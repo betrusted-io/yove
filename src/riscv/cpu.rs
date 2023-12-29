@@ -1,3575 +1,4105 @@
-//! The cpu module contains the privileged mode, registers, and CPU.
-//!
-//! This design is taken from rvemu, originally at:
-//! https://raw.githubusercontent.com/d0iasm/rvemu/main/src/cpu.rs
+// extern crate fnv;
 
-use std::cmp;
-use std::cmp::PartialEq;
-use std::collections::BTreeMap;
-use std::fmt;
-use std::num::FpCategory;
+// use self::fnv::FnvHashMap;
+use std::collections::HashMap;
 
-use crate::riscv::{
-    //     devices::{
-    //         uart::UART_IRQ,
-    //         virtio_blk::{Virtio, VIRTIO_IRQ},
-    //     },
-    //     dram::DRAM_SIZE,
-    bus::{Bus, XLen},
-    //     bus::{Bus, DRAM_BASE},
-    csr::*,
-    exception::Exception,
-    //     interrupt::Interrupt,
-};
+use crate::riscv::mmu::{AddressingMode, Mmu};
+// use terminal::Terminal;
 
-/// The number of registers.
-pub const REGISTERS_COUNT: usize = 32;
-/// The page size (4 KiB) for the virtual memory system.
-const PAGE_SIZE: u64 = 4096;
+const CSR_CAPACITY: usize = 4096;
 
-/// 8 bits. 1 byte.
-pub const BYTE: u8 = 8;
-/// 16 bits. 2 bytes.
-pub const HALFWORD: u8 = 16;
-/// 32 bits. 4 bytes.
-pub const WORD: u8 = 32;
-/// 64 bits. 8 bytes.
-pub const DOUBLEWORD: u8 = 64;
+const CSR_USTATUS_ADDRESS: u16 = 0x000;
+const CSR_FFLAGS_ADDRESS: u16 = 0x001;
+const CSR_FRM_ADDRESS: u16 = 0x002;
+const CSR_FCSR_ADDRESS: u16 = 0x003;
+const CSR_UIE_ADDRESS: u16 = 0x004;
+const CSR_UTVEC_ADDRESS: u16 = 0x005;
+const _CSR_USCRATCH_ADDRESS: u16 = 0x040;
+const CSR_UEPC_ADDRESS: u16 = 0x041;
+const CSR_UCAUSE_ADDRESS: u16 = 0x042;
+const CSR_UTVAL_ADDRESS: u16 = 0x043;
+const _CSR_UIP_ADDRESS: u16 = 0x044;
+const CSR_SSTATUS_ADDRESS: u16 = 0x100;
+const CSR_SEDELEG_ADDRESS: u16 = 0x102;
+const CSR_SIDELEG_ADDRESS: u16 = 0x103;
+const CSR_SIE_ADDRESS: u16 = 0x104;
+const CSR_STVEC_ADDRESS: u16 = 0x105;
+const _CSR_SSCRATCH_ADDRESS: u16 = 0x140;
+const CSR_SEPC_ADDRESS: u16 = 0x141;
+const CSR_SCAUSE_ADDRESS: u16 = 0x142;
+const CSR_STVAL_ADDRESS: u16 = 0x143;
+const CSR_SIP_ADDRESS: u16 = 0x144;
+const CSR_SATP_ADDRESS: u16 = 0x180;
+const CSR_MSTATUS_ADDRESS: u16 = 0x300;
+const CSR_MISA_ADDRESS: u16 = 0x301;
+const CSR_MEDELEG_ADDRESS: u16 = 0x302;
+const CSR_MIDELEG_ADDRESS: u16 = 0x303;
+const CSR_MIE_ADDRESS: u16 = 0x304;
 
-/// riscv-pk is passing x10 and x11 registers to kernel. x11 is expected to have the pointer to DTB.
-/// https://github.com/riscv/riscv-pk/blob/master/machine/mentry.S#L233-L235
-pub const POINTER_TO_DTB: u64 = 0x1020;
+const CSR_MTVEC_ADDRESS: u16 = 0x305;
+const _CSR_MSCRATCH_ADDRESS: u16 = 0x340;
+const CSR_MEPC_ADDRESS: u16 = 0x341;
+const CSR_MCAUSE_ADDRESS: u16 = 0x342;
+const CSR_MTVAL_ADDRESS: u16 = 0x343;
+const CSR_MIP_ADDRESS: u16 = 0x344;
+const _CSR_PMPCFG0_ADDRESS: u16 = 0x3a0;
+const _CSR_PMPADDR0_ADDRESS: u16 = 0x3b0;
+const _CSR_MCYCLE_ADDRESS: u16 = 0xb00;
+const CSR_CYCLE_ADDRESS: u16 = 0xc00;
+const CSR_TIME_ADDRESS: u16 = 0xc01;
+const _CSR_INSERT_ADDRESS: u16 = 0xc02;
+const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
 
-macro_rules! inst_count {
-    ($cpu:ident, $inst_name:expr) => {
-        if $cpu.is_count {
-            *$cpu.inst_counter.entry($inst_name.to_string()).or_insert(0) += 1;
-        }
+const MIP_MEIP: u64 = 0x800;
+pub const MIP_MTIP: u64 = 0x080;
+pub const MIP_MSIP: u64 = 0x008;
+pub const MIP_SEIP: u64 = 0x200;
+const MIP_STIP: u64 = 0x020;
+const MIP_SSIP: u64 = 0x002;
+
+/// Emulates a RISC-V CPU core
+pub struct Cpu {
+    clock: u64,
+    xlen: Xlen,
+    privilege_mode: PrivilegeMode,
+    wfi: bool,
+    // using only lower 32bits of x, pc, and csr registers
+    // for 32-bit mode
+    x: [i64; 32],
+    f: [f64; 32],
+    pc: u64,
+    csr: [u64; CSR_CAPACITY],
+    mmu: Mmu,
+    reservation: u64, // @TODO: Should support multiple address reservations
+    is_reservation_set: bool,
+    _dump_flag: bool,
+    decode_cache: DecodeCache,
+    unsigned_data_mask: u64,
+}
+
+#[derive(Clone)]
+pub enum Xlen {
+    Bit32,
+    Bit64, // @TODO: Support Bit128
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub enum PrivilegeMode {
+    User,
+    Supervisor,
+    Reserved,
+    Machine,
+}
+
+pub struct Trap {
+    pub trap_type: TrapType,
+    pub value: u64, // Trap type specific value
+}
+
+#[allow(dead_code)]
+pub enum TrapType {
+    InstructionAddressMisaligned,
+    InstructionAccessFault,
+    IllegalInstruction,
+    Breakpoint,
+    LoadAddressMisaligned,
+    LoadAccessFault,
+    StoreAddressMisaligned,
+    StoreAccessFault,
+    EnvironmentCallFromUMode,
+    EnvironmentCallFromSMode,
+    EnvironmentCallFromMMode,
+    InstructionPageFault,
+    LoadPageFault,
+    StorePageFault,
+    UserSoftwareInterrupt,
+    SupervisorSoftwareInterrupt,
+    MachineSoftwareInterrupt,
+    UserTimerInterrupt,
+    SupervisorTimerInterrupt,
+    MachineTimerInterrupt,
+    UserExternalInterrupt,
+    SupervisorExternalInterrupt,
+    MachineExternalInterrupt,
+}
+
+fn _get_privilege_mode_name(mode: &PrivilegeMode) -> &'static str {
+    match mode {
+        PrivilegeMode::User => "User",
+        PrivilegeMode::Supervisor => "Supervisor",
+        PrivilegeMode::Reserved => "Reserved",
+        PrivilegeMode::Machine => "Machine",
+    }
+}
+
+// bigger number is higher privilege level
+fn get_privilege_encoding(mode: &PrivilegeMode) -> u8 {
+    match mode {
+        PrivilegeMode::User => 0,
+        PrivilegeMode::Supervisor => 1,
+        PrivilegeMode::Reserved => panic!(),
+        PrivilegeMode::Machine => 3,
+    }
+}
+
+/// Returns `PrivilegeMode` from encoded privilege mode bits
+pub fn get_privilege_mode(encoding: u64) -> PrivilegeMode {
+    match encoding {
+        0 => PrivilegeMode::User,
+        1 => PrivilegeMode::Supervisor,
+        3 => PrivilegeMode::Machine,
+        _ => panic!("Unknown privilege uncoding"),
+    }
+}
+
+fn _get_trap_type_name(trap_type: &TrapType) -> &'static str {
+    match trap_type {
+        TrapType::InstructionAddressMisaligned => "InstructionAddressMisaligned",
+        TrapType::InstructionAccessFault => "InstructionAccessFault",
+        TrapType::IllegalInstruction => "IllegalInstruction",
+        TrapType::Breakpoint => "Breakpoint",
+        TrapType::LoadAddressMisaligned => "LoadAddressMisaligned",
+        TrapType::LoadAccessFault => "LoadAccessFault",
+        TrapType::StoreAddressMisaligned => "StoreAddressMisaligned",
+        TrapType::StoreAccessFault => "StoreAccessFault",
+        TrapType::EnvironmentCallFromUMode => "EnvironmentCallFromUMode",
+        TrapType::EnvironmentCallFromSMode => "EnvironmentCallFromSMode",
+        TrapType::EnvironmentCallFromMMode => "EnvironmentCallFromMMode",
+        TrapType::InstructionPageFault => "InstructionPageFault",
+        TrapType::LoadPageFault => "LoadPageFault",
+        TrapType::StorePageFault => "StorePageFault",
+        TrapType::UserSoftwareInterrupt => "UserSoftwareInterrupt",
+        TrapType::SupervisorSoftwareInterrupt => "SupervisorSoftwareInterrupt",
+        TrapType::MachineSoftwareInterrupt => "MachineSoftwareInterrupt",
+        TrapType::UserTimerInterrupt => "UserTimerInterrupt",
+        TrapType::SupervisorTimerInterrupt => "SupervisorTimerInterrupt",
+        TrapType::MachineTimerInterrupt => "MachineTimerInterrupt",
+        TrapType::UserExternalInterrupt => "UserExternalInterrupt",
+        TrapType::SupervisorExternalInterrupt => "SupervisorExternalInterrupt",
+        TrapType::MachineExternalInterrupt => "MachineExternalInterrupt",
+    }
+}
+
+fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
+    let interrupt_bit = match xlen {
+        Xlen::Bit32 => 0x80000000 as u64,
+        Xlen::Bit64 => 0x8000000000000000 as u64,
     };
+    match trap.trap_type {
+        TrapType::InstructionAddressMisaligned => 0,
+        TrapType::InstructionAccessFault => 1,
+        TrapType::IllegalInstruction => 2,
+        TrapType::Breakpoint => 3,
+        TrapType::LoadAddressMisaligned => 4,
+        TrapType::LoadAccessFault => 5,
+        TrapType::StoreAddressMisaligned => 6,
+        TrapType::StoreAccessFault => 7,
+        TrapType::EnvironmentCallFromUMode => 8,
+        TrapType::EnvironmentCallFromSMode => 9,
+        TrapType::EnvironmentCallFromMMode => 11,
+        TrapType::InstructionPageFault => 12,
+        TrapType::LoadPageFault => 13,
+        TrapType::StorePageFault => 15,
+        TrapType::UserSoftwareInterrupt => interrupt_bit,
+        TrapType::SupervisorSoftwareInterrupt => interrupt_bit + 1,
+        TrapType::MachineSoftwareInterrupt => interrupt_bit + 3,
+        TrapType::UserTimerInterrupt => interrupt_bit + 4,
+        TrapType::SupervisorTimerInterrupt => interrupt_bit + 5,
+        TrapType::MachineTimerInterrupt => interrupt_bit + 7,
+        TrapType::UserExternalInterrupt => interrupt_bit + 8,
+        TrapType::SupervisorExternalInterrupt => interrupt_bit + 9,
+        TrapType::MachineExternalInterrupt => interrupt_bit + 11,
+    }
 }
 
-/// Access type that is used in the virtual address translation process. It decides which exception
-/// should raises (InstructionPageFault, LoadPageFault or StoreAMOPageFault).
-#[derive(Debug, PartialEq, PartialOrd)]
-pub enum AccessType {
-    /// Raises the exception InstructionPageFault. It is used for an instruction fetch.
-    Instruction,
-    /// Raises the exception LoadPageFault.
-    Load,
-    /// Raises the exception StoreAMOPageFault.
-    Store,
-}
-
-/// The privileged mode.
-#[derive(Debug, PartialEq, PartialOrd, Eq, Copy, Clone)]
-pub enum Mode {
-    User = 0b00,
-    Supervisor = 0b01,
-    Machine = 0b11,
-    Debug,
-}
-
-/// The integer registers.
-#[derive(Debug)]
-pub struct XRegisters {
-    xregs: [u64; REGISTERS_COUNT],
-}
-
-impl XRegisters {
-    /// Create a new `XRegisters` object.
+impl Cpu {
+    /// Creates a new `Cpu`.
+    ///
+    /// # Arguments
+    /// * `Terminal`
     pub fn new() -> Self {
-        let mut xregs = [0; REGISTERS_COUNT];
-        // The stack pointer is set in the default maximum memory size + the start address of dram.
-        // xregs[2] = DRAM_BASE + DRAM_SIZE;
-        // From riscv-pk:
-        // https://github.com/riscv/riscv-pk/blob/master/machine/mentry.S#L233-L235
-        //   save a0 and a1; arguments from previous boot loader stage:
-        //   // li x10, 0
-        //   // li x11, 0
-        //
-        // void init_first_hart(uintptr_t hartid, uintptr_t dtb)
-        //   x10 (a0): hartid
-        //   x11 (a1): pointer to dtb
-        //
-        // So, we need to set registers register to the state as they are when a bootloader finished.
-        xregs[10] = 0;
-        xregs[11] = POINTER_TO_DTB;
-        Self { xregs }
-    }
-
-    /// Read the value from a register.
-    pub fn read(&self, index: u64) -> u64 {
-        self.xregs[index as usize]
-    }
-
-    /// Write the value to a register.
-    pub fn write(&mut self, index: u64, value: u64) {
-        // Register x0 is hardwired with all bits equal to 0.
-        if index != 0 {
-            self.xregs[index as usize] = value;
-        }
-    }
-}
-
-impl fmt::Display for XRegisters {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let abi = [
-            "zero", " ra ", " sp ", " gp ", " tp ", " t0 ", " t1 ", " t2 ", " s0 ", " s1 ", " a0 ",
-            " a1 ", " a2 ", " a3 ", " a4 ", " a5 ", " a6 ", " a7 ", " s2 ", " s3 ", " s4 ", " s5 ",
-            " s6 ", " s7 ", " s8 ", " s9 ", " s10", " s11", " t3 ", " t4 ", " t5 ", " t6 ",
-        ];
-        let mut output = String::from("");
-        for i in (0..REGISTERS_COUNT).step_by(4) {
-            output = format!(
-                "{}\n{}",
-                output,
-                format!(
-                    "x{:02}({})={:>#18x} x{:02}({})={:>#18x} x{:02}({})={:>#18x} x{:02}({})={:>#18x}",
-                    i,
-                    abi[i],
-                    self.read(i as u64),
-                    i + 1,
-                    abi[i + 1],
-                    self.read(i as u64 + 1),
-                    i + 2,
-                    abi[i + 2],
-                    self.read(i as u64 + 2),
-                    i + 3,
-                    abi[i + 3],
-                    self.read(i as u64 + 3),
-                )
-            );
-        }
-        write!(f, "{}", output)
-    }
-}
-
-/// The floating-point registers.
-#[derive(Debug)]
-pub struct FRegisters {
-    fregs: [f64; REGISTERS_COUNT],
-}
-
-impl FRegisters {
-    /// Create a new `FRegisters` object.
-    pub fn new() -> Self {
-        Self {
-            fregs: [0.0; REGISTERS_COUNT],
-        }
-    }
-
-    /// Read the value from a register.
-    pub fn read(&self, index: u64) -> f64 {
-        self.fregs[index as usize]
-    }
-
-    /// Write the value to a register.
-    pub fn write(&mut self, index: u64, value: f64) {
-        self.fregs[index as usize] = value;
-    }
-}
-
-impl fmt::Display for FRegisters {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let abi = [
-            // ft0-7: FP temporaries
-            " ft0", " ft1", " ft2", " ft3", " ft4", " ft5", " ft6", " ft7",
-            // fs0-1: FP saved registers
-            " fs0", " fs1", // fa0-1: FP arguments/return values
-            " fa0", " fa1", // fa2–7: FP arguments
-            " fa2", " fa3", " fa4", " fa5", " fa6", " fa7",
-            // fs2–11: FP saved registers
-            " fs2", " fs3", " fs4", " fs5", " fs6", " fs7", " fs8", " fs9", "fs10", "fs11",
-            // ft8–11: FP temporaries
-            " ft8", " ft9", "ft10", "ft11",
-        ];
-        let mut output = String::from("");
-        for i in (0..REGISTERS_COUNT).step_by(4) {
-            output = format!(
-                "{}\n{}",
-                output,
-                format!(
-                    "f{:02}({})={:>width$.prec$} f{:02}({})={:>width$.prec$} f{:02}({})={:>width$.prec$} f{:02}({})={:>width$.prec$}",
-                    i,
-                    abi[i],
-                    self.read(i as u64),
-                    i + 1,
-                    abi[i + 1],
-                    self.read(i as u64 + 1),
-                    i + 2,
-                    abi[i + 2],
-                    self.read(i  as u64+ 2),
-                    i + 3,
-                    abi[i + 3],
-                    self.read(i as u64 + 3),
-                    width=18,
-                    prec=8,
-                )
-            );
-        }
-        // Remove the first new line.
-        output.remove(0);
-        write!(f, "{}", output)
-    }
-}
-
-/// The CPU to contain registers, a program counter, status, and a privileged mode.
-pub struct Cpu<Bus> where Bus: crate::riscv::bus::Bus<XLen> {
-    /// 64-bit integer registers.
-    pub xregs: XRegisters,
-    /// 64-bit floating-point registers.
-    pub fregs: FRegisters,
-    /// Program counter.
-    pub pc: u64,
-    /// Control and status registers (CSR).
-    pub state: State,
-    /// Privilege level.
-    pub mode: Mode,
-    /// System bus.
-    pub bus: Bus,
-    /// SV39 paging flag.
-    enable_paging: bool,
-    /// Physical page number (PPN) × PAGE_SIZE (4096).
-    page_table: u64,
-    /// A set of bytes that subsumes the bytes in the addressed word used in
-    /// load-reserved/store-conditional instructions.
-    reservation_set: Vec<u64>,
-    /// Idle state. True when WFI is called, and becomes false when an interrupt happens.
-    pub idle: bool,
-    /// Counter of each instructions for debug.
-    pub inst_counter: BTreeMap<String, u64>,
-    /// The count flag. Count the number of each instruction executed.
-    pub is_count: bool,
-    /// Previous instruction. This is for debug.
-    pub pre_inst: u64,
-}
-
-impl<Bus> Cpu<Bus> where Bus: crate::riscv::bus::Bus<XLen> {
-    /// Create a new `Cpu` object.
-    pub fn new(bus: Bus) -> Cpu<Bus> {
-        Cpu {
-            xregs: XRegisters::new(),
-            fregs: FRegisters::new(),
+        let mut cpu = Cpu {
+            clock: 0,
+            xlen: Xlen::Bit64,
+            privilege_mode: PrivilegeMode::Machine,
+            wfi: false,
+            x: [0; 32],
+            f: [0.0; 32],
             pc: 0,
-            state: State::new(),
-            mode: Mode::Machine,
-            bus,
-            enable_paging: false,
-            page_table: 0,
-            reservation_set: Vec::new(),
-            idle: false,
-            inst_counter: BTreeMap::new(),
-            is_count: false,
-            pre_inst: 0,
+            csr: [0; CSR_CAPACITY],
+            mmu: Mmu::new(Xlen::Bit64),
+            reservation: 0,
+            is_reservation_set: false,
+            _dump_flag: false,
+            decode_cache: DecodeCache::new(),
+            unsigned_data_mask: 0xffffffffffffffff,
+        };
+        cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
+        cpu.write_csr_raw(CSR_MISA_ADDRESS, 0x800000008014312f);
+        cpu
+    }
+
+    /// Updates Program Counter content
+    ///
+    /// # Arguments
+    /// * `value`
+    pub fn update_pc(&mut self, value: u64) {
+        self.pc = value;
+    }
+
+    /// Updates XLEN, 32-bit or 64-bit
+    ///
+    /// # Arguments
+    /// * `xlen`
+    pub fn update_xlen(&mut self, xlen: Xlen) {
+        self.xlen = xlen.clone();
+        self.unsigned_data_mask = match xlen {
+            Xlen::Bit32 => 0xffffffff,
+            Xlen::Bit64 => 0xffffffffffffffff,
+        };
+        self.mmu.update_xlen(xlen.clone());
+    }
+
+    /// Reads integer register content
+    ///
+    /// # Arguments
+    /// * `reg` Register number. Must be 0-31
+    pub fn read_register(&self, reg: u8) -> i64 {
+        debug_assert!(reg <= 31, "reg must be 0-31. {}", reg);
+        match reg {
+            0 => 0, // 0th register is hardwired zero
+            _ => self.x[reg as usize],
         }
     }
 
-    fn debug(&self, _inst: u64, _name: &str) {
-        /*
-        if (((0x20_0000_0000 & self.pc) >> 37) == 1) && (self.pc & 0xf0000000_00000000) == 0 {
-            println!(
-                "[user]    {} pc: {:#x}, inst: {:#x}, is_inst 16? {} x[0x1c] {:#x}",
-                name,
-                self.pc,
-                inst,
-                // Check if an instruction is one of the compressed instructions.
-                inst & 0b11 == 0 || inst & 0b11 == 1 || inst & 0b11 == 2,
-                self.xregs.read(0x1c),
-            );
-            return;
-        }
-
-        if (self.pc & 0xf0000000_00000000) != 0 {
-            return;
-            /*
-            println!(
-                "[kernel]  {} pc: {:#x}, inst: {:#x}, is_inst 16? {} x[0x1c] {:#x}",
-                name,
-                self.pc,
-                inst,
-                // Check if an instruction is one of the compressed instructions.
-                inst & 0b11 == 0 || inst & 0b11 == 1 || inst & 0b11 == 2,
-                self.xregs.read(0x1c),
-            );
-            return;
-            */
-        }
-
-        println!(
-            "[machine] {} pc: {:#x}, inst: {:#x}, is_inst 16? {} x[0x1c] {:#x}",
-            name,
-            self.pc,
-            inst,
-            // Check if an instruction is one of the compressed instructions.
-            inst & 0b11 == 0 || inst & 0b11 == 1 || inst & 0b11 == 2,
-            self.xregs.read(0x1c),
-        );
-        */
+    /// Reads Program counter content
+    pub fn read_pc(&self) -> u64 {
+        self.pc
     }
 
-    /// Reset CPU states.
-    pub fn reset(&mut self) {
-        self.pc = 0;
-        self.mode = Mode::Machine;
-        self.state.reset();
-        for i in 0..REGISTERS_COUNT {
-            self.xregs.write(i as u64, 0);
-            self.fregs.write(i as u64, 0.0);
+    /// Runs program one cycle. Fetch, decode, and execution are completed in a cycle so far.
+    pub fn tick(&mut self) {
+        let instruction_address = self.pc;
+        match self.tick_operate() {
+            Ok(()) => {}
+            Err(e) => self.handle_exception(e, instruction_address),
         }
+        self.mmu.tick(&mut self.csr[CSR_MIP_ADDRESS as usize]);
+        self.handle_interrupt(self.pc);
+        self.clock = self.clock.wrapping_add(1);
+
+        // cpu core clock : mtime clock in clint = 8 : 1 is
+        // just an arbiraty ratio.
+        // @TODO: Implement more properly
+        self.write_csr_raw(CSR_CYCLE_ADDRESS, self.clock * 8);
     }
 
-    // /// Check interrupt flags for all devices that can interrupt.
-    // pub fn check_pending_interrupt(&mut self) -> Option<Interrupt> {
-    //     // global interrupt: PLIC (Platform Local Interrupt Controller) dispatches global
-    //     //                   interrupts to multiple harts.
-    //     // local interrupt: CLINT (Core Local Interrupter) dispatches local interrupts to a hart
-    //     //                  which directly connected to CLINT.
-
-    //     // 3.1.6.1 Privilege and Global Interrupt-Enable Stack in mstatus register
-    //     // "When a hart is executing in privilege mode x, interrupts are globally enabled when
-    //     // xIE=1 and globally disabled when xIE=0."
-    //     match self.mode {
-    //         Mode::Machine => {
-    //             // Check if the MIE bit is enabled.
-    //             if self.state.read_mstatus(MSTATUS_MIE) == 0 {
-    //                 return None;
-    //             }
-    //         }
-    //         Mode::Supervisor => {
-    //             // Check if the SIE bit is enabled.
-    //             if self.state.read_sstatus(XSTATUS_SIE) == 0 {
-    //                 return None;
-    //             }
-    //         }
-    //         _ => {}
-    //     }
-
-    //     // TODO: Take interrupts based on priorities.
-
-    //     // Check external interrupt for uart and virtio.
-    //     let irq;
-    //     if self.bus.uart.is_interrupting() {
-    //         irq = UART_IRQ;
-    //     } else if self.bus.virtio.is_interrupting() {
-    //         // An interrupt is raised after a disk access is done.
-    //         Virtio::disk_access(self).expect("failed to access the disk");
-    //         irq = VIRTIO_IRQ;
-    //     } else {
-    //         irq = 0;
-    //     }
-
-    //     if irq != 0 {
-    //         // TODO: assume that hart is 0
-    //         // TODO: write a value to MCLAIM if the mode is machine
-    //         self.bus.plic.update_pending(irq);
-    //         self.state.write(MIP, self.state.read(MIP) | SEIP_BIT);
-    //     }
-
-    //     // 3.1.9 Machine Interrupt Registers (mip and mie)
-    //     // "An interrupt i will be taken if bit i is set in both mip and mie, and if interrupts are
-    //     // globally enabled. By default, M-mode interrupts are globally enabled if the hart’s
-    //     // current privilege mode is less than M, or if the current privilege mode is M and the MIE
-    //     // bit in the mstatus register is set. If bit i in mideleg is set, however, interrupts are
-    //     // considered to be globally enabled if the hart’s current privilege mode equals the
-    //     // delegated privilege mode (S or U) and that mode’s interrupt enable bit (SIE or UIE in
-    //     // mstatus) is set, or if the current privilege mode is less than the delegated privilege
-    //     // mode."
-    //     let pending = self.state.read(MIE) & self.state.read(MIP);
-
-    //     if (pending & MEIP_BIT) != 0 {
-    //         self.state.write(MIP, self.state.read(MIP) & !MEIP_BIT);
-    //         return Some(Interrupt::MachineExternalInterrupt);
-    //     }
-    //     if (pending & MSIP_BIT) != 0 {
-    //         self.state.write(MIP, self.state.read(MIP) & !MSIP_BIT);
-    //         return Some(Interrupt::MachineSoftwareInterrupt);
-    //     }
-    //     if (pending & MTIP_BIT) != 0 {
-    //         self.state.write(MIP, self.state.read(MIP) & !MTIP_BIT);
-    //         return Some(Interrupt::MachineTimerInterrupt);
-    //     }
-    //     if (pending & SEIP_BIT) != 0 {
-    //         self.state.write(MIP, self.state.read(MIP) & !SEIP_BIT);
-    //         return Some(Interrupt::SupervisorExternalInterrupt);
-    //     }
-    //     if (pending & SSIP_BIT) != 0 {
-    //         self.state.write(MIP, self.state.read(MIP) & !SSIP_BIT);
-    //         return Some(Interrupt::SupervisorSoftwareInterrupt);
-    //     }
-    //     if (pending & STIP_BIT) != 0 {
-    //         self.state.write(MIP, self.state.read(MIP) & !STIP_BIT);
-    //         return Some(Interrupt::SupervisorTimerInterrupt);
-    //     }
-
-    //     return None;
-    // }
-
-    /// Update the physical page number (PPN) and the addressing mode.
-    fn update_paging(&mut self) {
-        // Read the physical page number (PPN) of the root page table, i.e., its
-        // supervisor physical address divided by 4 KiB.
-        self.page_table = self.state.read_bits(SATP, ..44) * PAGE_SIZE;
-
-        // Read the MODE field, which selects the current address-translation scheme.
-        let mode = self.state.read_bits(SATP, 60..);
-
-        // Enable the SV39 paging if the value of the mode field is 8.
-        if mode == 8 {
-            self.enable_paging = true;
-        } else {
-            self.enable_paging = false;
+    // @TODO: Rename?
+    fn tick_operate(&mut self) -> Result<(), Trap> {
+        if self.wfi {
+            if (self.read_csr_raw(CSR_MIE_ADDRESS) & self.read_csr_raw(CSR_MIP_ADDRESS)) != 0 {
+                self.wfi = false;
+            }
+            return Ok(());
         }
+
+        let original_word = match self.fetch() {
+            Ok(word) => word,
+            Err(e) => return Err(e),
+        };
+        let instruction_address = self.pc;
+        let word = match (original_word & 0x3) == 0x3 {
+            true => {
+                self.pc = self.pc.wrapping_add(4); // 32-bit length non-compressed instruction
+                original_word
+            }
+            false => {
+                self.pc = self.pc.wrapping_add(2); // 16-bit length compressed instruction
+                self.uncompress(original_word & 0xffff)
+            }
+        };
+
+        match self.decode(word) {
+            Ok(inst) => {
+                let result = (inst.operation)(self, word, instruction_address);
+                self.x[0] = 0; // hardwired zero
+                return result;
+            }
+            Err(()) => {
+                panic!(
+                    "Unknown instruction PC:{:x} WORD:{:x}",
+                    instruction_address, original_word
+                );
+            }
+        };
     }
 
-    /// Translate a virtual address to a physical address for the paged virtual-memory system.
-    fn translate(&mut self, addr: u64, access_type: AccessType) -> Result<u64, Exception> {
-        if !self.enable_paging || self.mode == Mode::Machine {
-            return Ok(addr);
-        }
-
-        // 4.3.2 Virtual Address Translation Process
-        // (The RISC-V Instruction Set Manual Volume II-Privileged Architecture_20190608)
-        // A virtual address va is translated into a physical address pa as follows:
-        let levels = 3;
-        let vpn = [
-            (addr >> 12) & 0x1ff,
-            (addr >> 21) & 0x1ff,
-            (addr >> 30) & 0x1ff,
-        ];
-
-        // 1. Let a be satp.ppn × PAGESIZE, and let i = LEVELS − 1. (For Sv32, PAGESIZE=212
-        //    and LEVELS=2.)
-        let mut a = self.page_table;
-        let mut i: i64 = levels - 1;
-        let mut pte;
-        loop {
-            // 2. Let pte be the value of the PTE at address a+va.vpn[i]×PTESIZE. (For Sv32,
-            //    PTESIZE=4.) If accessing pte violates a PMA or PMP check, raise an access
-            //    exception corresponding to the original access type.
-            pte = self.bus.read(a + vpn[i as usize] * 8, DOUBLEWORD)?;
-
-            // 3. If pte.v = 0, or if pte.r = 0 and pte.w = 1, stop and raise a page-fault
-            //    exception corresponding to the original access type.
-            let v = pte & 1;
-            let r = (pte >> 1) & 1;
-            let w = (pte >> 2) & 1;
-            let x = (pte >> 3) & 1;
-            if v == 0 || (r == 0 && w == 1) {
-                match access_type {
-                    AccessType::Instruction => return Err(Exception::InstructionPageFault(addr)),
-                    AccessType::Load => return Err(Exception::LoadPageFault(addr)),
-                    AccessType::Store => return Err(Exception::StoreAMOPageFault(addr)),
+    /// Decodes a word instruction data and returns a reference to
+    /// [`Instruction`](struct.Instruction.html). Using [`DecodeCache`](struct.DecodeCache.html)
+    /// so if cache hits this method returns the result very quickly.
+    /// The result will be stored to cache.
+    fn decode(&mut self, word: u32) -> Result<&Instruction, ()> {
+        match self.decode_cache.get(word) {
+            Some(index) => return Ok(&INSTRUCTIONS[index]),
+            None => match self.decode_and_get_instruction_index(word) {
+                Ok(index) => {
+                    self.decode_cache.insert(word, index);
+                    Ok(&INSTRUCTIONS[index])
                 }
-            }
-
-            // 4. Otherwise, the PTE is valid. If pte.r = 1 or pte.x = 1, go to step 5.
-            //    Otherwise, this PTE is a pointer to the next level of the page table.
-            //    Let i = i − 1. If i < 0, stop and raise a page-fault exception
-            //    corresponding to the original access type. Otherwise,
-            //    let a = pte.ppn × PAGESIZE and go to step 2.
-            if r == 1 || x == 1 {
-                break;
-            }
-            i -= 1;
-            let ppn = (pte >> 10) & 0x0fff_ffff_ffff;
-            a = ppn * PAGE_SIZE;
-            if i < 0 {
-                match access_type {
-                    AccessType::Instruction => return Err(Exception::InstructionPageFault(addr)),
-                    AccessType::Load => return Err(Exception::LoadPageFault(addr)),
-                    AccessType::Store => return Err(Exception::StoreAMOPageFault(addr)),
-                }
-            }
-        }
-        // TODO: implement step 5
-        // 5. A leaf PTE has been found. Determine if the requested memory access is
-        //    allowed by the pte.r, pte.w, pte.x, and pte.u bits, given the current
-        //    privilege mode and the value of the SUM and MXR fields of the mstatus
-        //    register. If not, stop and raise a page-fault exception corresponding
-        //    to the original access type.
-
-        // 3.1.6.3 Memory Privilege in mstatus Register
-        // "The MXR (Make eXecutable Readable) bit modifies the privilege with which loads access
-        // virtual memory. When MXR=0, only loads from pages marked readable (R=1 in Figure 4.15)
-        // will succeed. When MXR=1, loads from pages marked either readable or executable
-        // (R=1 or X=1) will succeed. MXR has no effect when page-based virtual memory is not in
-        // effect. MXR is hardwired to 0 if S-mode is not supported."
-
-        // "The SUM (permit Supervisor User Memory access) bit modifies the privilege with which
-        // S-mode loads and stores access virtual memory. When SUM=0, S-mode memory accesses to
-        // pages that are accessible by U-mode (U=1 in Figure 4.15) will fault. When SUM=1, these
-        // accesses are permitted.  SUM has no effect when page-based virtual memory is not in
-        // effect. Note that, while SUM is ordinarily ignored when not executing in S-mode, it is
-        // in effect when MPRV=1 and MPP=S. SUM is hardwired to 0 if S-mode is not supported."
-
-        // 6. If i > 0 and pte.ppn[i−1:0] != 0, this is a misaligned superpage; stop and
-        //    raise a page-fault exception corresponding to the original access type.
-        let ppn = [
-            (pte >> 10) & 0x1ff,
-            (pte >> 19) & 0x1ff,
-            (pte >> 28) & 0x03ff_ffff,
-        ];
-        if i > 0 {
-            for j in (0..i).rev() {
-                if ppn[j as usize] != 0 {
-                    // A misaligned superpage.
-                    match access_type {
-                        AccessType::Instruction => {
-                            return Err(Exception::InstructionPageFault(addr))
-                        }
-                        AccessType::Load => return Err(Exception::LoadPageFault(addr)),
-                        AccessType::Store => return Err(Exception::StoreAMOPageFault(addr)),
-                    }
-                }
-            }
-        }
-
-        // 7. If pte.a = 0, or if the memory access is a store and pte.d = 0, either raise
-        //    a page-fault exception corresponding to the original access type, or:
-        //    • Set pte.a to 1 and, if the memory access is a store, also set pte.d to 1.
-        //    • If this access violates a PMA or PMP check, raise an access exception
-        //    corresponding to the original access type.
-        //    • This update and the loading of pte in step 2 must be atomic; in particular,
-        //    no intervening store to the PTE may be perceived to have occurred in-between.
-        let a = (pte >> 6) & 1;
-        let d = (pte >> 7) & 1;
-        if a == 0 || (access_type == AccessType::Store && d == 0) {
-            // Set pte.a to 1 and, if the memory access is a store, also set pte.d to 1.
-            pte = pte
-                | (1 << 6)
-                | if access_type == AccessType::Store {
-                    1 << 7
-                } else {
-                    0
-                };
-
-            // TODO: PMA or PMP check.
-
-            // Update the value of address satp.ppn × PAGESIZE + va.vpn[i] × PTESIZE with new pte
-            // value.
-            // TODO: If this is enabled, running xv6 fails.
-            //self.bus.write(self.page_table + vpn[i as usize] * 8, pte, 64)?;
-        }
-
-        // 8. The translation is successful. The translated physical address is given as
-        //    follows:
-        //    • pa.pgoff = va.pgoff.
-        //    • If i > 0, then this is a superpage translation and pa.ppn[i−1:0] =
-        //    va.vpn[i−1:0].
-        //    • pa.ppn[LEVELS−1:i] = pte.ppn[LEVELS−1:i].
-        let offset = addr & 0xfff;
-        match i {
-            0 => {
-                let ppn = (pte >> 10) & 0x0fff_ffff_ffff;
-                Ok((ppn << 12) | offset)
-            }
-            1 => {
-                // Superpage translation. A superpage is a memory page of larger size than an
-                // ordinary page (4 KiB). It reduces TLB misses and improves performance.
-                Ok((ppn[2] << 30) | (ppn[1] << 21) | (vpn[0] << 12) | offset)
-            }
-            2 => {
-                // Superpage translation. A superpage is a memory page of larger size than an
-                // ordinary page (4 KiB). It reduces TLB misses and improves performance.
-                Ok((ppn[2] << 30) | (vpn[1] << 21) | (vpn[0] << 12) | offset)
-            }
-            _ => match access_type {
-                AccessType::Instruction => return Err(Exception::InstructionPageFault(addr)),
-                AccessType::Load => return Err(Exception::LoadPageFault(addr)),
-                AccessType::Store => return Err(Exception::StoreAMOPageFault(addr)),
+                Err(()) => Err(()),
             },
         }
     }
 
-    /// Read `size`-bit data from the system bus with the translation a virtual address to a physical address
-    /// if it is enabled.
-    fn read(&mut self, v_addr: u64, size: u8) -> Result<u64, Exception> {
-        let previous_mode = self.mode;
+    /// Decodes a word instruction data and returns a reference to
+    /// [`Instruction`](struct.Instruction.html). Not Using [`DecodeCache`](struct.DecodeCache.html)
+    /// so if you don't want to pollute the cache you should use this method
+    /// instead of `decode`.
+    fn decode_raw(&self, word: u32) -> Result<&Instruction, ()> {
+        match self.decode_and_get_instruction_index(word) {
+            Ok(index) => Ok(&INSTRUCTIONS[index]),
+            Err(()) => Err(()),
+        }
+    }
 
-        // 3.1.6.3 Memory Privilege in mstatus Register
-        // "When MPRV=1, load and store memory addresses are translated and protected, and
-        // endianness is applied, as though the current privilege mode were set to MPP."
-        if self.state.read_mstatus(MSTATUS_MPRV) == 1 {
-            self.mode = match self.state.read_mstatus(MSTATUS_MPP) {
-                0b00 => Mode::User,
-                0b01 => Mode::Supervisor,
-                0b11 => Mode::Machine,
-                _ => Mode::Debug,
+    /// Decodes a word instruction data and returns an index of
+    /// [`INSTRUCTIONS`](constant.INSTRUCTIONS.html)
+    ///
+    /// # Arguments
+    /// * `word` word instruction data decoded
+    fn decode_and_get_instruction_index(&self, word: u32) -> Result<usize, ()> {
+        for i in 0..INSTRUCTION_NUM {
+            let inst = &INSTRUCTIONS[i];
+            if (word & inst.mask) == inst.data {
+                return Ok(i);
+            }
+        }
+        return Err(());
+    }
+
+    fn handle_interrupt(&mut self, instruction_address: u64) {
+        // @TODO: Optimize
+        let minterrupt = self.read_csr_raw(CSR_MIP_ADDRESS) & self.read_csr_raw(CSR_MIE_ADDRESS);
+
+        if (minterrupt & MIP_MEIP) != 0 && self.handle_trap(
+                Trap {
+                    trap_type: TrapType::MachineExternalInterrupt,
+                    value: self.pc, // dummy
+                },
+                instruction_address,
+                true,
+            ) {
+            // Who should clear mip bit?
+            self.write_csr_raw(
+                CSR_MIP_ADDRESS,
+                self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_MEIP,
+            );
+            self.wfi = false;
+            return;
+        }
+        if (minterrupt & MIP_MSIP) != 0 && self.handle_trap(
+                Trap {
+                    trap_type: TrapType::MachineSoftwareInterrupt,
+                    value: self.pc, // dummy
+                },
+                instruction_address,
+                true,
+            ) {
+            self.write_csr_raw(
+                CSR_MIP_ADDRESS,
+                self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_MSIP,
+            );
+            self.wfi = false;
+            return;
+        }
+        if (minterrupt & MIP_MTIP) != 0 && self.handle_trap(
+                Trap {
+                    trap_type: TrapType::MachineTimerInterrupt,
+                    value: self.pc, // dummy
+                },
+                instruction_address,
+                true,
+            ) {
+            self.write_csr_raw(
+                CSR_MIP_ADDRESS,
+                self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_MTIP,
+            );
+            self.wfi = false;
+            return;
+        }
+        if (minterrupt & MIP_SEIP) != 0 && self.handle_trap(
+                Trap {
+                    trap_type: TrapType::SupervisorExternalInterrupt,
+                    value: self.pc, // dummy
+                },
+                instruction_address,
+                true,
+            ) {
+            self.write_csr_raw(
+                CSR_MIP_ADDRESS,
+                self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_SEIP,
+            );
+            self.wfi = false;
+            return;
+        }
+        if (minterrupt & MIP_SSIP) != 0 && self.handle_trap(
+                Trap {
+                    trap_type: TrapType::SupervisorSoftwareInterrupt,
+                    value: self.pc, // dummy
+                },
+                instruction_address,
+                true,
+            ) {
+            self.write_csr_raw(
+                CSR_MIP_ADDRESS,
+                self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_SSIP,
+            );
+            self.wfi = false;
+            return;
+        }
+        if (minterrupt & MIP_STIP) != 0 && self.handle_trap(
+                Trap {
+                    trap_type: TrapType::SupervisorTimerInterrupt,
+                    value: self.pc, // dummy
+                },
+                instruction_address,
+                true,
+            ) {
+            self.write_csr_raw(
+                CSR_MIP_ADDRESS,
+                self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_STIP,
+            );
+            self.wfi = false;
+            return;
+        }
+    }
+
+    fn handle_exception(&mut self, exception: Trap, instruction_address: u64) {
+        self.handle_trap(exception, instruction_address, false);
+    }
+
+    fn handle_trap(&mut self, trap: Trap, instruction_address: u64, is_interrupt: bool) -> bool {
+        let current_privilege_encoding = get_privilege_encoding(&self.privilege_mode) as u64;
+        let cause = get_trap_cause(&trap, &self.xlen);
+
+        // First, determine which privilege mode should handle the trap.
+        // @TODO: Check if this logic is correct
+        let mdeleg = match is_interrupt {
+            true => self.read_csr_raw(CSR_MIDELEG_ADDRESS),
+            false => self.read_csr_raw(CSR_MEDELEG_ADDRESS),
+        };
+        let sdeleg = match is_interrupt {
+            true => self.read_csr_raw(CSR_SIDELEG_ADDRESS),
+            false => self.read_csr_raw(CSR_SEDELEG_ADDRESS),
+        };
+        let pos = cause & 0xffff;
+
+        let new_privilege_mode = match ((mdeleg >> pos) & 1) == 0 {
+            true => PrivilegeMode::Machine,
+            false => match ((sdeleg >> pos) & 1) == 0 {
+                true => PrivilegeMode::Supervisor,
+                false => PrivilegeMode::User,
+            },
+        };
+        let new_privilege_encoding = get_privilege_encoding(&new_privilege_mode) as u64;
+
+        let current_status = match self.privilege_mode {
+            PrivilegeMode::Machine => self.read_csr_raw(CSR_MSTATUS_ADDRESS),
+            PrivilegeMode::Supervisor => self.read_csr_raw(CSR_SSTATUS_ADDRESS),
+            PrivilegeMode::User => self.read_csr_raw(CSR_USTATUS_ADDRESS),
+            PrivilegeMode::Reserved => panic!(),
+        };
+
+        // Second, ignore the interrupt if it's disabled by some conditions
+
+        if is_interrupt {
+            let ie = match new_privilege_mode {
+                PrivilegeMode::Machine => self.read_csr_raw(CSR_MIE_ADDRESS),
+                PrivilegeMode::Supervisor => self.read_csr_raw(CSR_SIE_ADDRESS),
+                PrivilegeMode::User => self.read_csr_raw(CSR_UIE_ADDRESS),
+                PrivilegeMode::Reserved => panic!(),
             };
-        }
 
-        let p_addr = self.translate(v_addr, AccessType::Load)?;
-        let result = self.bus.read(p_addr, size);
+            let current_mie = (current_status >> 3) & 1;
+            let current_sie = (current_status >> 1) & 1;
+            let current_uie = current_status & 1;
 
-        if self.state.read_mstatus(MSTATUS_MPRV) == 1 {
-            self.mode = previous_mode;
-        }
+            let msie = (ie >> 3) & 1;
+            let ssie = (ie >> 1) & 1;
+            let usie = ie & 1;
 
-        result
-    }
+            let mtie = (ie >> 7) & 1;
+            let stie = (ie >> 5) & 1;
+            let utie = (ie >> 4) & 1;
 
-    /// Write `size`-bit data to the system bus with the translation a virtual address to a physical
-    /// address if it is enabled.
-    fn write(&mut self, v_addr: u64, value: u64, size: u8) -> Result<(), Exception> {
-        let previous_mode = self.mode;
+            let meie = (ie >> 11) & 1;
+            let seie = (ie >> 9) & 1;
+            let ueie = (ie >> 8) & 1;
 
-        // 3.1.6.3 Memory Privilege in mstatus Register
-        // "When MPRV=1, load and store memory addresses are translated and protected, and
-        // endianness is applied, as though the current privilege mode were set to MPP."
-        if self.state.read_mstatus(MSTATUS_MPRV) == 1 {
-            self.mode = match self.state.read_mstatus(MSTATUS_MPP) {
-                0b00 => Mode::User,
-                0b01 => Mode::Supervisor,
-                0b11 => Mode::Machine,
-                _ => Mode::Debug,
-            };
-        }
+            // 1. Interrupt is always enabled if new privilege level is higher
+            // than current privilege level
+            // 2. Interrupt is always disabled if new privilege level is lower
+            // than current privilege level
+            // 3. Interrupt is enabled if xIE in xstatus is 1 where x is privilege level
+            // and new privilege level equals to current privilege level
 
-        // "The SC must fail if a write from some other device to the bytes accessed by the LR can
-        // be observed to occur between the LR and SC."
-        if self.reservation_set.contains(&v_addr) {
-            self.reservation_set.retain(|&x| x != v_addr);
-        }
-
-        let p_addr = self.translate(v_addr, AccessType::Store)?;
-        let result = self.bus.write(p_addr, value, size);
-
-        if self.state.read_mstatus(MSTATUS_MPRV) == 1 {
-            self.mode = previous_mode;
-        }
-
-        result
-    }
-
-    /// Fetch the `size`-bit next instruction from the memory at the current program counter.
-    pub fn fetch(&mut self, size: u8) -> Result<u64, Exception> {
-        if size != HALFWORD && size != WORD {
-            return Err(Exception::InstructionAccessFault);
-        }
-
-        let p_pc = self.translate(self.pc, AccessType::Instruction)?;
-
-        // The result of the read method can be `Exception::LoadAccessFault`. In fetch(), an error
-        // should be `Exception::InstructionAccessFault`.
-        match self.bus.read(p_pc, size) {
-            Ok(value) => Ok(value),
-            Err(_) => Err(Exception::InstructionAccessFault),
-        }
-    }
-
-    // /// Execute a cycle on peripheral devices.
-    // pub fn devices_increment(&mut self) {
-    //     // TODO: mtime in Clint and TIME in CSR should be the same value.
-    //     // Increment the timer register (mtimer) in Clint.
-    //     self.bus.clint.increment(&mut self.state);
-    //     // Increment the value in the TIME and CYCLE registers in CSR.
-    //     self.state.increment_time();
-    // }
-
-    /// Execute an instruction. Raises an exception if something is wrong, otherwise, returns
-    /// the instruction executed in this cycle.
-    pub fn execute(&mut self) -> Result<u64, Exception> {
-        // WFI is called and pending interrupts don't exist.
-        if self.idle {
-            return Ok(0);
-        }
-
-        // Fetch.
-        let inst16 = self.fetch(HALFWORD)?;
-        let inst;
-        match inst16 & 0b11 {
-            0 | 1 | 2 => {
-                if inst16 == 0 {
-                    // Unimplemented instruction, since all bits are 0.
-                    return Err(Exception::IllegalInstruction(inst16));
-                }
-                inst = inst16;
-                self.execute_compressed(inst)?;
-                // Add 2 bytes to the program counter.
-                self.pc += 2;
-            }
-            _ => {
-                inst = self.fetch(WORD)?;
-                self.execute_general(inst)?;
-                // Add 4 bytes to the program counter.
-                self.pc += 4;
-            }
-        }
-        self.pre_inst = inst;
-        Ok(inst)
-    }
-
-    /// Execute a compressed instruction. Raised an exception if something is wrong, otherwise,
-    /// returns a fetched instruction. It also increments the program counter by 2 bytes.
-    pub fn execute_compressed(&mut self, inst: u64) -> Result<(), Exception> {
-        // 2. Decode.
-        let opcode = inst & 0x3;
-        let funct3 = (inst >> 13) & 0x7;
-
-        // 3. Execute.
-        // Compressed instructions have 3-bit field for popular registers, which correspond to
-        // registers x8 to x15.
-        match opcode {
-            0 => {
-                // Quadrant 0.
-                match funct3 {
-                    0x0 => {
-                        // c.addi4spn
-                        // Expands to addi rd, x2, nzuimm, where rd=rd'+8.
-                        inst_count!(self, "c.addi4spn");
-                        self.debug(inst, "c.addi4spn");
-
-                        let rd = ((inst >> 2) & 0x7) + 8;
-                        // nzuimm[5:4|9:6|2|3] = inst[12:11|10:7|6|5]
-                        let nzuimm = ((inst >> 1) & 0x3c0) // znuimm[9:6]
-                            | ((inst >> 7) & 0x30) // znuimm[5:4]
-                            | ((inst >> 2) & 0x8) // znuimm[3]
-                            | ((inst >> 4) & 0x4); // znuimm[2]
-                        if nzuimm == 0 {
-                            return Err(Exception::IllegalInstruction(inst));
-                        }
-                        self.xregs
-                            .write(rd, self.xregs.read(2).wrapping_add(nzuimm));
-                    }
-                    0x1 => {
-                        // c.fld
-                        // Expands to fld rd, offset(rs1), where rd=rd'+8 and rs1=rs1'+8.
-                        inst_count!(self, "c.fld");
-                        self.debug(inst, "c.fld");
-
-                        let rd = ((inst >> 2) & 0x7) + 8;
-                        let rs1 = ((inst >> 7) & 0x7) + 8;
-                        // offset[5:3|7:6] = isnt[12:10|6:5]
-                        let offset = ((inst << 1) & 0xc0) // imm[7:6]
-                            | ((inst >> 7) & 0x38); // imm[5:3]
-                        let val = f64::from_bits(
-                            self.read(self.xregs.read(rs1).wrapping_add(offset), DOUBLEWORD)?,
-                        );
-                        self.fregs.write(rd, val);
-                    }
-                    0x2 => {
-                        // c.lw
-                        // Expands to lw rd, offset(rs1), where rd=rd'+8 and rs1=rs1'+8.
-                        inst_count!(self, "c.lw");
-                        self.debug(inst, "c.lw");
-
-                        let rd = ((inst >> 2) & 0x7) + 8;
-                        let rs1 = ((inst >> 7) & 0x7) + 8;
-                        // offset[5:3|2|6] = isnt[12:10|6|5]
-                        let offset = ((inst << 1) & 0x40) // imm[6]
-                            | ((inst >> 7) & 0x38) // imm[5:3]
-                            | ((inst >> 4) & 0x4); // imm[2]
-                        let addr = self.xregs.read(rs1).wrapping_add(offset);
-                        let val = self.read(addr, WORD)?;
-                        self.xregs.write(rd, val as i32 as i64 as u64);
-                    }
-                    0x3 => {
-                        // c.ld
-                        // Expands to ld rd, offset(rs1), where rd=rd'+8 and rs1=rs1'+8.
-                        inst_count!(self, "c.ld");
-                        self.debug(inst, "c.ld");
-
-                        let rd = ((inst >> 2) & 0x7) + 8;
-                        let rs1 = ((inst >> 7) & 0x7) + 8;
-                        // offset[5:3|7:6] = isnt[12:10|6:5]
-                        let offset = ((inst << 1) & 0xc0) // imm[7:6]
-                            | ((inst >> 7) & 0x38); // imm[5:3]
-                        let addr = self.xregs.read(rs1).wrapping_add(offset);
-                        let val = self.read(addr, DOUBLEWORD)?;
-                        self.xregs.write(rd, val);
-                    }
-                    0x4 => {
-                        // Reserved.
-                        panic!("reserved");
-                    }
-                    0x5 => {
-                        // c.fsd
-                        // Expands to fsd rs2, offset(rs1), where rs2=rs2'+8 and rs1=rs1'+8.
-                        inst_count!(self, "c.fsd");
-                        self.debug(inst, "c.fsd");
-
-                        let rs2 = ((inst >> 2) & 0x7) + 8;
-                        let rs1 = ((inst >> 7) & 0x7) + 8;
-                        // offset[5:3|7:6] = isnt[12:10|6:5]
-                        let offset = ((inst << 1) & 0xc0) // imm[7:6]
-                            | ((inst >> 7) & 0x38); // imm[5:3]
-                        let addr = self.xregs.read(rs1).wrapping_add(offset);
-                        self.write(addr, self.fregs.read(rs2).to_bits() as u64, DOUBLEWORD)?;
-                    }
-                    0x6 => {
-                        // c.sw
-                        // Expands to sw rs2, offset(rs1), where rs2=rs2'+8 and rs1=rs1'+8.
-                        inst_count!(self, "c.sw");
-                        self.debug(inst, "c.sw");
-
-                        let rs2 = ((inst >> 2) & 0x7) + 8;
-                        let rs1 = ((inst >> 7) & 0x7) + 8;
-                        // offset[5:3|2|6] = isnt[12:10|6|5]
-                        let offset = ((inst << 1) & 0x40) // imm[6]
-                            | ((inst >> 7) & 0x38) // imm[5:3]
-                            | ((inst >> 4) & 0x4); // imm[2]
-                        let addr = self.xregs.read(rs1).wrapping_add(offset);
-                        self.write(addr, self.xregs.read(rs2), WORD)?;
-                    }
-                    0x7 => {
-                        // c.sd
-                        // Expands to sd rs2, offset(rs1), where rs2=rs2'+8 and rs1=rs1'+8.
-                        inst_count!(self, "c.sd");
-                        self.debug(inst, "c.sd");
-
-                        let rs2 = ((inst >> 2) & 0x7) + 8;
-                        let rs1 = ((inst >> 7) & 0x7) + 8;
-                        // offset[5:3|7:6] = isnt[12:10|6:5]
-                        let offset = ((inst << 1) & 0xc0) // imm[7:6]
-                            | ((inst >> 7) & 0x38); // imm[5:3]
-                        let addr = self.xregs.read(rs1).wrapping_add(offset);
-                        self.write(addr, self.xregs.read(rs2), DOUBLEWORD)?;
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            1 => {
-                // Quadrant 1.
-                match funct3 {
-                    0x0 => {
-                        // c.addi
-                        // Expands to addi rd, rd, nzimm.
-                        inst_count!(self, "c.addi");
-                        self.debug(inst, "c.addi");
-
-                        let rd = (inst >> 7) & 0x1f;
-                        // nzimm[5|4:0] = inst[12|6:2]
-                        let mut nzimm = ((inst >> 7) & 0x20) | ((inst >> 2) & 0x1f);
-                        // Sign-extended.
-                        nzimm = match (nzimm & 0x20) == 0 {
-                            true => nzimm,
-                            false => (0xc0 | nzimm) as i8 as i64 as u64,
-                        };
-                        if rd != 0 {
-                            self.xregs
-                                .write(rd, self.xregs.read(rd).wrapping_add(nzimm));
+            if new_privilege_encoding < current_privilege_encoding {
+                return false;
+            } else if current_privilege_encoding == new_privilege_encoding {
+                match self.privilege_mode {
+                    PrivilegeMode::Machine => {
+                        if current_mie == 0 {
+                            return false;
                         }
                     }
-                    0x1 => {
-                        // c.addiw
-                        // Expands to addiw rd, rd, imm
-                        // "The immediate can be zero for C.ADDIW, where this corresponds to sext.w
-                        // rd"
-                        inst_count!(self, "c.addiw");
-                        self.debug(inst, "c.addiw");
-
-                        let rd = (inst >> 7) & 0x1f;
-                        // imm[5|4:0] = inst[12|6:2]
-                        let mut imm = ((inst >> 7) & 0x20) | ((inst >> 2) & 0x1f);
-                        // Sign-extended.
-                        imm = match (imm & 0x20) == 0 {
-                            true => imm,
-                            false => (0xc0 | imm) as i8 as i64 as u64,
-                        };
-                        if rd != 0 {
-                            self.xregs.write(
-                                rd,
-                                self.xregs.read(rd).wrapping_add(imm) as i32 as i64 as u64,
-                            );
+                    PrivilegeMode::Supervisor => {
+                        if current_sie == 0 {
+                            return false;
                         }
                     }
-                    0x2 => {
-                        // c.li
-                        // Expands to addi rd, x0, imm.
-                        inst_count!(self, "c.li");
-                        self.debug(inst, "c.li");
-
-                        let rd = (inst >> 7) & 0x1f;
-                        // imm[5|4:0] = inst[12|6:2]
-                        let mut imm = ((inst >> 7) & 0x20) | ((inst >> 2) & 0x1f);
-                        // Sign-extended.
-                        imm = match (imm & 0x20) == 0 {
-                            true => imm,
-                            false => (0xc0 | imm) as i8 as i64 as u64,
-                        };
-                        if rd != 0 {
-                            self.xregs.write(rd, imm);
+                    PrivilegeMode::User => {
+                        if current_uie == 0 {
+                            return false;
                         }
                     }
-                    0x3 => {
-                        let rd = (inst >> 7) & 0x1f;
-                        match rd {
-                            0 => {}
-                            2 => {
-                                // c.addi16sp
-                                // Expands to addi x2, x2, nzimm
-                                inst_count!(self, "c.addi16sp");
-                                self.debug(inst, "c.addi16sp");
-
-                                // nzimm[9|4|6|8:7|5] = inst[12|6|5|4:3|2]
-                                let mut nzimm = ((inst >> 3) & 0x200) // nzimm[9]
-                                    | ((inst >> 2) & 0x10) // nzimm[4]
-                                    | ((inst << 1) & 0x40) // nzimm[6]
-                                    | ((inst << 4) & 0x180) // nzimm[8:7]
-                                    | ((inst << 3) & 0x20); // nzimm[5]
-                                nzimm = match (nzimm & 0x200) == 0 {
-                                    true => nzimm,
-                                    // Sign-extended.
-                                    false => (0xfc00 | nzimm) as i16 as i32 as i64 as u64,
-                                };
-                                if nzimm != 0 {
-                                    self.xregs.write(2, self.xregs.read(2).wrapping_add(nzimm));
-                                }
-                            }
-                            _ => {
-                                // c.lui
-                                // Expands to lui rd, nzimm.
-                                inst_count!(self, "c.lui");
-                                self.debug(inst, "c.lui");
-
-                                // nzimm[17|16:12] = inst[12|6:2]
-                                let mut nzimm = ((inst << 5) & 0x20000) | ((inst << 10) & 0x1f000);
-                                // Sign-extended.
-                                nzimm = match (nzimm & 0x20000) == 0 {
-                                    true => nzimm,
-                                    false => (0xfffc0000 | nzimm) as i32 as i64 as u64,
-                                };
-                                if nzimm != 0 {
-                                    self.xregs.write(rd, nzimm);
-                                }
-                            }
-                        }
-                    }
-                    0x4 => {
-                        let funct2 = (inst >> 10) & 0x3;
-                        match funct2 {
-                            0x0 => {
-                                // c.srli
-                                // Expands to srli rd, rd, shamt, where rd=rd'+8.
-                                inst_count!(self, "c.srli");
-                                self.debug(inst, "c.srli");
-
-                                let rd = ((inst >> 7) & 0b111) + 8;
-                                // shamt[5|4:0] = inst[12|6:2]
-                                let shamt = ((inst >> 7) & 0x20) | ((inst >> 2) & 0x1f);
-                                self.xregs.write(rd, self.xregs.read(rd) >> shamt);
-                            }
-                            0x1 => {
-                                // c.srai
-                                // Expands to srai rd, rd, shamt, where rd=rd'+8.
-                                inst_count!(self, "c.srai");
-                                self.debug(inst, "c.srai");
-
-                                let rd = ((inst >> 7) & 0b111) + 8;
-                                // shamt[5|4:0] = inst[12|6:2]
-                                let shamt = ((inst >> 7) & 0x20) | ((inst >> 2) & 0x1f);
-                                self.xregs
-                                    .write(rd, ((self.xregs.read(rd) as i64) >> shamt) as u64);
-                            }
-                            0x2 => {
-                                // c.andi
-                                // Expands to andi rd, rd, imm, where rd=rd'+8.
-                                inst_count!(self, "c.andi");
-                                self.debug(inst, "c.andi");
-
-                                let rd = ((inst >> 7) & 0b111) + 8;
-                                // imm[5|4:0] = inst[12|6:2]
-                                let mut imm = ((inst >> 7) & 0x20) | ((inst >> 2) & 0x1f);
-                                // Sign-extended.
-                                imm = match (imm & 0x20) == 0 {
-                                    true => imm,
-                                    false => (0xc0 | imm) as i8 as i64 as u64,
-                                };
-                                self.xregs.write(rd, self.xregs.read(rd) & imm);
-                            }
-                            0x3 => {
-                                match ((inst >> 12) & 0b1, (inst >> 5) & 0b11) {
-                                    (0x0, 0x0) => {
-                                        // c.sub
-                                        // Expands to sub rd, rd, rs2, rd=rd'+8 and rs2=rs2'+8.
-                                        inst_count!(self, "c.sub");
-                                        self.debug(inst, "c.sub");
-
-                                        let rd = ((inst >> 7) & 0b111) + 8;
-                                        let rs2 = ((inst >> 2) & 0b111) + 8;
-                                        self.xregs.write(
-                                            rd,
-                                            self.xregs.read(rd).wrapping_sub(self.xregs.read(rs2)),
-                                        );
-                                    }
-                                    (0x0, 0x1) => {
-                                        // c.xor
-                                        // Expands to xor rd, rd, rs2, rd=rd'+8 and rs2=rs2'+8.
-                                        inst_count!(self, "c.xor");
-                                        self.debug(inst, "c.xor");
-
-                                        let rd = ((inst >> 7) & 0b111) + 8;
-                                        let rs2 = ((inst >> 2) & 0b111) + 8;
-                                        self.xregs
-                                            .write(rd, self.xregs.read(rd) ^ self.xregs.read(rs2));
-                                    }
-                                    (0x0, 0x2) => {
-                                        // c.or
-                                        // Expands to or rd, rd, rs2, rd=rd'+8 and rs2=rs2'+8.
-                                        inst_count!(self, "c.or");
-                                        self.debug(inst, "c.or");
-
-                                        let rd = ((inst >> 7) & 0b111) + 8;
-                                        let rs2 = ((inst >> 2) & 0b111) + 8;
-                                        self.xregs
-                                            .write(rd, self.xregs.read(rd) | self.xregs.read(rs2));
-                                    }
-                                    (0x0, 0x3) => {
-                                        // c.and
-                                        // Expands to and rd, rd, rs2, rd=rd'+8 and rs2=rs2'+8.
-                                        inst_count!(self, "c.and");
-                                        self.debug(inst, "c.and");
-
-                                        let rd = ((inst >> 7) & 0b111) + 8;
-                                        let rs2 = ((inst >> 2) & 0b111) + 8;
-                                        self.xregs
-                                            .write(rd, self.xregs.read(rd) & self.xregs.read(rs2));
-                                    }
-                                    (0x1, 0x0) => {
-                                        // c.subw
-                                        // Expands to subw rd, rd, rs2, rd=rd'+8 and rs2=rs2'+8.
-                                        inst_count!(self, "c.subw");
-                                        self.debug(inst, "c.subw");
-
-                                        let rd = ((inst >> 7) & 0b111) + 8;
-                                        let rs2 = ((inst >> 2) & 0b111) + 8;
-                                        self.xregs.write(
-                                            rd,
-                                            self.xregs.read(rd).wrapping_sub(self.xregs.read(rs2))
-                                                as i32
-                                                as i64
-                                                as u64,
-                                        );
-                                    }
-                                    (0x1, 0x1) => {
-                                        // c.addw
-                                        // Expands to addw rd, rd, rs2, rd=rd'+8 and rs2=rs2'+8.
-                                        inst_count!(self, "c.addw");
-                                        self.debug(inst, "c.andw");
-
-                                        let rd = ((inst >> 7) & 0b111) + 8;
-                                        let rs2 = ((inst >> 2) & 0b111) + 8;
-                                        self.xregs.write(
-                                            rd,
-                                            self.xregs.read(rd).wrapping_add(self.xregs.read(rs2))
-                                                as i32
-                                                as i64
-                                                as u64,
-                                        );
-                                    }
-                                    _ => {
-                                        return Err(Exception::IllegalInstruction(inst));
-                                    }
-                                }
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x5 => {
-                        // c.j
-                        // Expands to jal x0, offset.
-                        inst_count!(self, "c.j");
-                        self.debug(inst, "c.j");
-
-                        // offset[11|4|9:8|10|6|7|3:1|5] = inst[12|11|10:9|8|7|6|5:3|2]
-                        let mut offset = ((inst >> 1) & 0x800) // offset[11]
-                            | ((inst << 2) & 0x400) // offset[10]
-                            | ((inst >> 1) & 0x300) // offset[9:8]
-                            | ((inst << 1) & 0x80) // offset[7]
-                            | ((inst >> 1) & 0x40) // offset[6]
-                            | ((inst << 3) & 0x20) // offset[5]
-                            | ((inst >> 7) & 0x10) // offset[4]
-                            | ((inst >> 2) & 0xe); // offset[3:1]
-
-                        // Sign-extended.
-                        offset = match (offset & 0x800) == 0 {
-                            true => offset,
-                            false => (0xf000 | offset) as i16 as i64 as u64,
-                        };
-                        self.pc = self.pc.wrapping_add(offset).wrapping_sub(2);
-                    }
-                    0x6 => {
-                        // c.beqz
-                        // Expands to beq rs1, x0, offset, rs1=rs1'+8.
-                        inst_count!(self, "c.beqz");
-                        self.debug(inst, "c.beqz");
-
-                        let rs1 = ((inst >> 7) & 0b111) + 8;
-                        // offset[8|4:3|7:6|2:1|5] = inst[12|11:10|6:5|4:3|2]
-                        let mut offset = ((inst >> 4) & 0x100) // offset[8]
-                            | ((inst << 1) & 0xc0) // offset[7:6]
-                            | ((inst << 3) & 0x20) // offset[5]
-                            | ((inst >> 7) & 0x18) // offset[4:3]
-                            | ((inst >> 2) & 0x6); // offset[2:1]
-                                                   // Sign-extended.
-                        offset = match (offset & 0x100) == 0 {
-                            true => offset,
-                            false => (0xfe00 | offset) as i16 as i64 as u64,
-                        };
-                        if self.xregs.read(rs1) == 0 {
-                            self.pc = self.pc.wrapping_add(offset).wrapping_sub(2);
-                        }
-                    }
-                    0x7 => {
-                        // c.bnez
-                        // Expands to bne rs1, x0, offset, rs1=rs1'+8.
-                        inst_count!(self, "c.bnez");
-                        self.debug(inst, "c.beez");
-
-                        let rs1 = ((inst >> 7) & 0b111) + 8;
-                        // offset[8|4:3|7:6|2:1|5] = inst[12|11:10|6:5|4:3|2]
-                        let mut offset = ((inst >> 4) & 0x100) // offset[8]
-                            | ((inst << 1) & 0xc0) // offset[7:6]
-                            | ((inst << 3) & 0x20) // offset[5]
-                            | ((inst >> 7) & 0x18) // offset[4:3]
-                            | ((inst >> 2) & 0x6); // offset[2:1]
-                                                   // Sign-extended.
-                        offset = match (offset & 0x100) == 0 {
-                            true => offset,
-                            false => (0xfe00 | offset) as i16 as i64 as u64,
-                        };
-                        if self.xregs.read(rs1) != 0 {
-                            self.pc = self.pc.wrapping_add(offset).wrapping_sub(2);
-                        }
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            2 => {
-                // Quadrant 2.
-                match funct3 {
-                    0x0 => {
-                        // c.slli
-                        // Expands to slli rd, rd, shamt.
-                        inst_count!(self, "c.slli");
-                        self.debug(inst, "c.slli");
-
-                        let rd = (inst >> 7) & 0x1f;
-                        // shamt[5|4:0] = inst[12|6:2]
-                        let shamt = ((inst >> 7) & 0x20) | ((inst >> 2) & 0x1f);
-                        if rd != 0 {
-                            self.xregs.write(rd, self.xregs.read(rd) << shamt);
-                        }
-                    }
-                    0x1 => {
-                        // c.fldsp
-                        // Expands to fld rd, offset(x2).
-                        inst_count!(self, "c.fldsp");
-                        self.debug(inst, "c.fldsp");
-
-                        let rd = (inst >> 7) & 0x1f;
-                        // offset[5|4:3|8:6] = inst[12|6:5|4:2]
-                        let offset = ((inst << 4) & 0x1c0) // offset[8:6]
-                            | ((inst >> 7) & 0x20) // offset[5]
-                            | ((inst >> 2) & 0x18); // offset[4:3]
-                        let val =
-                            f64::from_bits(self.read(self.xregs.read(2) + offset, DOUBLEWORD)?);
-                        self.fregs.write(rd, val);
-                    }
-                    0x2 => {
-                        // c.lwsp
-                        // Expands to lw rd, offset(x2).
-                        inst_count!(self, "c.lwsp");
-                        self.debug(inst, "c.lwsp");
-
-                        let rd = (inst >> 7) & 0x1f;
-                        // offset[5|4:2|7:6] = inst[12|6:4|3:2]
-                        let offset = ((inst << 4) & 0xc0) // offset[7:6]
-                            | ((inst >> 7) & 0x20) // offset[5]
-                            | ((inst >> 2) & 0x1c); // offset[4:2]
-                        let val = self.read(self.xregs.read(2).wrapping_add(offset), WORD)?;
-                        self.xregs.write(rd, val as i32 as i64 as u64);
-                    }
-                    0x3 => {
-                        // c.ldsp
-                        // Expands to ld rd, offset(x2).
-                        inst_count!(self, "c.ldsp");
-                        self.debug(inst, "c.ldsp");
-
-                        let rd = (inst >> 7) & 0x1f;
-                        // offset[5|4:3|8:6] = inst[12|6:5|4:2]
-                        let offset = ((inst << 4) & 0x1c0) // offset[8:6]
-                            | ((inst >> 7) & 0x20) // offset[5]
-                            | ((inst >> 2) & 0x18); // offset[4:3]
-                        let val = self.read(self.xregs.read(2).wrapping_add(offset), DOUBLEWORD)?;
-                        self.xregs.write(rd, val);
-                    }
-                    0x4 => {
-                        match ((inst >> 12) & 0x1, (inst >> 2) & 0x1f) {
-                            (0, 0) => {
-                                // c.jr
-                                // Expands to jalr x0, 0(rs1).
-                                inst_count!(self, "c.jr");
-                                self.debug(inst, "c.jr");
-
-                                let rs1 = (inst >> 7) & 0x1f;
-                                if rs1 != 0 {
-                                    self.pc = self.xregs.read(rs1).wrapping_sub(2);
-                                }
-                            }
-                            (0, _) => {
-                                // c.mv
-                                // Expands to add rd, x0, rs2.
-                                inst_count!(self, "c.mv");
-                                self.debug(inst, "c.mv");
-
-                                let rd = (inst >> 7) & 0x1f;
-                                let rs2 = (inst >> 2) & 0x1f;
-                                if rs2 != 0 {
-                                    self.xregs.write(rd, self.xregs.read(rs2));
-                                }
-                            }
-                            (1, 0) => {
-                                let rd = (inst >> 7) & 0x1f;
-                                if rd == 0 {
-                                    // c.ebreak
-                                    // Expands to ebreak.
-                                    inst_count!(self, "c.ebreak");
-                                    self.debug(inst, "c.ebreak");
-
-                                    return Err(Exception::Breakpoint);
-                                } else {
-                                    // c.jalr
-                                    // Expands to jalr x1, 0(rs1).
-                                    inst_count!(self, "c.jalr");
-                                    self.debug(inst, "c.jalr");
-
-                                    let rs1 = (inst >> 7) & 0x1f;
-                                    let t = self.pc.wrapping_add(2);
-                                    self.pc = self.xregs.read(rs1).wrapping_sub(2);
-                                    self.xregs.write(1, t);
-                                }
-                            }
-                            (1, _) => {
-                                // c.add
-                                // Expands to add rd, rd, rs2.
-                                inst_count!(self, "c.add");
-                                self.debug(inst, "c.add");
-
-                                let rd = (inst >> 7) & 0x1f;
-                                let rs2 = (inst >> 2) & 0x1f;
-                                if rs2 != 0 {
-                                    self.xregs.write(
-                                        rd,
-                                        self.xregs.read(rd).wrapping_add(self.xregs.read(rs2)),
-                                    );
-                                }
-                            }
-                            (_, _) => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x5 => {
-                        // c.fsdsp
-                        // Expands to fsd rs2, offset(x2).
-                        inst_count!(self, "c.fsdsp");
-                        self.debug(inst, "c.fsdsp");
-
-                        let rs2 = (inst >> 2) & 0x1f;
-                        // offset[5:3|8:6] = isnt[12:10|9:7]
-                        let offset = ((inst >> 1) & 0x1c0) // offset[8:6]
-                            | ((inst >> 7) & 0x38); // offset[5:3]
-                        let addr = self.xregs.read(2).wrapping_add(offset);
-                        self.write(addr, self.fregs.read(rs2).to_bits(), DOUBLEWORD)?;
-                    }
-                    0x6 => {
-                        // c.swsp
-                        // Expands to sw rs2, offset(x2).
-                        inst_count!(self, "c.swsp");
-                        self.debug(inst, "c.swsp");
-
-                        let rs2 = (inst >> 2) & 0x1f;
-                        // offset[5:2|7:6] = inst[12:9|8:7]
-                        let offset = ((inst >> 1) & 0xc0) // offset[7:6]
-                            | ((inst >> 7) & 0x3c); // offset[5:2]
-                        let addr = self.xregs.read(2).wrapping_add(offset);
-                        self.write(addr, self.xregs.read(rs2), WORD)?;
-                    }
-                    0x7 => {
-                        // c.sdsp
-                        // Expands to sd rs2, offset(x2).
-                        inst_count!(self, "c.sdsp");
-                        self.debug(inst, "c.sdsp");
-
-                        let rs2 = (inst >> 2) & 0x1f;
-                        // offset[5:3|8:6] = isnt[12:10|9:7]
-                        let offset = ((inst >> 1) & 0x1c0) // offset[8:6]
-                            | ((inst >> 7) & 0x38); // offset[5:3]
-                        let addr = self.xregs.read(2).wrapping_add(offset);
-                        self.write(addr, self.xregs.read(rs2), DOUBLEWORD)?;
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            _ => {
-                return Err(Exception::IllegalInstruction(inst));
-            }
-        }
-        Ok(())
-    }
-
-    /// Execute a general-purpose instruction. Raises an exception if something is wrong,
-    /// otherwise, returns a fetched instruction. It also increments the program counter by 4 bytes.
-    fn execute_general(&mut self, inst: u64) -> Result<(), Exception> {
-        // 2. Decode.
-        let opcode = inst & 0x0000007f;
-        let rd = (inst & 0x00000f80) >> 7;
-        let rs1 = (inst & 0x000f8000) >> 15;
-        let rs2 = (inst & 0x01f00000) >> 20;
-        let funct3 = (inst & 0x00007000) >> 12;
-        let funct7 = (inst & 0xfe000000) >> 25;
-
-        // 3. Execute.
-        match opcode {
-            0x03 => {
-                // RV32I and RV64I
-                // imm[11:0] = inst[31:20]
-                let offset = ((inst as i32 as i64) >> 20) as u64;
-                let addr = self.xregs.read(rs1).wrapping_add(offset);
-                match funct3 {
-                    0x0 => {
-                        // lb
-                        inst_count!(self, "lb");
-                        self.debug(inst, "lb");
-
-                        let val = self.read(addr, BYTE)?;
-                        self.xregs.write(rd, val as i8 as i64 as u64);
-                    }
-                    0x1 => {
-                        // lh
-                        inst_count!(self, "lh");
-                        self.debug(inst, "lh");
-
-                        let val = self.read(addr, HALFWORD)?;
-                        self.xregs.write(rd, val as i16 as i64 as u64);
-                    }
-                    0x2 => {
-                        // lw
-                        inst_count!(self, "lw");
-                        self.debug(inst, "lw");
-
-                        let val = self.read(addr, WORD)?;
-                        self.xregs.write(rd, val as i32 as i64 as u64);
-                    }
-                    0x3 => {
-                        // ld
-                        inst_count!(self, "ld");
-                        self.debug(inst, "ld");
-
-                        let val = self.read(addr, DOUBLEWORD)?;
-                        self.xregs.write(rd, val);
-                    }
-                    0x4 => {
-                        // lbu
-                        inst_count!(self, "lbu");
-                        self.debug(inst, "lbu");
-
-                        let val = self.read(addr, BYTE)?;
-                        self.xregs.write(rd, val);
-                    }
-                    0x5 => {
-                        // lhu
-                        inst_count!(self, "lhu");
-                        self.debug(inst, "lhu");
-
-                        let val = self.read(addr, HALFWORD)?;
-                        self.xregs.write(rd, val);
-                    }
-                    0x6 => {
-                        // lwu
-                        inst_count!(self, "lwu");
-                        self.debug(inst, "lwu");
-
-                        let val = self.read(addr, WORD)?;
-                        self.xregs.write(rd, val);
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x07 => {
-                // RV32D and RV64D
-                // imm[11:0] = inst[31:20]
-                let offset = ((inst as i32 as i64) >> 20) as u64;
-                let addr = self.xregs.read(rs1).wrapping_add(offset);
-                match funct3 {
-                    0x2 => {
-                        // flw
-                        inst_count!(self, "flw");
-                        self.debug(inst, "flw");
-
-                        let val = f32::from_bits(self.read(addr, WORD)? as u32);
-                        self.fregs.write(rd, val as f64);
-                    }
-                    0x3 => {
-                        // fld
-                        inst_count!(self, "fld");
-                        self.debug(inst, "fld");
-
-                        let val = f64::from_bits(self.read(addr, DOUBLEWORD)?);
-                        self.fregs.write(rd, val);
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x0f => {
-                // RV32I and RV64I
-                // fence instructions are not supported yet because this emulator executes an
-                // instruction sequentially on a single thread.
-                // fence.i is a part of the Zifencei extension.
-                match funct3 {
-                    0x0 => {
-                        // fence
-                        inst_count!(self, "fence");
-                        self.debug(inst, "fence");
-                    }
-                    0x1 => {
-                        // fence.i
-                        inst_count!(self, "fence.i");
-                        self.debug(inst, "fence.i");
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x13 => {
-                // RV32I and RV64I
-                // imm[11:0] = inst[31:20]
-                let imm = ((inst as i32 as i64) >> 20) as u64;
-                let funct6 = funct7 >> 1;
-                match funct3 {
-                    0x0 => {
-                        // addi
-                        inst_count!(self, "addi");
-                        self.debug(inst, "addi");
-
-                        self.xregs.write(rd, self.xregs.read(rs1).wrapping_add(imm));
-                    }
-                    0x1 => {
-                        // slli
-                        inst_count!(self, "slli");
-                        self.debug(inst, "slli");
-
-                        // shamt size is 5 bits for RV32I and 6 bits for RV64I.
-                        let shamt = (inst >> 20) & 0x3f;
-                        self.xregs.write(rd, self.xregs.read(rs1) << shamt);
-                    }
-                    0x2 => {
-                        // slti
-                        inst_count!(self, "slti");
-                        self.debug(inst, "slti");
-
-                        self.xregs.write(
-                            rd,
-                            if (self.xregs.read(rs1) as i64) < (imm as i64) {
-                                1
-                            } else {
-                                0
-                            },
-                        );
-                    }
-                    0x3 => {
-                        // sltiu
-                        inst_count!(self, "sltiu");
-                        self.debug(inst, "sltiu");
-
-                        self.xregs
-                            .write(rd, if self.xregs.read(rs1) < imm { 1 } else { 0 });
-                    }
-                    0x4 => {
-                        // xori
-                        inst_count!(self, "xori");
-                        self.debug(inst, "xori");
-
-                        self.xregs.write(rd, self.xregs.read(rs1) ^ imm);
-                    }
-                    0x5 => {
-                        match funct6 {
-                            0x00 => {
-                                // srli
-                                inst_count!(self, "srli");
-                                self.debug(inst, "srli");
-
-                                // shamt size is 5 bits for RV32I and 6 bits for RV64I.
-                                let shamt = (inst >> 20) & 0x3f;
-                                self.xregs.write(rd, self.xregs.read(rs1) >> shamt);
-                            }
-                            0x10 => {
-                                // srai
-                                inst_count!(self, "srai");
-                                self.debug(inst, "srai");
-
-                                // shamt size is 5 bits for RV32I and 6 bits for RV64I.
-                                let shamt = (inst >> 20) & 0x3f;
-                                self.xregs
-                                    .write(rd, ((self.xregs.read(rs1) as i64) >> shamt) as u64);
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x6 => {
-                        // ori
-                        inst_count!(self, "ori");
-                        self.debug(inst, "ori");
-
-                        self.xregs.write(rd, self.xregs.read(rs1) | imm);
-                    }
-                    0x7 => {
-                        // andi
-                        inst_count!(self, "andi");
-                        self.debug(inst, "andi");
-
-                        self.xregs.write(rd, self.xregs.read(rs1) & imm);
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x17 => {
-                // RV32I
-                // auipc
-                inst_count!(self, "auipc");
-                self.debug(inst, "auipc");
-
-                // AUIPC forms a 32-bit offset from the 20-bit U-immediate, filling
-                // in the lowest 12 bits with zeros.
-                // imm[31:12] = inst[31:12]
-                let imm = (inst & 0xfffff000) as i32 as i64 as u64;
-                self.xregs.write(rd, self.pc.wrapping_add(imm));
-            }
-            0x1b => {
-                // RV64I
-                // imm[11:0] = inst[31:20]
-                let imm = ((inst as i32 as i64) >> 20) as u64;
-                match funct3 {
-                    0x0 => {
-                        // addiw
-                        inst_count!(self, "addiw");
-                        self.debug(inst, "addiw");
-
-                        self.xregs.write(
-                            rd,
-                            self.xregs.read(rs1).wrapping_add(imm) as i32 as i64 as u64,
-                        );
-                    }
-                    0x1 => {
-                        // slliw
-                        inst_count!(self, "slliw");
-                        self.debug(inst, "slliw");
-
-                        // "SLLIW, SRLIW, and SRAIW encodings with imm[5] ̸= 0 are reserved."
-                        let shamt = (imm & 0x1f) as u32;
-                        self.xregs
-                            .write(rd, (self.xregs.read(rs1) << shamt) as i32 as i64 as u64);
-                    }
-                    0x5 => {
-                        match funct7 {
-                            0x00 => {
-                                // srliw
-                                inst_count!(self, "srliw");
-                                self.debug(inst, "srliw");
-
-                                // "SLLIW, SRLIW, and SRAIW encodings with imm[5] ̸= 0 are reserved."
-                                let shamt = (imm & 0x1f) as u32;
-                                self.xregs.write(
-                                    rd,
-                                    ((self.xregs.read(rs1) as u32) >> shamt) as i32 as i64 as u64,
-                                )
-                            }
-                            0x20 => {
-                                // sraiw
-                                inst_count!(self, "sraiw");
-                                self.debug(inst, "sraiw");
-
-                                // "SLLIW, SRLIW, and SRAIW encodings with imm[5] ̸= 0 are reserved."
-                                let shamt = (imm & 0x1f) as u32;
-                                self.xregs.write(
-                                    rd,
-                                    ((self.xregs.read(rs1) as i32) >> shamt) as i64 as u64,
-                                );
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x23 => {
-                // RV32I
-                // offset[11:5|4:0] = inst[31:25|11:7]
-                let offset =
-                    (((inst & 0xfe000000) as i32 as i64 >> 20) as u64) | ((inst >> 7) & 0x1f);
-                let addr = self.xregs.read(rs1).wrapping_add(offset);
-                match funct3 {
-                    0x0 => {
-                        // sb
-                        inst_count!(self, "sb");
-                        self.debug(inst, "sb");
-
-                        self.write(addr, self.xregs.read(rs2), BYTE)?
-                    }
-                    0x1 => {
-                        // sh
-                        inst_count!(self, "sh");
-                        self.debug(inst, "sh");
-
-                        self.write(addr, self.xregs.read(rs2), HALFWORD)?
-                    }
-                    0x2 => {
-                        // sw
-                        inst_count!(self, "sw");
-                        self.debug(inst, "sw");
-
-                        self.write(addr, self.xregs.read(rs2), WORD)?
-                    }
-                    0x3 => {
-                        // sd
-                        inst_count!(self, "sd");
-                        self.debug(inst, "sd");
-
-                        self.write(addr, self.xregs.read(rs2), DOUBLEWORD)?
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x27 => {
-                // RV32F and RV64F
-                // offset[11:5|4:0] = inst[31:25|11:7]
-                let offset = ((((inst as i32 as i64) >> 20) as u64) & 0xfe0) | ((inst >> 7) & 0x1f);
-                let addr = self.xregs.read(rs1).wrapping_add(offset);
-                match funct3 {
-                    0x2 => {
-                        // fsw
-                        inst_count!(self, "fsw");
-                        self.debug(inst, "fsw");
-
-                        self.write(addr, (self.fregs.read(rs2) as f32).to_bits() as u64, WORD)?
-                    }
-                    0x3 => {
-                        // fsd
-                        inst_count!(self, "fsd");
-                        self.debug(inst, "fsd");
-
-                        self.write(addr, self.fregs.read(rs2).to_bits() as u64, DOUBLEWORD)?
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x2f => {
-                // RV32A and RV64A
-                let funct5 = (funct7 & 0b1111100) >> 2;
-                // TODO: Handle `aq` and `rl`.
-                let _aq = (funct7 & 0b0000010) >> 1; // acquire access
-                let _rl = funct7 & 0b0000001; // release access
-                match (funct3, funct5) {
-                    (0x2, 0x00) => {
-                        // amoadd.w
-                        inst_count!(self, "amoadd.w");
-                        self.debug(inst, "amoadd.w");
-
-                        let addr = self.xregs.read(rs1);
-                        // "For AMOs, the A extension requires that the address held in rs1 be
-                        // naturally aligned to the size of the operand (i.e., eight-byte aligned
-                        // for 64-bit words and four-byte aligned for 32-bit words). If the
-                        // address is not naturally aligned, an address-misaligned exception or
-                        // an access-fault exception will be generated."
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(addr, t.wrapping_add(self.xregs.read(rs2)), WORD)?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x00) => {
-                        // amoadd.d
-                        inst_count!(self, "amoadd.d");
-                        self.debug(inst, "amoadd.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(addr, t.wrapping_add(self.xregs.read(rs2)), DOUBLEWORD)?;
-                        self.xregs.write(rd, t);
-                    }
-                    (0x2, 0x01) => {
-                        // amoswap.w
-                        inst_count!(self, "amoswap.w");
-                        self.debug(inst, "amoswap.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(addr, self.xregs.read(rs2), WORD)?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x01) => {
-                        // amoswap.d
-                        inst_count!(self, "amoswap.d");
-                        self.debug(inst, "amoswap.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(addr, self.xregs.read(rs2), DOUBLEWORD)?;
-                        self.xregs.write(rd, t);
-                    }
-                    (0x2, 0x02) => {
-                        // lr.w
-                        inst_count!(self, "lr.w");
-                        self.debug(inst, "lr.w");
-
-                        let addr = self.xregs.read(rs1);
-                        // "For LR and SC, the A extension requires that the address held in rs1 be
-                        // naturally aligned to the size of the operand (i.e., eight-byte aligned
-                        // for 64-bit words and four-byte aligned for 32-bit words)."
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let value = self.read(addr, WORD)?;
-                        self.xregs.write(rd, value as i32 as i64 as u64);
-                        self.reservation_set.push(addr);
-                    }
-                    (0x3, 0x02) => {
-                        // lr.d
-                        inst_count!(self, "lr.d");
-                        self.debug(inst, "lr.d");
-
-                        let addr = self.xregs.read(rs1);
-                        // "For LR and SC, the A extension requires that the address held in rs1 be
-                        // naturally aligned to the size of the operand (i.e., eight-byte aligned for
-                        // 64-bit words and four-byte aligned for 32-bit words)."
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let value = self.read(addr, DOUBLEWORD)?;
-                        self.xregs.write(rd, value);
-                        self.reservation_set.push(addr);
-                    }
-                    (0x2, 0x03) => {
-                        // sc.w
-                        inst_count!(self, "sc.w");
-                        self.debug(inst, "sc.w");
-
-                        let addr = self.xregs.read(rs1);
-                        // "For LR and SC, the A extension requires that the address held in rs1 be
-                        // naturally aligned to the size of the operand (i.e., eight-byte aligned for
-                        // 64-bit words and four-byte aligned for 32-bit words)."
-                        if addr % 4 != 0 {
-                            return Err(Exception::StoreAMOAddressMisaligned);
-                        }
-                        if self.reservation_set.contains(&addr) {
-                            // "Regardless of success or failure, executing an SC.W instruction
-                            // invalidates any reservation held by this hart. "
-                            self.reservation_set.retain(|&x| x != addr);
-                            self.write(addr, self.xregs.read(rs2), WORD)?;
-                            self.xregs.write(rd, 0);
-                        } else {
-                            self.reservation_set.retain(|&x| x != addr);
-                            self.xregs.write(rd, 1);
-                        };
-                    }
-                    (0x3, 0x03) => {
-                        // sc.d
-                        inst_count!(self, "sc.d");
-                        self.debug(inst, "sc.d");
-
-                        let addr = self.xregs.read(rs1);
-                        // "For LR and SC, the A extension requires that the address held in rs1 be
-                        // naturally aligned to the size of the operand (i.e., eight-byte aligned for
-                        // 64-bit words and four-byte aligned for 32-bit words)."
-                        if addr % 8 != 0 {
-                            return Err(Exception::StoreAMOAddressMisaligned);
-                        }
-                        if self.reservation_set.contains(&addr) {
-                            self.reservation_set.retain(|&x| x != addr);
-                            self.write(addr, self.xregs.read(rs2), DOUBLEWORD)?;
-                            self.xregs.write(rd, 0);
-                        } else {
-                            self.reservation_set.retain(|&x| x != addr);
-                            self.xregs.write(rd, 1);
-                        }
-                    }
-                    (0x2, 0x04) => {
-                        // amoxor.w
-                        inst_count!(self, "amoxor.w");
-                        self.debug(inst, "amoxor.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(
-                            addr,
-                            (t as i32 ^ (self.xregs.read(rs2) as i32)) as i64 as u64,
-                            WORD,
-                        )?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x04) => {
-                        // amoxor.d
-                        inst_count!(self, "amoxor.d");
-                        self.debug(inst, "amoxor.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(addr, t ^ self.xregs.read(rs2), DOUBLEWORD)?;
-                        self.xregs.write(rd, t);
-                    }
-                    (0x2, 0x08) => {
-                        // amoor.w
-                        inst_count!(self, "amoor.w");
-                        self.debug(inst, "amoor.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(
-                            addr,
-                            (t as i32 | (self.xregs.read(rs2) as i32)) as i64 as u64,
-                            WORD,
-                        )?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x08) => {
-                        // amoor.d
-                        inst_count!(self, "amoor.d");
-                        self.debug(inst, "amoor.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(addr, t | self.xregs.read(rs2), DOUBLEWORD)?;
-                        self.xregs.write(rd, t);
-                    }
-                    (0x2, 0x0c) => {
-                        // amoand.w
-                        inst_count!(self, "amoand.w");
-                        self.debug(inst, "amoand.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(
-                            addr,
-                            (t as i32 & (self.xregs.read(rs2) as i32)) as u32 as u64,
-                            WORD,
-                        )?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x0c) => {
-                        // amoand.d
-                        inst_count!(self, "amoand.d");
-                        self.debug(inst, "amoand.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(addr, t & self.xregs.read(rs2), DOUBLEWORD)?;
-                        self.xregs.write(rd, t);
-                    }
-                    (0x2, 0x10) => {
-                        // amomin.w
-                        inst_count!(self, "amomin.w");
-                        self.debug(inst, "amomin.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(
-                            addr,
-                            cmp::min(t as i32, self.xregs.read(rs2) as i32) as i64 as u64,
-                            WORD,
-                        )?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x10) => {
-                        // amomin.d
-                        inst_count!(self, "amomin.d");
-                        self.debug(inst, "amomin.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(
-                            addr,
-                            cmp::min(t as i64, self.xregs.read(rs2) as i64) as u64,
-                            DOUBLEWORD,
-                        )?;
-                        self.xregs.write(rd, t as u64);
-                    }
-                    (0x2, 0x14) => {
-                        // amomax.w
-                        inst_count!(self, "amomax.w");
-                        self.debug(inst, "amomax.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(
-                            addr,
-                            cmp::max(t as i32, self.xregs.read(rs2) as i32) as i64 as u64,
-                            WORD,
-                        )?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x14) => {
-                        // amomax.d
-                        inst_count!(self, "amomax.d");
-                        self.debug(inst, "amomax.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(
-                            addr,
-                            cmp::max(t as i64, self.xregs.read(rs2) as i64) as u64,
-                            DOUBLEWORD,
-                        )?;
-                        self.xregs.write(rd, t);
-                    }
-                    (0x2, 0x18) => {
-                        // amominu.w
-                        inst_count!(self, "amominu.w");
-                        self.debug(inst, "amominu.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(
-                            addr,
-                            cmp::min(t as u32, self.xregs.read(rs2) as u32) as u64,
-                            WORD,
-                        )?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x18) => {
-                        // amominu.d
-                        inst_count!(self, "amominu.d");
-                        self.debug(inst, "amominu.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(addr, cmp::min(t, self.xregs.read(rs2)), DOUBLEWORD)?;
-                        self.xregs.write(rd, t);
-                    }
-                    (0x2, 0x1c) => {
-                        // amomaxu.w
-                        inst_count!(self, "amomaxu.w");
-                        self.debug(inst, "amomaxu.w");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 4 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, WORD)?;
-                        self.write(
-                            addr,
-                            cmp::max(t as u32, self.xregs.read(rs2) as u32) as u64,
-                            WORD,
-                        )?;
-                        self.xregs.write(rd, t as i32 as i64 as u64);
-                    }
-                    (0x3, 0x1c) => {
-                        // amomaxu.d
-                        inst_count!(self, "amomaxu.d");
-                        self.debug(inst, "amomaxu.d");
-
-                        let addr = self.xregs.read(rs1);
-                        if addr % 8 != 0 {
-                            return Err(Exception::LoadAddressMisaligned);
-                        }
-                        let t = self.read(addr, DOUBLEWORD)?;
-                        self.write(addr, cmp::max(t, self.xregs.read(rs2)), DOUBLEWORD)?;
-                        self.xregs.write(rd, t);
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
-            }
-            0x33 => {
-                // RV64I and RV64M
-                match (funct3, funct7) {
-                    (0x0, 0x00) => {
-                        // add
-                        inst_count!(self, "add");
-                        self.debug(inst, "add");
-
-                        self.xregs
-                            .write(rd, self.xregs.read(rs1).wrapping_add(self.xregs.read(rs2)));
-                    }
-                    (0x0, 0x01) => {
-                        // mul
-                        inst_count!(self, "mul");
-                        self.debug(inst, "mul");
-
-                        self.xregs.write(
-                            rd,
-                            (self.xregs.read(rs1) as i64).wrapping_mul(self.xregs.read(rs2) as i64)
-                                as u64,
-                        );
-                    }
-                    (0x0, 0x20) => {
-                        // sub
-                        inst_count!(self, "sub");
-                        self.debug(inst, "sub");
-
-                        self.xregs
-                            .write(rd, self.xregs.read(rs1).wrapping_sub(self.xregs.read(rs2)));
-                    }
-                    (0x1, 0x00) => {
-                        // sll
-                        inst_count!(self, "sll");
-                        self.debug(inst, "sll");
-
-                        // "SLL, SRL, and SRA perform logical left, logical right, and arithmetic
-                        // right shifts on the value in register rs1 by the shift amount held in
-                        // register rs2. In RV64I, only the low 6 bits of rs2 are considered for the
-                        // shift amount."
-                        let shamt = self.xregs.read(rs2) & 0x3f;
-                        self.xregs.write(rd, self.xregs.read(rs1) << shamt);
-                    }
-                    (0x1, 0x01) => {
-                        // mulh
-                        inst_count!(self, "mulh");
-                        self.debug(inst, "mulh");
-
-                        // signed × signed
-                        self.xregs.write(
-                            rd,
-                            ((self.xregs.read(rs1) as i64 as i128)
-                                .wrapping_mul(self.xregs.read(rs2) as i64 as i128)
-                                >> 64) as u64,
-                        );
-                    }
-                    (0x2, 0x00) => {
-                        // slt
-                        inst_count!(self, "slt");
-                        self.debug(inst, "slt");
-
-                        self.xregs.write(
-                            rd,
-                            if (self.xregs.read(rs1) as i64) < (self.xregs.read(rs2) as i64) {
-                                1
-                            } else {
-                                0
-                            },
-                        );
-                    }
-                    (0x2, 0x01) => {
-                        // mulhsu
-                        inst_count!(self, "mulhsu");
-                        self.debug(inst, "mulhsu");
-
-                        // signed × unsigned
-                        self.xregs.write(
-                            rd,
-                            ((self.xregs.read(rs1) as i64 as i128 as u128)
-                                .wrapping_mul(self.xregs.read(rs2) as u128)
-                                >> 64) as u64,
-                        );
-                    }
-                    (0x3, 0x00) => {
-                        // sltu
-                        inst_count!(self, "sltu");
-                        self.debug(inst, "sltu");
-
-                        self.xregs.write(
-                            rd,
-                            if self.xregs.read(rs1) < self.xregs.read(rs2) {
-                                1
-                            } else {
-                                0
-                            },
-                        );
-                    }
-                    (0x3, 0x01) => {
-                        // mulhu
-                        inst_count!(self, "mulhu");
-                        self.debug(inst, "mulhu");
-
-                        // unsigned × unsigned
-                        self.xregs.write(
-                            rd,
-                            ((self.xregs.read(rs1) as u128)
-                                .wrapping_mul(self.xregs.read(rs2) as u128)
-                                >> 64) as u64,
-                        );
-                    }
-                    (0x4, 0x00) => {
-                        // xor
-                        inst_count!(self, "xor");
-                        self.debug(inst, "xor");
-
-                        self.xregs
-                            .write(rd, self.xregs.read(rs1) ^ self.xregs.read(rs2));
-                    }
-                    (0x4, 0x01) => {
-                        // div
-                        inst_count!(self, "div");
-                        self.debug(inst, "div");
-
-                        let dividend = self.xregs.read(rs1) as i64;
-                        let divisor = self.xregs.read(rs2) as i64;
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // Set DZ (Divide by Zero) flag to 1.
-                                self.state.write_bit(FCSR, 3, 1);
-                                // "The quotient of division by zero has all bits set"
-                                u64::MAX
-                            } else if dividend == i64::MIN && divisor == -1 {
-                                // Overflow
-                                // "The quotient of a signed division with overflow is equal to the
-                                // dividend"
-                                dividend as u64
-                            } else {
-                                // "division of rs1 by rs2, rounding towards zero"
-                                dividend.wrapping_div(divisor) as u64
-                            },
-                        );
-                    }
-                    (0x5, 0x00) => {
-                        // srl
-                        inst_count!(self, "srl");
-                        self.debug(inst, "srl");
-
-                        // "SLL, SRL, and SRA perform logical left, logical right, and arithmetic
-                        // right shifts on the value in register rs1 by the shift amount held in
-                        // register rs2. In RV64I, only the low 6 bits of rs2 are considered for the
-                        // shift amount."
-                        let shamt = self.xregs.read(rs2) & 0x3f;
-                        self.xregs.write(rd, self.xregs.read(rs1) >> shamt);
-                    }
-                    (0x5, 0x01) => {
-                        // divu
-                        inst_count!(self, "divu");
-                        self.debug(inst, "divu");
-
-                        let dividend = self.xregs.read(rs1);
-                        let divisor = self.xregs.read(rs2);
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // Set DZ (Divide by Zero) flag to 1.
-                                self.state.write_bit(FCSR, 3, 1);
-                                // "The quotient of division by zero has all bits set"
-                                u64::MAX
-                            } else {
-                                // "division of rs1 by rs2, rounding towards zero"
-                                dividend.wrapping_div(divisor)
-                            },
-                        );
-                    }
-                    (0x5, 0x20) => {
-                        // sra
-                        inst_count!(self, "sra");
-                        self.debug(inst, "sra");
-
-                        // "SLL, SRL, and SRA perform logical left, logical right, and arithmetic
-                        // right shifts on the value in register rs1 by the shift amount held in
-                        // register rs2. In RV64I, only the low 6 bits of rs2 are considered for the
-                        // shift amount."
-                        let shamt = self.xregs.read(rs2) & 0x3f;
-                        self.xregs
-                            .write(rd, ((self.xregs.read(rs1) as i64) >> shamt) as u64);
-                    }
-                    (0x6, 0x00) => {
-                        // or
-                        inst_count!(self, "or");
-                        self.debug(inst, "or");
-
-                        self.xregs
-                            .write(rd, self.xregs.read(rs1) | self.xregs.read(rs2));
-                    }
-                    (0x6, 0x01) => {
-                        // rem
-                        inst_count!(self, "rem");
-                        self.debug(inst, "rem");
-
-                        let dividend = self.xregs.read(rs1) as i64;
-                        let divisor = self.xregs.read(rs2) as i64;
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // "the remainder of division by zero equals the dividend"
-                                dividend as u64
-                            } else if dividend == i64::MIN && divisor == -1 {
-                                // Overflow
-                                // "the remainder is zero"
-                                0
-                            } else {
-                                // "provide the remainder of the corresponding division
-                                // operation"
-                                dividend.wrapping_rem(divisor) as u64
-                            },
-                        );
-                    }
-                    (0x7, 0x00) => {
-                        // and
-                        inst_count!(self, "and");
-                        self.debug(inst, "and");
-
-                        self.xregs
-                            .write(rd, self.xregs.read(rs1) & self.xregs.read(rs2));
-                    }
-                    (0x7, 0x01) => {
-                        // remu
-                        inst_count!(self, "remu");
-                        self.debug(inst, "remu");
-
-                        let dividend = self.xregs.read(rs1);
-                        let divisor = self.xregs.read(rs2);
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // "the remainder of division by zero equals the dividend"
-                                dividend
-                            } else {
-                                // "provide the remainder of the corresponding division
-                                // operation"
-                                dividend.wrapping_rem(divisor)
-                            },
-                        );
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
+                    PrivilegeMode::Reserved => panic!(),
                 };
             }
-            0x37 => {
-                // RV32I
-                // lui
-                inst_count!(self, "lui");
-                self.debug(inst, "lui");
 
-                // "LUI places the U-immediate value in the top 20 bits of the destination
-                // register rd, filling in the lowest 12 bits with zeros."
-                self.xregs
-                    .write(rd, (inst & 0xfffff000) as i32 as i64 as u64);
-            }
-            0x3b => {
-                // RV64I and RV64M
-                match (funct3, funct7) {
-                    (0x0, 0x00) => {
-                        // addw
-                        inst_count!(self, "addw");
-                        self.debug(inst, "addw");
+            // Interrupt can be maskable by xie csr register
+            // where x is a new privilege mode.
 
-                        self.xregs.write(
-                            rd,
-                            self.xregs.read(rs1).wrapping_add(self.xregs.read(rs2)) as i32 as i64
-                                as u64,
-                        );
-                    }
-                    (0x0, 0x01) => {
-                        // mulw
-                        inst_count!(self, "mulw");
-                        self.debug(inst, "mulw");
-
-                        let n1 = self.xregs.read(rs1) as i32;
-                        let n2 = self.xregs.read(rs2) as i32;
-                        let result = n1.wrapping_mul(n2);
-                        self.xregs.write(rd, result as i64 as u64);
-                    }
-                    (0x0, 0x20) => {
-                        // subw
-                        inst_count!(self, "subw");
-                        self.debug(inst, "subw");
-
-                        self.xregs.write(
-                            rd,
-                            ((self.xregs.read(rs1).wrapping_sub(self.xregs.read(rs2))) as i32)
-                                as u64,
-                        );
-                    }
-                    (0x1, 0x00) => {
-                        // sllw
-                        inst_count!(self, "sllw");
-                        self.debug(inst, "sllw");
-
-                        // The shift amount is given by rs2[4:0].
-                        let shamt = self.xregs.read(rs2) & 0x1f;
-                        self.xregs
-                            .write(rd, ((self.xregs.read(rs1)) << shamt) as i32 as i64 as u64);
-                    }
-                    (0x4, 0x01) => {
-                        // divw
-                        inst_count!(self, "divw");
-                        self.debug(inst, "divw");
-
-                        let dividend = self.xregs.read(rs1) as i32;
-                        let divisor = self.xregs.read(rs2) as i32;
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // Set DZ (Divide by Zero) flag to 1.
-                                self.state.write_bit(FCSR, 3, 1);
-                                // "The quotient of division by zero has all bits set"
-                                u64::MAX
-                            } else if dividend == i32::MIN && divisor == -1 {
-                                // Overflow
-                                // "The quotient of a signed division with overflow is equal to the
-                                // dividend"
-                                dividend as i64 as u64
-                            } else {
-                                // "division of rs1 by rs2, rounding towards zero"
-                                dividend.wrapping_div(divisor) as i64 as u64
-                            },
-                        );
-                    }
-                    (0x5, 0x00) => {
-                        // srlw
-                        inst_count!(self, "srlw");
-                        self.debug(inst, "srlw");
-
-                        // The shift amount is given by rs2[4:0].
-                        let shamt = self.xregs.read(rs2) & 0x1f;
-                        self.xregs.write(
-                            rd,
-                            ((self.xregs.read(rs1) as u32) >> shamt) as i32 as i64 as u64,
-                        );
-                    }
-                    (0x5, 0x01) => {
-                        // divuw
-                        inst_count!(self, "divuw");
-                        self.debug(inst, "divuw");
-
-                        let dividend = self.xregs.read(rs1) as u32;
-                        let divisor = self.xregs.read(rs2) as u32;
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // Set DZ (Divide by Zero) flag to 1.
-                                self.state.write_bit(FCSR, 3, 1);
-                                // "The quotient of division by zero has all bits set"
-                                u64::MAX
-                            } else {
-                                // "division of rs1 by rs2, rounding towards zero"
-                                dividend.wrapping_div(divisor) as i32 as i64 as u64
-                            },
-                        );
-                    }
-                    (0x5, 0x20) => {
-                        // sraw
-                        inst_count!(self, "sraw");
-                        self.debug(inst, "sraw");
-
-                        // The shift amount is given by rs2[4:0].
-                        let shamt = self.xregs.read(rs2) & 0x1f;
-                        self.xregs
-                            .write(rd, ((self.xregs.read(rs1) as i32) >> shamt) as i64 as u64);
-                    }
-                    (0x6, 0x01) => {
-                        // remw
-                        inst_count!(self, "remw");
-                        self.debug(inst, "remw");
-
-                        let dividend = self.xregs.read(rs1) as i32;
-                        let divisor = self.xregs.read(rs2) as i32;
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // "the remainder of division by zero equals the dividend"
-                                dividend as i64 as u64
-                            } else if dividend == i32::MIN && divisor == -1 {
-                                // Overflow
-                                // "the remainder is zero"
-                                0
-                            } else {
-                                // "provide the remainder of the corresponding division
-                                // operation"
-                                dividend.wrapping_rem(divisor) as i64 as u64
-                            },
-                        );
-                    }
-                    (0x7, 0x01) => {
-                        // remuw
-                        inst_count!(self, "remuw");
-                        self.debug(inst, "remuw");
-
-                        let dividend = self.xregs.read(rs1) as u32;
-                        let divisor = self.xregs.read(rs2) as u32;
-                        self.xregs.write(
-                            rd,
-                            if divisor == 0 {
-                                // Division by zero
-                                // "the remainder of division by zero equals the dividend"
-                                dividend as i32 as i64 as u64
-                            } else {
-                                // "provide the remainder of the corresponding division
-                                // operation"
-                                dividend.wrapping_rem(divisor) as i32 as i64 as u64
-                            },
-                        );
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
+            match trap.trap_type {
+                TrapType::UserSoftwareInterrupt => {
+                    if usie == 0 {
+                        return false;
                     }
                 }
-            }
-            0x43 => {
-                // RV32F and RV64F
-                // TODO: support the rounding mode encoding (rm).
-                let rs3 = ((inst & 0xf8000000) >> 27) as u64;
-                let funct2 = (inst & 0x03000000) >> 25;
-                match funct2 {
-                    0x0 => {
-                        // fmadd.s
-                        inst_count!(self, "fmadd.s");
-                        self.debug(inst, "fmadd.s");
-
-                        self.fregs.write(
-                            rd,
-                            (self.fregs.read(rs1) as f32)
-                                .mul_add(self.fregs.read(rs2) as f32, self.fregs.read(rs3) as f32)
-                                as f64,
-                        );
-                    }
-                    0x1 => {
-                        // fmadd.d
-                        inst_count!(self, "fmadd.d");
-                        self.debug(inst, "fmadd.d");
-
-                        self.fregs.write(
-                            rd,
-                            self.fregs
-                                .read(rs1)
-                                .mul_add(self.fregs.read(rs2), self.fregs.read(rs3)),
-                        );
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
+                TrapType::SupervisorSoftwareInterrupt => {
+                    if ssie == 0 {
+                        return false;
                     }
                 }
-            }
-            0x47 => {
-                // RV32F and RV64F
-                // TODO: support the rounding mode encoding (rm).
-                let rs3 = ((inst & 0xf8000000) >> 27) as u64;
-                let funct2 = (inst & 0x03000000) >> 25;
-                match funct2 {
-                    0x0 => {
-                        // fmsub.s
-                        inst_count!(self, "fmsub.s");
-                        self.debug(inst, "fmsub.s");
-
-                        self.fregs.write(
-                            rd,
-                            (self.fregs.read(rs1) as f32)
-                                .mul_add(self.fregs.read(rs2) as f32, -self.fregs.read(rs3) as f32)
-                                as f64,
-                        );
-                    }
-                    0x1 => {
-                        // fmsub.d
-                        inst_count!(self, "fmsub.d");
-                        self.debug(inst, "fmsub.d");
-
-                        self.fregs.write(
-                            rd,
-                            self.fregs
-                                .read(rs1)
-                                .mul_add(self.fregs.read(rs2), -self.fregs.read(rs3)),
-                        );
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
+                TrapType::MachineSoftwareInterrupt => {
+                    if msie == 0 {
+                        return false;
                     }
                 }
-            }
-            0x4b => {
-                // RV32F and RV64F
-                // TODO: support the rounding mode encoding (rm).
-                let rs3 = ((inst & 0xf8000000) >> 27) as u64;
-                let funct2 = (inst & 0x03000000) >> 25;
-                match funct2 {
-                    0x0 => {
-                        // fnmadd.s
-                        inst_count!(self, "fnmadd.s");
-                        self.debug(inst, "fnmadd.s");
-
-                        self.fregs.write(
-                            rd,
-                            (-self.fregs.read(rs1) as f32)
-                                .mul_add(self.fregs.read(rs2) as f32, self.fregs.read(rs3) as f32)
-                                as f64,
-                        );
-                    }
-                    0x1 => {
-                        // fnmadd.d
-                        inst_count!(self, "fnmadd.d");
-                        self.debug(inst, "fnmadd.d");
-
-                        self.fregs.write(
-                            rd,
-                            (-self.fregs.read(rs1))
-                                .mul_add(self.fregs.read(rs2), self.fregs.read(rs3)),
-                        );
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
+                TrapType::UserTimerInterrupt => {
+                    if utie == 0 {
+                        return false;
                     }
                 }
-            }
-            0x4f => {
-                // RV32F and RV64F
-                // TODO: support the rounding mode encoding (rm).
-                let rs3 = ((inst & 0xf8000000) >> 27) as u64;
-                let funct2 = (inst & 0x03000000) >> 25;
-                match funct2 {
-                    0x0 => {
-                        // fnmsub.s
-                        inst_count!(self, "fnmsub.s");
-                        self.debug(inst, "fnmsub.s");
-
-                        self.fregs.write(
-                            rd,
-                            (-self.fregs.read(rs1) as f32)
-                                .mul_add(self.fregs.read(rs2) as f32, -self.fregs.read(rs3) as f32)
-                                as f64,
-                        );
-                    }
-                    0x1 => {
-                        // fnmsub.d
-                        inst_count!(self, "fnmsub.d");
-                        self.debug(inst, "fnmsub.d");
-
-                        self.fregs.write(
-                            rd,
-                            (-self.fregs.read(rs1))
-                                .mul_add(self.fregs.read(rs2), -self.fregs.read(rs3)),
-                        );
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
+                TrapType::SupervisorTimerInterrupt => {
+                    if stie == 0 {
+                        return false;
                     }
                 }
-            }
-            0x53 => {
-                // RV32F and RV64F
-                // TODO: support the rounding mode encoding (rm).
-                // TODO: NaN Boxing of Narrower Values (Spec 12.2).
-                // TODO: set exception flags.
+                TrapType::MachineTimerInterrupt => {
+                    if mtie == 0 {
+                        return false;
+                    }
+                }
+                TrapType::UserExternalInterrupt => {
+                    if ueie == 0 {
+                        return false;
+                    }
+                }
+                TrapType::SupervisorExternalInterrupt => {
+                    if seie == 0 {
+                        return false;
+                    }
+                }
+                TrapType::MachineExternalInterrupt => {
+                    if meie == 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            };
+        }
 
+        // So, this trap should be taken
+
+        self.privilege_mode = new_privilege_mode;
+        self.mmu.update_privilege_mode(self.privilege_mode.clone());
+        let csr_epc_address = match self.privilege_mode {
+            PrivilegeMode::Machine => CSR_MEPC_ADDRESS,
+            PrivilegeMode::Supervisor => CSR_SEPC_ADDRESS,
+            PrivilegeMode::User => CSR_UEPC_ADDRESS,
+            PrivilegeMode::Reserved => panic!(),
+        };
+        let csr_cause_address = match self.privilege_mode {
+            PrivilegeMode::Machine => CSR_MCAUSE_ADDRESS,
+            PrivilegeMode::Supervisor => CSR_SCAUSE_ADDRESS,
+            PrivilegeMode::User => CSR_UCAUSE_ADDRESS,
+            PrivilegeMode::Reserved => panic!(),
+        };
+        let csr_tval_address = match self.privilege_mode {
+            PrivilegeMode::Machine => CSR_MTVAL_ADDRESS,
+            PrivilegeMode::Supervisor => CSR_STVAL_ADDRESS,
+            PrivilegeMode::User => CSR_UTVAL_ADDRESS,
+            PrivilegeMode::Reserved => panic!(),
+        };
+        let csr_tvec_address = match self.privilege_mode {
+            PrivilegeMode::Machine => CSR_MTVEC_ADDRESS,
+            PrivilegeMode::Supervisor => CSR_STVEC_ADDRESS,
+            PrivilegeMode::User => CSR_UTVEC_ADDRESS,
+            PrivilegeMode::Reserved => panic!(),
+        };
+
+        self.write_csr_raw(csr_epc_address, instruction_address);
+        self.write_csr_raw(csr_cause_address, cause);
+        self.write_csr_raw(csr_tval_address, trap.value);
+        self.pc = self.read_csr_raw(csr_tvec_address);
+
+        // Add 4 * cause if tvec has vector type address
+        if (self.pc & 0x3) != 0 {
+            self.pc = (self.pc & !0x3) + 4 * (cause & 0xffff);
+        }
+
+        match self.privilege_mode {
+            PrivilegeMode::Machine => {
+                let status = self.read_csr_raw(CSR_MSTATUS_ADDRESS);
+                let mie = (status >> 3) & 1;
+                // clear MIE[3], override MPIE[7] with MIE[3], override MPP[12:11] with current privilege encoding
+                let new_status =
+                    (status & !0x1888) | (mie << 7) | (current_privilege_encoding << 11);
+                self.write_csr_raw(CSR_MSTATUS_ADDRESS, new_status);
+            }
+            PrivilegeMode::Supervisor => {
+                let status = self.read_csr_raw(CSR_SSTATUS_ADDRESS);
+                let sie = (status >> 1) & 1;
+                // clear SIE[1], override SPIE[5] with SIE[1], override SPP[8] with current privilege encoding
+                let new_status =
+                    (status & !0x122) | (sie << 5) | ((current_privilege_encoding & 1) << 8);
+                self.write_csr_raw(CSR_SSTATUS_ADDRESS, new_status);
+            }
+            PrivilegeMode::User => {
+                panic!("Not implemented yet");
+            }
+            PrivilegeMode::Reserved => panic!(), // shouldn't happen
+        };
+        //println!("Trap! {:x} Clock:{:x}", cause, self.clock);
+        true
+    }
+
+    fn fetch(&mut self) -> Result<u32, Trap> {
+        let word = match self.mmu.fetch_word(self.pc) {
+            Ok(word) => word,
+            Err(e) => {
+                self.pc = self.pc.wrapping_add(4); // @TODO: What if instruction is compressed?
+                return Err(e);
+            }
+        };
+        Ok(word)
+    }
+
+    fn has_csr_access_privilege(&self, address: u16) -> bool {
+        let privilege = (address >> 8) & 0x3; // the lowest privilege level that can access the CSR
+        privilege as u8 <= get_privilege_encoding(&self.privilege_mode)
+    }
+
+    fn read_csr(&mut self, address: u16) -> Result<u64, Trap> {
+        match self.has_csr_access_privilege(address) {
+            true => Ok(self.read_csr_raw(address)),
+            false => Err(Trap {
+                trap_type: TrapType::IllegalInstruction,
+                value: self.pc.wrapping_sub(4), // @TODO: Is this always correct?
+            }),
+        }
+    }
+
+    fn write_csr(&mut self, address: u16, value: u64) -> Result<(), Trap> {
+        match self.has_csr_access_privilege(address) {
+            true => {
                 /*
-                 * Floating-point instructions align with the IEEE 754 (1985).
-                 * The format consist of three fields: a sign bit, a biased exponent, and a fraction.
-                 *
-                 * | sign(1) | exponent(8) | fraction(23) |
-                 * Ok => {}
-                 * 31                                     0
-                 *
-                 */
-
-                // Check the frm field is valid.
-                match self.state.read_bits(FCSR, 5..8) {
-                    0b000 => {}
-                    0b001 => {}
-                    0b010 => {}
-                    0b011 => {}
-                    0b100 => {}
-                    0b111 => {}
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
+                // Checking writability fails some tests so disabling so far
+                let read_only = ((address >> 10) & 0x3) == 0x3;
+                if read_only {
+                    return Err(Exception::IllegalInstruction);
                 }
-
-                match funct7 {
-                    0x00 => {
-                        // fadd.s
-                        inst_count!(self, "fadd.s");
-                        self.debug(inst, "fadd.s");
-
-                        self.fregs.write(
-                            rd,
-                            (self.fregs.read(rs1) as f32 + self.fregs.read(rs2) as f32) as f64,
-                        )
-                    }
-                    0x01 => {
-                        // fadd.d
-                        inst_count!(self, "fadd.d");
-                        self.debug(inst, "fadd.d");
-
-                        self.fregs
-                            .write(rd, self.fregs.read(rs1) + self.fregs.read(rs2));
-                    }
-                    0x04 => {
-                        // fsub.s
-                        inst_count!(self, "fsub.s");
-                        self.debug(inst, "fsub.s");
-
-                        self.fregs.write(
-                            rd,
-                            (self.fregs.read(rs1) as f32 - self.fregs.read(rs2) as f32) as f64,
-                        )
-                    }
-                    0x05 => {
-                        // fsub.d
-                        inst_count!(self, "fsub.d");
-                        self.debug(inst, "fsub.d");
-
-                        self.fregs
-                            .write(rd, self.fregs.read(rs1) - self.fregs.read(rs2));
-                    }
-                    0x08 => {
-                        // fmul.s
-                        inst_count!(self, "fmul.s");
-                        self.debug(inst, "fmul.s");
-
-                        self.fregs.write(
-                            rd,
-                            (self.fregs.read(rs1) as f32 * self.fregs.read(rs2) as f32) as f64,
-                        )
-                    }
-                    0x09 => {
-                        // fmul.d
-                        inst_count!(self, "fmul.d");
-                        self.debug(inst, "fmul.d");
-
-                        self.fregs
-                            .write(rd, self.fregs.read(rs1) * self.fregs.read(rs2));
-                    }
-                    0x0c => {
-                        // fdiv.s
-                        inst_count!(self, "fdiv.s");
-                        self.debug(inst, "fdiv.s");
-
-                        self.fregs.write(
-                            rd,
-                            (self.fregs.read(rs1) as f32 / self.fregs.read(rs2) as f32) as f64,
-                        )
-                    }
-                    0x0d => {
-                        // fdiv.d
-                        inst_count!(self, "fdiv.d");
-                        self.debug(inst, "fdiv.d");
-
-                        self.fregs
-                            .write(rd, self.fregs.read(rs1) / self.fregs.read(rs2));
-                    }
-                    0x10 => {
-                        match funct3 {
-                            0x0 => {
-                                // fsgnj.s
-                                inst_count!(self, "fsgnj.s");
-                                self.debug(inst, "fsgnj.s");
-
-                                self.fregs
-                                    .write(rd, self.fregs.read(rs1).copysign(self.fregs.read(rs2)));
-                            }
-                            0x1 => {
-                                // fsgnjn.s
-                                inst_count!(self, "fsgnjn.s");
-                                self.debug(inst, "fsgnjn.s");
-
-                                self.fregs.write(
-                                    rd,
-                                    self.fregs.read(rs1).copysign(-self.fregs.read(rs2)),
-                                );
-                            }
-                            0x2 => {
-                                // fsgnjx.s
-                                inst_count!(self, "fsgnjx.s");
-                                self.debug(inst, "fsgnjx.s");
-
-                                let sign1 = (self.fregs.read(rs1) as f32).to_bits() & 0x80000000;
-                                let sign2 = (self.fregs.read(rs2) as f32).to_bits() & 0x80000000;
-                                let other = (self.fregs.read(rs1) as f32).to_bits() & 0x7fffffff;
-                                self.fregs
-                                    .write(rd, f32::from_bits((sign1 ^ sign2) | other) as f64);
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x11 => {
-                        match funct3 {
-                            0x0 => {
-                                // fsgnj.d
-                                inst_count!(self, "fsgnj.d");
-                                self.debug(inst, "fsgnj.d");
-
-                                self.fregs
-                                    .write(rd, self.fregs.read(rs1).copysign(self.fregs.read(rs2)));
-                            }
-                            0x1 => {
-                                // fsgnjn.d
-                                inst_count!(self, "fsgnjn.d");
-                                self.debug(inst, "fsgnjn.d");
-
-                                self.fregs.write(
-                                    rd,
-                                    self.fregs.read(rs1).copysign(-self.fregs.read(rs2)),
-                                );
-                            }
-                            0x2 => {
-                                // fsgnjx.d
-                                inst_count!(self, "fsgnjx.d");
-                                self.debug(inst, "fsgnjx.d");
-
-                                let sign1 = self.fregs.read(rs1).to_bits() & 0x80000000_00000000;
-                                let sign2 = self.fregs.read(rs2).to_bits() & 0x80000000_00000000;
-                                let other = self.fregs.read(rs1).to_bits() & 0x7fffffff_ffffffff;
-                                self.fregs
-                                    .write(rd, f64::from_bits((sign1 ^ sign2) | other));
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x14 => {
-                        match funct3 {
-                            0x0 => {
-                                // fmin.s
-                                inst_count!(self, "fmin.s");
-                                self.debug(inst, "fmin.s");
-
-                                self.fregs
-                                    .write(rd, self.fregs.read(rs1).min(self.fregs.read(rs2)));
-                            }
-                            0x1 => {
-                                // fmax.s
-                                inst_count!(self, "fmax.s");
-                                self.debug(inst, "fmax.s");
-
-                                self.fregs
-                                    .write(rd, self.fregs.read(rs1).max(self.fregs.read(rs2)));
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x15 => {
-                        match funct3 {
-                            0x0 => {
-                                // fmin.d
-                                inst_count!(self, "fmin.d");
-                                self.debug(inst, "fmin.d");
-
-                                self.fregs
-                                    .write(rd, self.fregs.read(rs1).min(self.fregs.read(rs2)));
-                            }
-                            0x1 => {
-                                // fmax.d
-                                inst_count!(self, "fmax.d");
-                                self.debug(inst, "fmax.d");
-
-                                self.fregs
-                                    .write(rd, self.fregs.read(rs1).max(self.fregs.read(rs2)));
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x20 => {
-                        // fcvt.s.d
-                        inst_count!(self, "fcvt.s.d");
-                        self.debug(inst, "fcvt.s.d");
-
-                        self.fregs.write(rd, self.fregs.read(rs1));
-                    }
-                    0x21 => {
-                        // fcvt.d.s
-                        inst_count!(self, "fcvt.d.s");
-                        self.debug(inst, "fcvt.d.s");
-
-                        self.fregs.write(rd, (self.fregs.read(rs1) as f32) as f64);
-                    }
-                    0x2c => {
-                        // fsqrt.s
-                        inst_count!(self, "fsqrt.s");
-                        self.debug(inst, "fsqrt.s");
-
-                        self.fregs
-                            .write(rd, (self.fregs.read(rs1) as f32).sqrt() as f64);
-                    }
-                    0x2d => {
-                        // fsqrt.d
-                        inst_count!(self, "fsqrt.d");
-                        self.debug(inst, "fsqrt.d");
-
-                        self.fregs.write(rd, self.fregs.read(rs1).sqrt());
-                    }
-                    0x50 => {
-                        match funct3 {
-                            0x0 => {
-                                // fle.s
-                                inst_count!(self, "fle.s");
-                                self.debug(inst, "fle.s");
-
-                                self.xregs.write(
-                                    rd,
-                                    if self.fregs.read(rs1) <= self.fregs.read(rs2) {
-                                        1
-                                    } else {
-                                        0
-                                    },
-                                );
-                            }
-                            0x1 => {
-                                // flt.s
-                                inst_count!(self, "flt.s");
-                                self.debug(inst, "flt.s");
-
-                                self.xregs.write(
-                                    rd,
-                                    if self.fregs.read(rs1) < self.fregs.read(rs2) {
-                                        1
-                                    } else {
-                                        0
-                                    },
-                                );
-                            }
-                            0x2 => {
-                                // feq.s
-                                inst_count!(self, "feq.s");
-                                self.debug(inst, "feq.s");
-
-                                self.xregs.write(
-                                    rd,
-                                    if self.fregs.read(rs1) == self.fregs.read(rs2) {
-                                        1
-                                    } else {
-                                        0
-                                    },
-                                );
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x51 => {
-                        match funct3 {
-                            0x0 => {
-                                // fle.d
-                                inst_count!(self, "fle.d");
-                                self.debug(inst, "fle.d");
-
-                                self.xregs.write(
-                                    rd,
-                                    if self.fregs.read(rs1) <= self.fregs.read(rs2) {
-                                        1
-                                    } else {
-                                        0
-                                    },
-                                );
-                            }
-                            0x1 => {
-                                // flt.d
-                                inst_count!(self, "flt.d");
-                                self.debug(inst, "flt.d");
-
-                                self.xregs.write(
-                                    rd,
-                                    if self.fregs.read(rs1) < self.fregs.read(rs2) {
-                                        1
-                                    } else {
-                                        0
-                                    },
-                                );
-                            }
-                            0x2 => {
-                                // feq.d
-                                inst_count!(self, "feq.d");
-                                self.debug(inst, "feq.d");
-
-                                self.xregs.write(
-                                    rd,
-                                    if self.fregs.read(rs1) == self.fregs.read(rs2) {
-                                        1
-                                    } else {
-                                        0
-                                    },
-                                );
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x60 => {
-                        match rs2 {
-                            0x0 => {
-                                // fcvt.w.s
-                                inst_count!(self, "fcvt.w.s");
-                                self.debug(inst, "fcvt.w.s");
-
-                                self.xregs.write(
-                                    rd,
-                                    ((self.fregs.read(rs1) as f32).round() as i32) as u64,
-                                );
-                            }
-                            0x1 => {
-                                // fcvt.wu.s
-                                inst_count!(self, "fcvt.wu.s");
-                                self.debug(inst, "fcvt.wu.s");
-
-                                self.xregs.write(
-                                    rd,
-                                    (((self.fregs.read(rs1) as f32).round() as u32) as i32) as u64,
-                                );
-                            }
-                            0x2 => {
-                                // fcvt.l.s
-                                inst_count!(self, "fcvt.l.s");
-                                self.debug(inst, "fcvt.l.s");
-
-                                self.xregs
-                                    .write(rd, (self.fregs.read(rs1) as f32).round() as u64);
-                            }
-                            0x3 => {
-                                // fcvt.lu.s
-                                inst_count!(self, "fcvt.lu.s");
-                                self.debug(inst, "fcvt.lu.s");
-
-                                self.xregs
-                                    .write(rd, (self.fregs.read(rs1) as f32).round() as u64);
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x61 => {
-                        match rs2 {
-                            0x0 => {
-                                // fcvt.w.d
-                                inst_count!(self, "fcvt.w.d");
-                                self.debug(inst, "fcvt.w.d");
-
-                                self.xregs
-                                    .write(rd, (self.fregs.read(rs1).round() as i32) as u64);
-                            }
-                            0x1 => {
-                                // fcvt.wu.d
-                                inst_count!(self, "fcvt.wu.d");
-                                self.debug(inst, "fcvt.wu.d");
-
-                                self.xregs.write(
-                                    rd,
-                                    ((self.fregs.read(rs1).round() as u32) as i32) as u64,
-                                );
-                            }
-                            0x2 => {
-                                // fcvt.l.d
-                                inst_count!(self, "fcvt.l.d");
-                                self.debug(inst, "fcvt.l.d");
-
-                                self.xregs.write(rd, self.fregs.read(rs1).round() as u64);
-                            }
-                            0x3 => {
-                                // fcvt.lu.d
-                                inst_count!(self, "fcvt.lu.d");
-                                self.debug(inst, "fcvt.lu.d");
-
-                                self.xregs.write(rd, self.fregs.read(rs1).round() as u64);
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x68 => {
-                        match rs2 {
-                            0x0 => {
-                                // fcvt.s.w
-                                inst_count!(self, "fcvt.s.w");
-                                self.debug(inst, "fcvt.s.w");
-
-                                self.fregs
-                                    .write(rd, ((self.xregs.read(rs1) as i32) as f32) as f64);
-                            }
-                            0x1 => {
-                                // fcvt.s.wu
-                                inst_count!(self, "fcvt.s.wu");
-                                self.debug(inst, "fcvt.s.wu");
-
-                                self.fregs
-                                    .write(rd, ((self.xregs.read(rs1) as u32) as f32) as f64);
-                            }
-                            0x2 => {
-                                // fcvt.s.l
-                                inst_count!(self, "fcvt.s.l");
-                                self.debug(inst, "fcvt.s.l");
-
-                                self.fregs.write(rd, (self.xregs.read(rs1) as f32) as f64);
-                            }
-                            0x3 => {
-                                // fcvt.s.lu
-                                inst_count!(self, "fcvt.s.lu");
-                                self.debug(inst, "fcvt.s.lu");
-
-                                self.fregs
-                                    .write(rd, ((self.xregs.read(rs1) as u64) as f32) as f64);
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x69 => {
-                        match rs2 {
-                            0x0 => {
-                                // fcvt.d.w
-                                inst_count!(self, "fcvt.d.w");
-                                self.debug(inst, "fcvt.d.w");
-
-                                self.fregs.write(rd, (self.xregs.read(rs1) as i32) as f64);
-                            }
-                            0x1 => {
-                                // fcvt.d.wu
-                                inst_count!(self, "fcvt.d.wu");
-                                self.debug(inst, "fcvt.d.wu");
-
-                                self.fregs.write(rd, (self.xregs.read(rs1) as u32) as f64);
-                            }
-                            0x2 => {
-                                // fcvt.d.l
-                                inst_count!(self, "fcvt.d.l");
-                                self.debug(inst, "fcvt.d.l");
-
-                                self.fregs.write(rd, self.xregs.read(rs1) as f64);
-                            }
-                            0x3 => {
-                                // fcvt.d.lu
-                                inst_count!(self, "fcvt.d.lu");
-                                self.debug(inst, "fcvt.d.lu");
-
-                                self.fregs.write(rd, self.xregs.read(rs1) as f64);
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x70 => {
-                        match funct3 {
-                            0x0 => {
-                                // fmv.x.w
-                                inst_count!(self, "fmv.x.w");
-                                self.debug(inst, "fmv.x.w");
-
-                                self.xregs.write(
-                                    rd,
-                                    (self.fregs.read(rs1).to_bits() & 0xffffffff) as i32 as i64
-                                        as u64,
-                                );
-                            }
-                            0x1 => {
-                                // fclass.s
-                                inst_count!(self, "fclass.s");
-                                self.debug(inst, "fclass.s");
-
-                                let f = self.fregs.read(rs1);
-                                match f.classify() {
-                                    FpCategory::Infinite => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 0 } else { 7 });
-                                    }
-                                    FpCategory::Normal => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 1 } else { 6 });
-                                    }
-                                    FpCategory::Subnormal => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 2 } else { 5 });
-                                    }
-                                    FpCategory::Zero => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 3 } else { 4 });
-                                    }
-                                    // don't support a signaling nan, only support a quiet nan.
-                                    FpCategory::Nan => self.xregs.write(rd, 9),
-                                }
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x71 => {
-                        match funct3 {
-                            0x0 => {
-                                // fmv.x.d
-                                inst_count!(self, "fmv.x.d");
-                                self.debug(inst, "fmv.x.d");
-
-                                // "FMV.X.D and FMV.D.X do not modify the bits being transferred"
-                                self.xregs.write(rd, self.fregs.read(rs1).to_bits());
-                            }
-                            0x1 => {
-                                // fclass.d
-                                inst_count!(self, "fclass.d");
-                                self.debug(inst, "fclass.d");
-
-                                let f = self.fregs.read(rs1);
-                                match f.classify() {
-                                    FpCategory::Infinite => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 0 } else { 7 });
-                                    }
-                                    FpCategory::Normal => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 1 } else { 6 });
-                                    }
-                                    FpCategory::Subnormal => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 2 } else { 5 });
-                                    }
-                                    FpCategory::Zero => {
-                                        self.xregs
-                                            .write(rd, if f.is_sign_negative() { 3 } else { 4 });
-                                    }
-                                    // don't support a signaling nan, only support a quiet nan.
-                                    FpCategory::Nan => self.xregs.write(rd, 9),
-                                }
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x78 => {
-                        // fmv.w.x
-                        inst_count!(self, "fmv.w.x");
-                        self.debug(inst, "fmv.w.x");
-
-                        self.fregs
-                            .write(rd, f64::from_bits(self.xregs.read(rs1) & 0xffffffff));
-                    }
-                    0x79 => {
-                        // fmv.d.x
-                        inst_count!(self, "fmv.d.x");
-                        self.debug(inst, "fmv.d.x");
-
-                        // "FMV.X.D and FMV.D.X do not modify the bits being transferred"
-                        self.fregs.write(rd, f64::from_bits(self.xregs.read(rs1)));
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
+                */
+                self.write_csr_raw(address, value);
+                if address == CSR_SATP_ADDRESS {
+                    self.update_addressing_mode(value);
                 }
+                Ok(())
             }
-            0x63 => {
-                // RV32I
-                // imm[12|10:5|4:1|11] = inst[31|30:25|11:8|7]
-                let imm = (((inst & 0x80000000) as i32 as i64 >> 19) as u64)
-                    | ((inst & 0x80) << 4) // imm[11]
-                    | ((inst >> 20) & 0x7e0) // imm[10:5]
-                    | ((inst >> 7) & 0x1e); // imm[4:1]
+            false => Err(Trap {
+                trap_type: TrapType::IllegalInstruction,
+                value: self.pc.wrapping_sub(4), // @TODO: Is this always correct?
+            }),
+        }
+    }
 
-                match funct3 {
-                    0x0 => {
-                        // beq
-                        inst_count!(self, "beq");
-                        self.debug(inst, "beq");
+    // SSTATUS, SIE, and SIP are subsets of MSTATUS, MIE, and MIP
+    fn read_csr_raw(&self, address: u16) -> u64 {
+        match address {
+            // @TODO: Mask shuld consider of 32-bit mode
+            CSR_FFLAGS_ADDRESS => self.csr[CSR_FCSR_ADDRESS as usize] & 0x1f,
+            CSR_FRM_ADDRESS => (self.csr[CSR_FCSR_ADDRESS as usize] >> 5) & 0x7,
+            CSR_SSTATUS_ADDRESS => self.csr[CSR_MSTATUS_ADDRESS as usize] & 0x80000003000de162,
+            CSR_SIE_ADDRESS => self.csr[CSR_MIE_ADDRESS as usize] & 0x222,
+            CSR_SIP_ADDRESS => self.csr[CSR_MIP_ADDRESS as usize] & 0x222,
+            // CSR_TIME_ADDRESS => self.mmu.get_clint().read_mtime(),
+            _ => self.csr[address as usize],
+        }
+    }
 
-                        if self.xregs.read(rs1) == self.xregs.read(rs2) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
-                        }
-                    }
-                    0x1 => {
-                        // bne
-                        inst_count!(self, "bne");
-                        self.debug(inst, "bne");
-
-                        if self.xregs.read(rs1) != self.xregs.read(rs2) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
-                        }
-                    }
-                    0x4 => {
-                        // blt
-                        inst_count!(self, "blt");
-                        self.debug(inst, "blt");
-
-                        if (self.xregs.read(rs1) as i64) < (self.xregs.read(rs2) as i64) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
-                        }
-                    }
-                    0x5 => {
-                        // bge
-                        inst_count!(self, "bge");
-                        self.debug(inst, "bge");
-
-                        if (self.xregs.read(rs1) as i64) >= (self.xregs.read(rs2) as i64) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
-                        }
-                    }
-                    0x6 => {
-                        // bltu
-                        inst_count!(self, "bltu");
-                        self.debug(inst, "bltu");
-
-                        if self.xregs.read(rs1) < self.xregs.read(rs2) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
-                        }
-                    }
-                    0x7 => {
-                        // bgeu
-                        inst_count!(self, "bgeu");
-                        self.debug(inst, "bgeu");
-
-                        if self.xregs.read(rs1) >= self.xregs.read(rs2) {
-                            self.pc = self.pc.wrapping_add(imm).wrapping_sub(4);
-                        }
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
+    fn write_csr_raw(&mut self, address: u16, value: u64) {
+        match address {
+            CSR_FFLAGS_ADDRESS => {
+                self.csr[CSR_FCSR_ADDRESS as usize] &= !0x1f;
+                self.csr[CSR_FCSR_ADDRESS as usize] |= value & 0x1f;
             }
-            0x67 => {
-                // jalr
-                inst_count!(self, "jalr");
-                self.debug(inst, "jalr");
-
-                let t = self.pc.wrapping_add(4);
-
-                let offset = (inst as i32 as i64) >> 20;
-                let target = ((self.xregs.read(rs1) as i64).wrapping_add(offset)) & !1;
-
-                self.pc = (target as u64).wrapping_sub(4);
-
-                self.xregs.write(rd, t);
+            CSR_FRM_ADDRESS => {
+                self.csr[CSR_FCSR_ADDRESS as usize] &= !0xe0;
+                self.csr[CSR_FCSR_ADDRESS as usize] |= (value << 5) & 0xe0;
             }
-            0x6F => {
-                // jal
-                inst_count!(self, "jal");
-                self.debug(inst, "jal");
-
-                self.xregs.write(rd, self.pc.wrapping_add(4));
-
-                // imm[20|10:1|11|19:12] = inst[31|30:21|20|19:12]
-                let offset = (((inst & 0x80000000) as i32 as i64 >> 11) as u64) // imm[20]
-                    | (inst & 0xff000) // imm[19:12]
-                    | ((inst >> 9) & 0x800) // imm[11]
-                    | ((inst >> 20) & 0x7fe); // imm[10:1]
-
-                self.pc = self.pc.wrapping_add(offset).wrapping_sub(4);
+            CSR_SSTATUS_ADDRESS => {
+                self.csr[CSR_MSTATUS_ADDRESS as usize] &= !0x80000003000de162;
+                self.csr[CSR_MSTATUS_ADDRESS as usize] |= value & 0x80000003000de162;
+                self.mmu
+                    .update_mstatus(self.read_csr_raw(CSR_MSTATUS_ADDRESS));
             }
-            0x73 => {
-                // RV32I, RVZicsr, and supervisor ISA
-                let csr_addr = ((inst >> 20) & 0xfff) as u16;
-                match funct3 {
-                    0x0 => {
-                        match (rs2, funct7) {
-                            (0x0, 0x0) => {
-                                // ecall
-                                inst_count!(self, "ecall");
-                                self.debug(inst, "ecall");
-
-                                // Makes a request of the execution environment by raising an
-                                // environment call exception.
-                                match self.mode {
-                                    Mode::User => {
-                                        return Err(Exception::EnvironmentCallFromUMode);
-                                    }
-                                    Mode::Supervisor => {
-                                        return Err(Exception::EnvironmentCallFromSMode);
-                                    }
-                                    Mode::Machine => {
-                                        return Err(Exception::EnvironmentCallFromMMode);
-                                    }
-                                    _ => {
-                                        return Err(Exception::IllegalInstruction(inst));
-                                    }
-                                }
-                            }
-                            (0x1, 0x0) => {
-                                // ebreak
-                                inst_count!(self, "ebreak");
-                                self.debug(inst, "ebreak");
-
-                                // Makes a request of the debugger bu raising a Breakpoint
-                                // exception.
-                                return Err(Exception::Breakpoint);
-                            }
-                            (0x2, 0x0) => {
-                                // uret
-                                inst_count!(self, "uret");
-                                self.debug(inst, "uret");
-                                panic!("uret: not implemented yet. pc {}", self.pc);
-                            }
-                            (0x2, 0x8) => {
-                                // sret
-                                inst_count!(self, "sret");
-                                self.debug(inst, "sret");
-
-                                // "The RISC-V Reader" book says:
-                                // "Returns from a supervisor-mode exception handler. Sets the pc to
-                                // CSRs[sepc], the privilege mode to CSRs[sstatus].SPP,
-                                // CSRs[sstatus].SIE to CSRs[sstatus].SPIE, CSRs[sstatus].SPIE to
-                                // 1, and CSRs[sstatus].SPP to 0.", but the implementation in QEMU
-                                // and Spike use `mstatus` instead of `sstatus`.
-
-                                // Set the program counter to the supervisor exception program
-                                // counter (SEPC).
-                                self.pc = self.state.read(SEPC).wrapping_sub(4);
-
-                                // TODO: Check TSR field
-
-                                // Set the current privileged mode depending on a previous
-                                // privilege mode for supervisor mode (SPP, 8).
-                                self.mode = match self.state.read_sstatus(XSTATUS_SPP) {
-                                    0b0 => Mode::User,
-                                    0b1 => {
-                                        // If SPP != M-mode, SRET also sets MPRV=0.
-                                        self.state.write_mstatus(MSTATUS_MPRV, 0);
-                                        Mode::Supervisor
-                                    }
-                                    _ => Mode::Debug,
-                                };
-
-                                // Read a previous interrupt-enable bit for supervisor mode (SPIE,
-                                // 5), and set a global interrupt-enable bit for supervisor mode
-                                // (SIE, 1) to it.
-                                self.state.write_sstatus(
-                                    XSTATUS_SIE,
-                                    self.state.read_sstatus(XSTATUS_SPIE),
-                                );
-
-                                // Set a previous interrupt-enable bit for supervisor mode (SPIE,
-                                // 5) to 1.
-                                self.state.write_sstatus(XSTATUS_SPIE, 1);
-                                // Set a previous privilege mode for supervisor mode (SPP, 8) to 0.
-                                self.state.write_sstatus(XSTATUS_SPP, 0);
-                            }
-                            (0x2, 0x18) => {
-                                // mret
-                                inst_count!(self, "mret");
-                                self.debug(inst, "mret");
-
-                                // "The RISC-V Reader" book says:
-                                // "Returns from a machine-mode exception handler. Sets the pc to
-                                // CSRs[mepc], the privilege mode to CSRs[mstatus].MPP,
-                                // CSRs[mstatus].MIE to CSRs[mstatus].MPIE, and CSRs[mstatus].MPIE
-                                // to 1; and, if user mode is supported, sets CSRs[mstatus].MPP to
-                                // 0".
-
-                                // Set the program counter to the machine exception program
-                                // counter (MEPC).
-                                self.pc = self.state.read(MEPC).wrapping_sub(4);
-
-                                // Set the current privileged mode depending on a previous
-                                // privilege mode for machine  mode (MPP, 11..13).
-                                self.mode = match self.state.read_mstatus(MSTATUS_MPP) {
-                                    0b00 => {
-                                        // If MPP != M-mode, MRET also sets MPRV=0.
-                                        self.state.write_mstatus(MSTATUS_MPRV, 0);
-                                        Mode::User
-                                    }
-                                    0b01 => {
-                                        // If MPP != M-mode, MRET also sets MPRV=0.
-                                        self.state.write_mstatus(MSTATUS_MPRV, 0);
-                                        Mode::Supervisor
-                                    }
-                                    0b11 => Mode::Machine,
-                                    _ => Mode::Debug,
-                                };
-
-                                // Read a previous interrupt-enable bit for machine mode (MPIE, 7),
-                                // and set a global interrupt-enable bit for machine mode (MIE, 3)
-                                // to it.
-                                self.state.write_mstatus(
-                                    MSTATUS_MIE,
-                                    self.state.read_mstatus(MSTATUS_MPIE),
-                                );
-
-                                // Set a previous interrupt-enable bit for machine mode (MPIE, 7)
-                                // to 1.
-                                self.state.write_mstatus(MSTATUS_MPIE, 1);
-
-                                // Set a previous privilege mode for machine mode (MPP, 11..13) to
-                                // 0.
-                                self.state.write_mstatus(MSTATUS_MPP, Mode::User as u64);
-                            }
-                            (0x5, 0x8) => {
-                                // wfi
-                                inst_count!(self, "wfi");
-                                self.debug(inst, "wfi");
-                                // "provides a hint to the implementation that the current
-                                // hart can be stalled until an interrupt might need servicing."
-                                self.idle = true;
-                            }
-                            (_, 0x9) => {
-                                // sfence.vma
-                                inst_count!(self, "sfence.vma");
-                                self.debug(inst, "sfence.vma");
-                                // "SFENCE.VMA is used to synchronize updates to in-memory
-                                // memory-management data structures with current execution"
-                            }
-                            (_, 0x11) => {
-                                // hfence.bvma
-                                inst_count!(self, "hfence.bvma");
-                                self.debug(inst, "hfence.bvma");
-                            }
-                            (_, 0x51) => {
-                                // hfence.gvma
-                                inst_count!(self, "hfence.gvma");
-                                self.debug(inst, "hfence.gvma");
-                            }
-                            _ => {
-                                return Err(Exception::IllegalInstruction(inst));
-                            }
-                        }
-                    }
-                    0x1 => {
-                        // csrrw
-                        inst_count!(self, "csrrw");
-                        self.debug(inst, "csrrw");
-
-                        let t = self.state.read(csr_addr);
-                        self.state.write(csr_addr, self.xregs.read(rs1));
-                        self.xregs.write(rd, t);
-
-                        if csr_addr == SATP {
-                            self.update_paging();
-                        }
-                    }
-                    0x2 => {
-                        // csrrs
-                        inst_count!(self, "csrrs");
-                        self.debug(inst, "csrrs");
-
-                        let t = self.state.read(csr_addr);
-                        self.state.write(csr_addr, t | self.xregs.read(rs1));
-                        self.xregs.write(rd, t);
-
-                        if csr_addr == SATP {
-                            self.update_paging();
-                        }
-                    }
-                    0x3 => {
-                        // csrrc
-                        inst_count!(self, "csrrc");
-                        self.debug(inst, "csrrc");
-
-                        let t = self.state.read(csr_addr);
-                        self.state.write(csr_addr, t & (!self.xregs.read(rs1)));
-                        self.xregs.write(rd, t);
-
-                        if csr_addr == SATP {
-                            self.update_paging();
-                        }
-                    }
-                    0x5 => {
-                        // csrrwi
-                        inst_count!(self, "csrrwi");
-                        self.debug(inst, "csrrwi");
-
-                        let zimm = rs1;
-                        self.xregs.write(rd, self.state.read(csr_addr));
-                        self.state.write(csr_addr, zimm);
-
-                        if csr_addr == SATP {
-                            self.update_paging();
-                        }
-                    }
-                    0x6 => {
-                        // csrrsi
-                        inst_count!(self, "csrrsi");
-                        self.debug(inst, "csrrsi");
-
-                        let zimm = rs1;
-                        let t = self.state.read(csr_addr);
-                        self.state.write(csr_addr, t | zimm);
-                        self.xregs.write(rd, t);
-
-                        if csr_addr == SATP {
-                            self.update_paging();
-                        }
-                    }
-                    0x7 => {
-                        // csrrci
-                        inst_count!(self, "csrrci");
-                        self.debug(inst, "csrrci");
-
-                        let zimm = rs1;
-                        let t = self.state.read(csr_addr);
-                        self.state.write(csr_addr, t & (!zimm));
-                        self.xregs.write(rd, t);
-
-                        if csr_addr == SATP {
-                            self.update_paging();
-                        }
-                    }
-                    _ => {
-                        return Err(Exception::IllegalInstruction(inst));
-                    }
-                }
+            CSR_SIE_ADDRESS => {
+                self.csr[CSR_MIE_ADDRESS as usize] &= !0x222;
+                self.csr[CSR_MIE_ADDRESS as usize] |= value & 0x222;
             }
+            CSR_SIP_ADDRESS => {
+                self.csr[CSR_MIP_ADDRESS as usize] &= !0x222;
+                self.csr[CSR_MIP_ADDRESS as usize] |= value & 0x222;
+            }
+            CSR_MIDELEG_ADDRESS => {
+                self.csr[address as usize] = value & 0x666; // from qemu
+            }
+            CSR_MSTATUS_ADDRESS => {
+                self.csr[address as usize] = value;
+                self.mmu
+                    .update_mstatus(self.read_csr_raw(CSR_MSTATUS_ADDRESS));
+            }
+            // CSR_TIME_ADDRESS => {
+            //     self.mmu.get_mut_clint().write_mtime(value);
+            // }
             _ => {
-                return Err(Exception::IllegalInstruction(inst));
+                self.csr[address as usize] = value;
+            }
+        };
+    }
+
+    fn _set_fcsr_nv(&mut self) {
+        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x10;
+    }
+
+    fn set_fcsr_dz(&mut self) {
+        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x8;
+    }
+
+    fn _set_fcsr_of(&mut self) {
+        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x4;
+    }
+
+    fn _set_fcsr_uf(&mut self) {
+        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x2;
+    }
+
+    fn _set_fcsr_nx(&mut self) {
+        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x1;
+    }
+
+    fn update_addressing_mode(&mut self, value: u64) {
+        let addressing_mode = match self.xlen {
+            Xlen::Bit32 => match value & 0x80000000 {
+                0 => AddressingMode::None,
+                _ => AddressingMode::SV32,
+            },
+            Xlen::Bit64 => match value >> 60 {
+                0 => AddressingMode::None,
+                8 => AddressingMode::SV39,
+                9 => AddressingMode::SV48,
+                _ => {
+                    println!("Unknown addressing_mode {:x}", value >> 60);
+                    panic!();
+                }
+            },
+        };
+        let ppn = match self.xlen {
+            Xlen::Bit32 => value & 0x3fffff,
+            Xlen::Bit64 => value & 0xfffffffffff,
+        };
+        self.mmu.update_addressing_mode(addressing_mode);
+        self.mmu.update_ppn(ppn);
+    }
+
+    // @TODO: Rename to better name?
+    fn sign_extend(&self, value: i64) -> i64 {
+        match self.xlen {
+            Xlen::Bit32 => value as i32 as i64,
+            Xlen::Bit64 => value,
+        }
+    }
+
+    // @TODO: Rename to better name?
+    fn unsigned_data(&self, value: i64) -> u64 {
+        (value as u64) & self.unsigned_data_mask
+    }
+
+    // @TODO: Rename to better name?
+    fn most_negative(&self) -> i64 {
+        match self.xlen {
+            Xlen::Bit32 => std::i32::MIN as i64,
+            Xlen::Bit64 => std::i64::MIN,
+        }
+    }
+
+    // @TODO: Optimize
+    fn uncompress(&self, halfword: u32) -> u32 {
+        let op = halfword & 0x3; // [1:0]
+        let funct3 = (halfword >> 13) & 0x7; // [15:13]
+
+        match op {
+            0 => match funct3 {
+                0 => {
+                    // C.ADDI4SPN
+                    // addi rd+8, x2, nzuimm
+                    let rd = (halfword >> 2) & 0x7; // [4:2]
+                    let nzuimm = ((halfword >> 7) & 0x30) | // nzuimm[5:4] <= [12:11]
+						((halfword >> 1) & 0x3c0) | // nzuimm{9:6] <= [10:7]
+						((halfword >> 4) & 0x4) | // nzuimm[2] <= [6]
+						((halfword >> 2) & 0x8); // nzuimm[3] <= [5]
+                         // nzuimm == 0 is reserved instruction
+                    if nzuimm != 0 {
+                        return (nzuimm << 20) | (2 << 15) | ((rd + 8) << 7) | 0x13;
+                    }
+                }
+                1 => {
+                    // @TODO: Support C.LQ for 128-bit
+                    // C.FLD for 32, 64-bit
+                    // fld rd+8, offset(rs1+8)
+                    let rd = (halfword >> 2) & 0x7; // [4:2]
+                    let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                    let offset = ((halfword >> 7) & 0x38) | // offset[5:3] <= [12:10]
+						((halfword << 1) & 0xc0); // offset[7:6] <= [6:5]
+                    return (offset << 20) | ((rs1 + 8) << 15) | (3 << 12) | ((rd + 8) << 7) | 0x7;
+                }
+                2 => {
+                    // C.LW
+                    // lw rd+8, offset(rs1+8)
+                    let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                    let rd = (halfword >> 2) & 0x7; // [4:2]
+                    let offset = ((halfword >> 7) & 0x38) | // offset[5:3] <= [12:10]
+						((halfword >> 4) & 0x4) | // offset[2] <= [6]
+						((halfword << 1) & 0x40); // offset[6] <= [5]
+                    return (offset << 20) | ((rs1 + 8) << 15) | (2 << 12) | ((rd + 8) << 7) | 0x3;
+                }
+                3 => {
+                    // @TODO: Support C.FLW in 32-bit mode
+                    // C.LD in 64-bit mode
+                    // ld rd+8, offset(rs1+8)
+                    let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                    let rd = (halfword >> 2) & 0x7; // [4:2]
+                    let offset = ((halfword >> 7) & 0x38) | // offset[5:3] <= [12:10]
+						((halfword << 1) & 0xc0); // offset[7:6] <= [6:5]
+                    return (offset << 20) | ((rs1 + 8) << 15) | (3 << 12) | ((rd + 8) << 7) | 0x3;
+                }
+                4 => {
+                    // Reserved
+                }
+                5 => {
+                    // C.FSD
+                    // fsd rs2+8, offset(rs1+8)
+                    let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                    let rs2 = (halfword >> 2) & 0x7; // [4:2]
+                    let offset = ((halfword >> 7) & 0x38) | // uimm[5:3] <= [12:10]
+						((halfword << 1) & 0xc0); // uimm[7:6] <= [6:5]
+                    let imm11_5 = (offset >> 5) & 0x7f;
+                    let imm4_0 = offset & 0x1f;
+                    return (imm11_5 << 25)
+                        | ((rs2 + 8) << 20)
+                        | ((rs1 + 8) << 15)
+                        | (3 << 12)
+                        | (imm4_0 << 7)
+                        | 0x27;
+                }
+                6 => {
+                    // C.SW
+                    // sw rs2+8, offset(rs1+8)
+                    let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                    let rs2 = (halfword >> 2) & 0x7; // [4:2]
+                    let offset = ((halfword >> 7) & 0x38) | // offset[5:3] <= [12:10]
+						((halfword << 1) & 0x40) | // offset[6] <= [5]
+						((halfword >> 4) & 0x4); // offset[2] <= [6]
+                    let imm11_5 = (offset >> 5) & 0x7f;
+                    let imm4_0 = offset & 0x1f;
+                    return (imm11_5 << 25)
+                        | ((rs2 + 8) << 20)
+                        | ((rs1 + 8) << 15)
+                        | (2 << 12)
+                        | (imm4_0 << 7)
+                        | 0x23;
+                }
+                7 => {
+                    // @TODO: Support C.FSW in 32-bit mode
+                    // C.SD
+                    // sd rs2+8, offset(rs1+8)
+                    let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                    let rs2 = (halfword >> 2) & 0x7; // [4:2]
+                    let offset = ((halfword >> 7) & 0x38) | // uimm[5:3] <= [12:10]
+						((halfword << 1) & 0xc0); // uimm[7:6] <= [6:5]
+                    let imm11_5 = (offset >> 5) & 0x7f;
+                    let imm4_0 = offset & 0x1f;
+                    return (imm11_5 << 25)
+                        | ((rs2 + 8) << 20)
+                        | ((rs1 + 8) << 15)
+                        | (3 << 12)
+                        | (imm4_0 << 7)
+                        | 0x23;
+                }
+                _ => {} // Not happens
+            },
+            1 => {
+                match funct3 {
+                    0 => {
+                        let r = (halfword >> 7) & 0x1f; // [11:7]
+                        let imm = match halfword & 0x1000 {
+							0x1000 => 0xffffffc0,
+							_ => 0
+						} | // imm[31:6] <= [12]
+						((halfword >> 7) & 0x20) | // imm[5] <= [12]
+						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
+                        if r == 0 && imm == 0 {
+                            // C.NOP
+                            // addi x0, x0, 0
+                            return 0x13;
+                        } else if r != 0 {
+                            // C.ADDI
+                            // addi r, r, imm
+                            return (imm << 20) | (r << 15) | (r << 7) | 0x13;
+                        }
+                        // @TODO: Support HINTs
+                        // r == 0 and imm != 0 is HINTs
+                    }
+                    1 => {
+                        // @TODO: Support C.JAL in 32-bit mode
+                        // C.ADDIW
+                        // addiw r, r, imm
+                        let r = (halfword >> 7) & 0x1f;
+                        let imm = match halfword & 0x1000 {
+							0x1000 => 0xffffffc0,
+							_ => 0
+						} | // imm[31:6] <= [12]
+						((halfword >> 7) & 0x20) | // imm[5] <= [12]
+						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
+                        if r != 0 {
+                            return (imm << 20) | (r << 15) | (r << 7) | 0x1b;
+                        }
+                        // r == 0 is reserved instruction
+                    }
+                    2 => {
+                        // C.LI
+                        // addi rd, x0, imm
+                        let r = (halfword >> 7) & 0x1f;
+                        let imm = match halfword & 0x1000 {
+							0x1000 => 0xffffffc0,
+							_ => 0
+						} | // imm[31:6] <= [12]
+						((halfword >> 7) & 0x20) | // imm[5] <= [12]
+						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
+                        if r != 0 {
+                            return (imm << 20) | (r << 7) | 0x13;
+                        }
+                        // @TODO: Support HINTs
+                        // r == 0 is for HINTs
+                    }
+                    3 => {
+                        let r = (halfword >> 7) & 0x1f; // [11:7]
+                        if r == 2 {
+                            // C.ADDI16SP
+                            // addi r, r, nzimm
+                            let imm = match halfword & 0x1000 {
+								0x1000 => 0xfffffc00,
+								_ => 0
+							} | // imm[31:10] <= [12]
+							((halfword >> 3) & 0x200) | // imm[9] <= [12]
+							((halfword >> 2) & 0x10) | // imm[4] <= [6]
+							((halfword << 1) & 0x40) | // imm[6] <= [5]
+							((halfword << 4) & 0x180) | // imm[8:7] <= [4:3]
+							((halfword << 3) & 0x20); // imm[5] <= [2]
+                            if imm != 0 {
+                                return (imm << 20) | (r << 15) | (r << 7) | 0x13;
+                            }
+                            // imm == 0 is for reserved instruction
+                        }
+                        if r != 0 && r != 2 {
+                            // C.LUI
+                            // lui r, nzimm
+                            let nzimm = match halfword & 0x1000 {
+								0x1000 => 0xfffc0000,
+								_ => 0
+							} | // nzimm[31:18] <= [12]
+							((halfword << 5) & 0x20000) | // nzimm[17] <= [12]
+							((halfword << 10) & 0x1f000); // nzimm[16:12] <= [6:2]
+                            if nzimm != 0 {
+                                return nzimm | (r << 7) | 0x37;
+                            }
+                            // nzimm == 0 is for reserved instruction
+                        }
+                    }
+                    4 => {
+                        let funct2 = (halfword >> 10) & 0x3; // [11:10]
+                        match funct2 {
+                            0 => {
+                                // C.SRLI
+                                // c.srli rs1+8, rs1+8, shamt
+                                let shamt = ((halfword >> 7) & 0x20) | // shamt[5] <= [12]
+									((halfword >> 2) & 0x1f); // shamt[4:0] <= [6:2]
+                                let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                                return (shamt << 20)
+                                    | ((rs1 + 8) << 15)
+                                    | (5 << 12)
+                                    | ((rs1 + 8) << 7)
+                                    | 0x13;
+                            }
+                            1 => {
+                                // C.SRAI
+                                // srai rs1+8, rs1+8, shamt
+                                let shamt = ((halfword >> 7) & 0x20) | // shamt[5] <= [12]
+									((halfword >> 2) & 0x1f); // shamt[4:0] <= [6:2]
+                                let rs1 = (halfword >> 7) & 0x7; // [9:7]
+                                return (0x20 << 25)
+                                    | (shamt << 20)
+                                    | ((rs1 + 8) << 15)
+                                    | (5 << 12)
+                                    | ((rs1 + 8) << 7)
+                                    | 0x13;
+                            }
+                            2 => {
+                                // C.ANDI
+                                // andi, r+8, r+8, imm
+                                let r = (halfword >> 7) & 0x7; // [9:7]
+                                let imm = match halfword & 0x1000 {
+									0x1000 => 0xffffffc0,
+									_ => 0
+								} | // imm[31:6] <= [12]
+								((halfword >> 7) & 0x20) | // imm[5] <= [12]
+								((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
+                                return (imm << 20)
+                                    | ((r + 8) << 15)
+                                    | (7 << 12)
+                                    | ((r + 8) << 7)
+                                    | 0x13;
+                            }
+                            3 => {
+                                let funct1 = (halfword >> 12) & 1; // [12]
+                                let funct2_2 = (halfword >> 5) & 0x3; // [6:5]
+                                let rs1 = (halfword >> 7) & 0x7;
+                                let rs2 = (halfword >> 2) & 0x7;
+                                match funct1 {
+                                    0 => match funct2_2 {
+                                        0 => {
+                                            // C.SUB
+                                            // sub rs1+8, rs1+8, rs2+8
+                                            return (0x20 << 25)
+                                                | ((rs2 + 8) << 20)
+                                                | ((rs1 + 8) << 15)
+                                                | ((rs1 + 8) << 7)
+                                                | 0x33;
+                                        }
+                                        1 => {
+                                            // C.XOR
+                                            // xor rs1+8, rs1+8, rs2+8
+                                            return ((rs2 + 8) << 20)
+                                                | ((rs1 + 8) << 15)
+                                                | (4 << 12)
+                                                | ((rs1 + 8) << 7)
+                                                | 0x33;
+                                        }
+                                        2 => {
+                                            // C.OR
+                                            // or rs1+8, rs1+8, rs2+8
+                                            return ((rs2 + 8) << 20)
+                                                | ((rs1 + 8) << 15)
+                                                | (6 << 12)
+                                                | ((rs1 + 8) << 7)
+                                                | 0x33;
+                                        }
+                                        3 => {
+                                            // C.AND
+                                            // and rs1+8, rs1+8, rs2+8
+                                            return ((rs2 + 8) << 20)
+                                                | ((rs1 + 8) << 15)
+                                                | (7 << 12)
+                                                | ((rs1 + 8) << 7)
+                                                | 0x33;
+                                        }
+                                        _ => {} // Not happens
+                                    },
+                                    1 => match funct2_2 {
+                                        0 => {
+                                            // C.SUBW
+                                            // subw r1+8, r1+8, r2+8
+                                            return (0x20 << 25)
+                                                | ((rs2 + 8) << 20)
+                                                | ((rs1 + 8) << 15)
+                                                | ((rs1 + 8) << 7)
+                                                | 0x3b;
+                                        }
+                                        1 => {
+                                            // C.ADDW
+                                            // addw r1+8, r1+8, r2+8
+                                            return ((rs2 + 8) << 20)
+                                                | ((rs1 + 8) << 15)
+                                                | ((rs1 + 8) << 7)
+                                                | 0x3b;
+                                        }
+                                        2 => {
+                                            // Reserved
+                                        }
+                                        3 => {
+                                            // Reserved
+                                        }
+                                        _ => {} // Not happens
+                                    },
+                                    _ => {} // No happens
+                                };
+                            }
+                            _ => {} // not happens
+                        };
+                    }
+                    5 => {
+                        // C.J
+                        // jal x0, imm
+                        let offset = match halfword & 0x1000 {
+								0x1000 => 0xfffff000,
+								_ => 0
+							} | // offset[31:12] <= [12]
+							((halfword >> 1) & 0x800) | // offset[11] <= [12]
+							((halfword >> 7) & 0x10) | // offset[4] <= [11]
+							((halfword >> 1) & 0x300) | // offset[9:8] <= [10:9]
+							((halfword << 2) & 0x400) | // offset[10] <= [8]
+							((halfword >> 1) & 0x40) | // offset[6] <= [7]
+							((halfword << 1) & 0x80) | // offset[7] <= [6]
+							((halfword >> 2) & 0xe) | // offset[3:1] <= [5:3]
+							((halfword << 3) & 0x20); // offset[5] <= [2]
+                        let imm = ((offset >> 1) & 0x80000) | // imm[19] <= offset[20]
+							((offset << 8) & 0x7fe00) | // imm[18:9] <= offset[10:1]
+							((offset >> 3) & 0x100) | // imm[8] <= offset[11]
+							((offset >> 12) & 0xff); // imm[7:0] <= offset[19:12]
+                        return (imm << 12) | 0x6f;
+                    }
+                    6 => {
+                        // C.BEQZ
+                        // beq r+8, x0, offset
+                        let r = (halfword >> 7) & 0x7;
+                        let offset = match halfword & 0x1000 {
+								0x1000 => 0xfffffe00,
+								_ => 0
+							} | // offset[31:9] <= [12]
+							((halfword >> 4) & 0x100) | // offset[8] <= [12]
+							((halfword >> 7) & 0x18) | // offset[4:3] <= [11:10]
+							((halfword << 1) & 0xc0) | // offset[7:6] <= [6:5]
+							((halfword >> 2) & 0x6) | // offset[2:1] <= [4:3]
+							((halfword << 3) & 0x20); // offset[5] <= [2]
+                        let imm2 = ((offset >> 6) & 0x40) | // imm2[6] <= [12]
+							((offset >> 5) & 0x3f); // imm2[5:0] <= [10:5]
+                        let imm1 = (offset & 0x1e) | // imm1[4:1] <= [4:1]
+							((offset >> 11) & 0x1); // imm1[0] <= [11]
+                        return (imm2 << 25) | ((r + 8) << 20) | (imm1 << 7) | 0x63;
+                    }
+                    7 => {
+                        // C.BNEZ
+                        // bne r+8, x0, offset
+                        let r = (halfword >> 7) & 0x7;
+                        let offset = match halfword & 0x1000 {
+								0x1000 => 0xfffffe00,
+								_ => 0
+							} | // offset[31:9] <= [12]
+							((halfword >> 4) & 0x100) | // offset[8] <= [12]
+							((halfword >> 7) & 0x18) | // offset[4:3] <= [11:10]
+							((halfword << 1) & 0xc0) | // offset[7:6] <= [6:5]
+							((halfword >> 2) & 0x6) | // offset[2:1] <= [4:3]
+							((halfword << 3) & 0x20); // offset[5] <= [2]
+                        let imm2 = ((offset >> 6) & 0x40) | // imm2[6] <= [12]
+							((offset >> 5) & 0x3f); // imm2[5:0] <= [10:5]
+                        let imm1 = (offset & 0x1e) | // imm1[4:1] <= [4:1]
+							((offset >> 11) & 0x1); // imm1[0] <= [11]
+                        return (imm2 << 25) | ((r + 8) << 20) | (1 << 12) | (imm1 << 7) | 0x63;
+                    }
+                    _ => {} // No happens
+                };
+            }
+            2 => {
+                match funct3 {
+                    0 => {
+                        // C.SLLI
+                        // slli r, r, shamt
+                        let r = (halfword >> 7) & 0x1f;
+                        let shamt = ((halfword >> 7) & 0x20) | // imm[5] <= [12]
+							((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
+                        if r != 0 {
+                            return (shamt << 20) | (r << 15) | (1 << 12) | (r << 7) | 0x13;
+                        }
+                        // r == 0 is reserved instruction?
+                    }
+                    1 => {
+                        // C.FLDSP
+                        // fld rd, offset(x2)
+                        let rd = (halfword >> 7) & 0x1f;
+                        let offset = ((halfword >> 7) & 0x20) | // offset[5] <= [12]
+							((halfword >> 2) & 0x18) | // offset[4:3] <= [6:5]
+							((halfword << 4) & 0x1c0); // offset[8:6] <= [4:2]
+                        if rd != 0 {
+                            return (offset << 20) | (2 << 15) | (3 << 12) | (rd << 7) | 0x7;
+                        }
+                        // rd == 0 is reseved instruction
+                    }
+                    2 => {
+                        // C.LWSP
+                        // lw r, offset(x2)
+                        let r = (halfword >> 7) & 0x1f;
+                        let offset = ((halfword >> 7) & 0x20) | // offset[5] <= [12]
+							((halfword >> 2) & 0x1c) | // offset[4:2] <= [6:4]
+							((halfword << 4) & 0xc0); // offset[7:6] <= [3:2]
+                        if r != 0 {
+                            return (offset << 20) | (2 << 15) | (2 << 12) | (r << 7) | 0x3;
+                        }
+                        // r == 0 is reseved instruction
+                    }
+                    3 => {
+                        // @TODO: Support C.FLWSP in 32-bit mode
+                        // C.LDSP
+                        // ld rd, offset(x2)
+                        let rd = (halfword >> 7) & 0x1f;
+                        let offset = ((halfword >> 7) & 0x20) | // offset[5] <= [12]
+							((halfword >> 2) & 0x18) | // offset[4:3] <= [6:5]
+							((halfword << 4) & 0x1c0); // offset[8:6] <= [4:2]
+                        if rd != 0 {
+                            return (offset << 20) | (2 << 15) | (3 << 12) | (rd << 7) | 0x3;
+                        }
+                        // rd == 0 is reseved instruction
+                    }
+                    4 => {
+                        let funct1 = (halfword >> 12) & 1; // [12]
+                        let rs1 = (halfword >> 7) & 0x1f; // [11:7]
+                        let rs2 = (halfword >> 2) & 0x1f; // [6:2]
+                        match funct1 {
+                            0 => {
+                                if rs1 != 0 && rs2 == 0 {
+                                    // C.JR
+                                    // jalr x0, 0(rs1)
+                                    return (rs1 << 15) | 0x67;
+                                }
+                                // rs1 == 0 is reserved instruction
+                                if rs1 != 0 && rs2 != 0 {
+                                    // C.MV
+                                    // add rs1, x0, rs2
+                                    // println!("C.MV RS1:{:x} RS2:{:x}", rs1, rs2);
+                                    return (rs2 << 20) | (rs1 << 7) | 0x33;
+                                }
+                                // rs1 == 0 && rs2 != 0 is Hints
+                                // @TODO: Support Hints
+                            }
+                            1 => {
+                                if rs1 == 0 && rs2 == 0 {
+                                    // C.EBREAK
+                                    // ebreak
+                                    return 0x00100073;
+                                }
+                                if rs1 != 0 && rs2 == 0 {
+                                    // C.JALR
+                                    // jalr x1, 0(rs1)
+                                    return (rs1 << 15) | (1 << 7) | 0x67;
+                                }
+                                if rs1 != 0 && rs2 != 0 {
+                                    // C.ADD
+                                    // add rs1, rs1, rs2
+                                    return (rs2 << 20) | (rs1 << 15) | (rs1 << 7) | 0x33;
+                                }
+                                // rs1 == 0 && rs2 != 0 is Hists
+                                // @TODO: Supports Hinsts
+                            }
+                            _ => {} // Not happens
+                        };
+                    }
+                    5 => {
+                        // @TODO: Implement
+                        // C.FSDSP
+                        // fsd rs2, offset(x2)
+                        let rs2 = (halfword >> 2) & 0x1f; // [6:2]
+                        let offset = ((halfword >> 7) & 0x38) | // offset[5:3] <= [12:10]
+							((halfword >> 1) & 0x1c0); // offset[8:6] <= [9:7]
+                        let imm11_5 = (offset >> 5) & 0x3f;
+                        let imm4_0 = offset & 0x1f;
+                        return (imm11_5 << 25)
+                            | (rs2 << 20)
+                            | (2 << 15)
+                            | (3 << 12)
+                            | (imm4_0 << 7)
+                            | 0x27;
+                    }
+                    6 => {
+                        // C.SWSP
+                        // sw rs2, offset(x2)
+                        let rs2 = (halfword >> 2) & 0x1f; // [6:2]
+                        let offset = ((halfword >> 7) & 0x3c) | // offset[5:2] <= [12:9]
+							((halfword >> 1) & 0xc0); // offset[7:6] <= [8:7]
+                        let imm11_5 = (offset >> 5) & 0x3f;
+                        let imm4_0 = offset & 0x1f;
+                        return (imm11_5 << 25)
+                            | (rs2 << 20)
+                            | (2 << 15)
+                            | (2 << 12)
+                            | (imm4_0 << 7)
+                            | 0x23;
+                    }
+                    7 => {
+                        // @TODO: Support C.FSWSP in 32-bit mode
+                        // C.SDSP
+                        // sd rs, offset(x2)
+                        let rs2 = (halfword >> 2) & 0x1f; // [6:2]
+                        let offset = ((halfword >> 7) & 0x38) | // offset[5:3] <= [12:10]
+							((halfword >> 1) & 0x1c0); // offset[8:6] <= [9:7]
+                        let imm11_5 = (offset >> 5) & 0x3f;
+                        let imm4_0 = offset & 0x1f;
+                        return (imm11_5 << 25)
+                            | (rs2 << 20)
+                            | (2 << 15)
+                            | (3 << 12)
+                            | (imm4_0 << 7)
+                            | 0x23;
+                    }
+                    _ => {} // Not happens
+                };
+            }
+            _ => {} // No happnes
+        };
+        0xffffffff // Return invalid value
+    }
+
+    /// Disassembles an instruction pointed by Program Counter.
+    pub fn disassemble_next_instruction(&mut self) -> String {
+        // @TODO: Fetching can make a side effect,
+        // for example updating page table entry or update peripheral hardware registers.
+        // But ideally disassembling doesn't want to cause any side effect.
+        // How can we avoid side effect?
+        let mut original_word = match self.mmu.fetch_word(self.pc) {
+            Ok(data) => data,
+            Err(_e) => {
+                return format!("PC:{:016x}, InstructionPageFault Trap!\n", self.pc);
+            }
+        };
+
+        let word = match (original_word & 0x3) == 0x3 {
+            true => original_word,
+            false => {
+                original_word &= 0xffff;
+                self.uncompress(original_word)
+            }
+        };
+
+        let inst = {
+            match self.decode_raw(word) {
+                Ok(inst) => inst,
+                Err(()) => {
+                    return format!(
+                        "Unknown instruction PC:{:x} WORD:{:x}",
+                        self.pc, original_word
+                    );
+                }
+            }
+        };
+
+        let mut s = format!("PC:{:016x} ", self.unsigned_data(self.pc as i64));
+        s += &format!("{:08x} ", original_word);
+        s += &format!("{} ", inst.name);
+        s += &format!("{}", (inst.disassemble)(self, word, self.pc, true));
+        s
+    }
+
+    /// Returns mutable `Mmu`
+    pub fn get_mut_mmu(&mut self) -> &mut Mmu {
+        &mut self.mmu
+    }
+
+    // /// Returns mutable `Terminal`
+    // pub fn get_mut_terminal(&mut self) -> &mut Box<dyn Terminal> {
+    //     self.mmu.get_mut_uart().get_mut_terminal()
+    // }
+}
+
+struct Instruction {
+    mask: u32,
+    data: u32, // @TODO: rename
+    name: &'static str,
+    operation: fn(cpu: &mut Cpu, word: u32, address: u64) -> Result<(), Trap>,
+    disassemble: fn(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String,
+}
+
+struct FormatB {
+    rs1: usize,
+    rs2: usize,
+    imm: u64,
+}
+
+fn parse_format_b(word: u32) -> FormatB {
+    FormatB {
+        rs1: ((word >> 15) & 0x1f) as usize, // [19:15]
+        rs2: ((word >> 20) & 0x1f) as usize, // [24:20]
+        imm: (
+            match word & 0x80000000 { // imm[31:12] = [31]
+				0x80000000 => 0xfffff000,
+				_ => 0
+			} |
+			((word << 4) & 0x00000800) | // imm[11] = [7]
+			((word >> 20) & 0x000007e0) | // imm[10:5] = [30:25]
+			((word >> 7) & 0x0000001e)
+            // imm[4:1] = [11:8]
+        ) as i32 as i64 as u64,
+    }
+}
+
+fn dump_format_b(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String {
+    let f = parse_format_b(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rs1));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs1]);
+    }
+    s += &format!(",{}", get_register_name(f.rs2));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs2]);
+    }
+    s += &format!(",{:x}", address.wrapping_add(f.imm));
+    s
+}
+
+struct FormatCSR {
+    csr: u16,
+    rs: usize,
+    rd: usize,
+}
+
+fn parse_format_csr(word: u32) -> FormatCSR {
+    FormatCSR {
+        csr: ((word >> 20) & 0xfff) as u16, // [31:20]
+        rs: ((word >> 15) & 0x1f) as usize, // [19:15], also uimm
+        rd: ((word >> 7) & 0x1f) as usize,  // [11:7]
+    }
+}
+
+fn dump_format_csr(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+    let f = parse_format_csr(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rd));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rd]);
+    }
+    // @TODO: Use CSR name
+    s += &format!(",{:x}", f.csr);
+    if evaluate {
+        s += &format!(":{:x}", cpu.read_csr_raw(f.csr));
+    }
+    s += &format!(",{}", get_register_name(f.rs));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs]);
+    }
+    s
+}
+
+struct FormatI {
+    rd: usize,
+    rs1: usize,
+    imm: i64,
+}
+
+fn parse_format_i(word: u32) -> FormatI {
+    FormatI {
+        rd: ((word >> 7) & 0x1f) as usize,   // [11:7]
+        rs1: ((word >> 15) & 0x1f) as usize, // [19:15]
+        imm: (
+            match word & 0x80000000 {
+                // imm[31:11] = [31]
+                0x80000000 => 0xfffff800,
+                _ => 0,
+            } | ((word >> 20) & 0x000007ff)
+            // imm[10:0] = [30:20]
+        ) as i32 as i64,
+    }
+}
+
+fn dump_format_i(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+    let f = parse_format_i(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rd));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rd]);
+    }
+    s += &format!(",{}", get_register_name(f.rs1));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs1]);
+    }
+    s += &format!(",{:x}", f.imm);
+    s
+}
+
+fn dump_format_i_mem(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+    let f = parse_format_i(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rd));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rd]);
+    }
+    s += &format!(",{:x}({}", f.imm, get_register_name(f.rs1));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs1]);
+    }
+    s += &format!(")");
+    s
+}
+
+struct FormatJ {
+    rd: usize,
+    imm: u64,
+}
+
+fn parse_format_j(word: u32) -> FormatJ {
+    FormatJ {
+        rd: ((word >> 7) & 0x1f) as usize, // [11:7]
+        imm: (
+            match word & 0x80000000 { // imm[31:20] = [31]
+				0x80000000 => 0xfff00000,
+				_ => 0
+			} |
+			(word & 0x000ff000) | // imm[19:12] = [19:12]
+			((word & 0x00100000) >> 9) | // imm[11] = [20]
+			((word & 0x7fe00000) >> 20)
+            // imm[10:1] = [30:21]
+        ) as i32 as i64 as u64,
+    }
+}
+
+fn dump_format_j(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String {
+    let f = parse_format_j(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rd));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rd]);
+    }
+    s += &format!(",{:x}", address.wrapping_add(f.imm));
+    s
+}
+
+struct FormatR {
+    rd: usize,
+    rs1: usize,
+    rs2: usize,
+}
+
+fn parse_format_r(word: u32) -> FormatR {
+    FormatR {
+        rd: ((word >> 7) & 0x1f) as usize,   // [11:7]
+        rs1: ((word >> 15) & 0x1f) as usize, // [19:15]
+        rs2: ((word >> 20) & 0x1f) as usize, // [24:20]
+    }
+}
+
+fn dump_format_r(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+    let f = parse_format_r(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rd));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rd]);
+    }
+    s += &format!(",{}", get_register_name(f.rs1));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs1]);
+    }
+    s += &format!(",{}", get_register_name(f.rs2));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs2]);
+    }
+    s
+}
+
+// has rs3
+struct FormatR2 {
+    rd: usize,
+    rs1: usize,
+    rs2: usize,
+    rs3: usize,
+}
+
+fn parse_format_r2(word: u32) -> FormatR2 {
+    FormatR2 {
+        rd: ((word >> 7) & 0x1f) as usize,   // [11:7]
+        rs1: ((word >> 15) & 0x1f) as usize, // [19:15]
+        rs2: ((word >> 20) & 0x1f) as usize, // [24:20]
+        rs3: ((word >> 27) & 0x1f) as usize, // [31:27]
+    }
+}
+
+fn dump_format_r2(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+    let f = parse_format_r2(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rd));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rd]);
+    }
+    s += &format!(",{}", get_register_name(f.rs1));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs1]);
+    }
+    s += &format!(",{}", get_register_name(f.rs2));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs2]);
+    }
+    s += &format!(",{}", get_register_name(f.rs3));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs3]);
+    }
+    s
+}
+
+struct FormatS {
+    rs1: usize,
+    rs2: usize,
+    imm: i64,
+}
+
+fn parse_format_s(word: u32) -> FormatS {
+    FormatS {
+        rs1: ((word >> 15) & 0x1f) as usize, // [19:15]
+        rs2: ((word >> 20) & 0x1f) as usize, // [24:20]
+        imm: (
+            match word & 0x80000000 {
+				0x80000000 => 0xfffff000,
+				_ => 0
+			} | // imm[31:12] = [31]
+			((word >> 20) & 0xfe0) | // imm[11:5] = [31:25]
+			((word >> 7) & 0x1f)
+            // imm[4:0] = [11:7]
+        ) as i32 as i64,
+    }
+}
+
+fn dump_format_s(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+    let f = parse_format_s(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rs2));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs2]);
+    }
+    s += &format!(",{:x}({}", f.imm, get_register_name(f.rs1));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rs1]);
+    }
+    s += &format!(")");
+    s
+}
+
+struct FormatU {
+    rd: usize,
+    imm: u64,
+}
+
+fn parse_format_u(word: u32) -> FormatU {
+    FormatU {
+        rd: ((word >> 7) & 0x1f) as usize, // [11:7]
+        imm: (
+            match word & 0x80000000 {
+				0x80000000 => 0xffffffff00000000,
+				_ => 0
+			} | // imm[63:32] = [31]
+			((word as u64) & 0xfffff000)
+            // imm[31:12] = [31:12]
+        ) as u64,
+    }
+}
+
+fn dump_format_u(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+    let f = parse_format_u(word);
+    let mut s = String::new();
+    s += &format!("{}", get_register_name(f.rd));
+    if evaluate {
+        s += &format!(":{:x}", cpu.x[f.rd]);
+    }
+    s += &format!(",{:x}", f.imm);
+    s
+}
+
+fn dump_empty(_cpu: &mut Cpu, _word: u32, _address: u64, _evaluate: bool) -> String {
+    String::new()
+}
+
+fn get_register_name(num: usize) -> &'static str {
+    match num {
+        0 => "zero",
+        1 => "ra",
+        2 => "sp",
+        3 => "gp",
+        4 => "tp",
+        5 => "t0",
+        6 => "t1",
+        7 => "t2",
+        8 => "s0",
+        9 => "s1",
+        10 => "a0",
+        11 => "a1",
+        12 => "a2",
+        13 => "a3",
+        14 => "a4",
+        15 => "a5",
+        16 => "a6",
+        17 => "a7",
+        18 => "s2",
+        19 => "s3",
+        20 => "s4",
+        21 => "s5",
+        22 => "s6",
+        23 => "s7",
+        24 => "s8",
+        25 => "s9",
+        26 => "s10",
+        27 => "s11",
+        28 => "t3",
+        29 => "t4",
+        30 => "t5",
+        31 => "t6",
+        _ => panic!("Unknown register num {}", num),
+    }
+}
+
+const INSTRUCTION_NUM: usize = 116;
+
+// @TODO: Reorder in often used order as
+const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00000033,
+        name: "ADD",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1].wrapping_add(cpu.x[f.rs2]));
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00000013,
+        name: "ADDI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1].wrapping_add(f.imm));
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x0000001b,
+        name: "ADDIW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = cpu.x[f.rs1].wrapping_add(f.imm) as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0000003b,
+        name: "ADDW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.x[f.rs1].wrapping_add(cpu.x[f.rs2]) as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x0000302f,
+        name: "AMOADD.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu
+                .mmu
+                .store_doubleword(cpu.x[f.rs1] as u64, cpu.x[f.rs2].wrapping_add(tmp) as u64)
+            {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x0000202f,
+        name: "AMOADD.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i32 as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu
+                .mmu
+                .store_word(cpu.x[f.rs1] as u64, cpu.x[f.rs2].wrapping_add(tmp) as u32)
+            {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x6000302f,
+        name: "AMOAND.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu
+                .mmu
+                .store_doubleword(cpu.x[f.rs1] as u64, (cpu.x[f.rs2] & tmp) as u64)
+            {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x6000202f,
+        name: "AMOAND.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i32 as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu
+                .mmu
+                .store_word(cpu.x[f.rs1] as u64, (cpu.x[f.rs2] & tmp) as u32)
+            {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0xe000302f,
+        name: "AMOMAXU.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+                Ok(data) => data,
+                Err(e) => return Err(e),
+            };
+            let max = match cpu.x[f.rs2] as u64 >= tmp {
+                true => cpu.x[f.rs2] as u64,
+                false => tmp,
+            };
+            match cpu.mmu.store_doubleword(cpu.x[f.rs1] as u64, max) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0xe000202f,
+        name: "AMOMAXU.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+                Ok(data) => data,
+                Err(e) => return Err(e),
+            };
+            let max = match cpu.x[f.rs2] as u32 >= tmp {
+                true => cpu.x[f.rs2] as u32,
+                false => tmp,
+            };
+            match cpu.mmu.store_word(cpu.x[f.rs1] as u64, max) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x4000302f,
+        name: "AMOOR.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu
+                .mmu
+                .store_doubleword(cpu.x[f.rs1] as u64, (cpu.x[f.rs2] | tmp) as u64)
+            {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x4000202f,
+        name: "AMOOR.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i32 as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu
+                .mmu
+                .store_word(cpu.x[f.rs1] as u64, (cpu.x[f.rs2] | tmp) as u32)
+            {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x0800302f,
+        name: "AMOSWAP.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu
+                .mmu
+                .store_doubleword(cpu.x[f.rs1] as u64, cpu.x[f.rs2] as u64)
+            {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x0800202f,
+        name: "AMOSWAP.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let tmp = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+                Ok(data) => data as i32 as i64,
+                Err(e) => return Err(e),
+            };
+            match cpu.mmu.store_word(cpu.x[f.rs1] as u64, cpu.x[f.rs2] as u32) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00007033,
+        name: "AND",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] & cpu.x[f.rs2]);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00007013,
+        name: "ANDI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] & f.imm);
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+    Instruction {
+        mask: 0x0000007f,
+        data: 0x00000017,
+        name: "AUIPC",
+        operation: |cpu, word, address| {
+            let f = parse_format_u(word);
+            cpu.x[f.rd] = cpu.sign_extend(address.wrapping_add(f.imm) as i64);
+            Ok(())
+        },
+        disassemble: dump_format_u,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00000063,
+        name: "BEQ",
+        operation: |cpu, word, address| {
+            let f = parse_format_b(word);
+            if cpu.sign_extend(cpu.x[f.rs1]) == cpu.sign_extend(cpu.x[f.rs2]) {
+                cpu.pc = address.wrapping_add(f.imm);
+            }
+            Ok(())
+        },
+        disassemble: dump_format_b,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00005063,
+        name: "BGE",
+        operation: |cpu, word, address| {
+            let f = parse_format_b(word);
+            if cpu.sign_extend(cpu.x[f.rs1]) >= cpu.sign_extend(cpu.x[f.rs2]) {
+                cpu.pc = address.wrapping_add(f.imm);
+            }
+            Ok(())
+        },
+        disassemble: dump_format_b,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00007063,
+        name: "BGEU",
+        operation: |cpu, word, address| {
+            let f = parse_format_b(word);
+            if cpu.unsigned_data(cpu.x[f.rs1]) >= cpu.unsigned_data(cpu.x[f.rs2]) {
+                cpu.pc = address.wrapping_add(f.imm);
+            }
+            Ok(())
+        },
+        disassemble: dump_format_b,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00004063,
+        name: "BLT",
+        operation: |cpu, word, address| {
+            let f = parse_format_b(word);
+            if cpu.sign_extend(cpu.x[f.rs1]) < cpu.sign_extend(cpu.x[f.rs2]) {
+                cpu.pc = address.wrapping_add(f.imm);
+            }
+            Ok(())
+        },
+        disassemble: dump_format_b,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00006063,
+        name: "BLTU",
+        operation: |cpu, word, address| {
+            let f = parse_format_b(word);
+            if cpu.unsigned_data(cpu.x[f.rs1]) < cpu.unsigned_data(cpu.x[f.rs2]) {
+                cpu.pc = address.wrapping_add(f.imm);
+            }
+            Ok(())
+        },
+        disassemble: dump_format_b,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00001063,
+        name: "BNE",
+        operation: |cpu, word, address| {
+            let f = parse_format_b(word);
+            if cpu.sign_extend(cpu.x[f.rs1]) != cpu.sign_extend(cpu.x[f.rs2]) {
+                cpu.pc = address.wrapping_add(f.imm);
+            }
+            Ok(())
+        },
+        disassemble: dump_format_b,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00003073,
+        name: "CSRRC",
+        operation: |cpu, word, _address| {
+            let f = parse_format_csr(word);
+            let data = match cpu.read_csr(f.csr) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            let tmp = cpu.x[f.rs];
+            cpu.x[f.rd] = cpu.sign_extend(data);
+            match cpu.write_csr(f.csr, (cpu.x[f.rd] & !tmp) as u64) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_csr,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00007073,
+        name: "CSRRCI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_csr(word);
+            let data = match cpu.read_csr(f.csr) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = cpu.sign_extend(data);
+            match cpu.write_csr(f.csr, (cpu.x[f.rd] & !(f.rs as i64)) as u64) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_csr,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00002073,
+        name: "CSRRS",
+        operation: |cpu, word, _address| {
+            let f = parse_format_csr(word);
+            let data = match cpu.read_csr(f.csr) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            let tmp = cpu.x[f.rs];
+            cpu.x[f.rd] = cpu.sign_extend(data);
+            match cpu.write_csr(f.csr, cpu.unsigned_data(cpu.x[f.rd] | tmp)) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_csr,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00006073,
+        name: "CSRRSI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_csr(word);
+            let data = match cpu.read_csr(f.csr) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = cpu.sign_extend(data);
+            match cpu.write_csr(f.csr, cpu.unsigned_data(cpu.x[f.rd] | (f.rs as i64))) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_csr,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00001073,
+        name: "CSRRW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_csr(word);
+            let data = match cpu.read_csr(f.csr) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            let tmp = cpu.x[f.rs];
+            cpu.x[f.rd] = cpu.sign_extend(data);
+            match cpu.write_csr(f.csr, cpu.unsigned_data(tmp)) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_csr,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00005073,
+        name: "CSRRWI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_csr(word);
+            let data = match cpu.read_csr(f.csr) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            cpu.x[f.rd] = cpu.sign_extend(data);
+            match cpu.write_csr(f.csr, f.rs as u64) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_csr,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02004033,
+        name: "DIV",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.x[f.rs1];
+            let divisor = cpu.x[f.rs2];
+            if divisor == 0 {
+                cpu.x[f.rd] = -1;
+            } else if dividend == cpu.most_negative() && divisor == -1 {
+                cpu.x[f.rd] = dividend;
+            } else {
+                cpu.x[f.rd] = cpu.sign_extend(dividend.wrapping_div(divisor))
+            }
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02005033,
+        name: "DIVU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.unsigned_data(cpu.x[f.rs1]);
+            let divisor = cpu.unsigned_data(cpu.x[f.rs2]);
+            if divisor == 0 {
+                cpu.x[f.rd] = -1;
+            } else {
+                cpu.x[f.rd] = cpu.sign_extend(dividend.wrapping_div(divisor) as i64)
+            }
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0200503b,
+        name: "DIVUW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.unsigned_data(cpu.x[f.rs1]) as u32;
+            let divisor = cpu.unsigned_data(cpu.x[f.rs2]) as u32;
+            if divisor == 0 {
+                cpu.x[f.rd] = -1;
+            } else {
+                cpu.x[f.rd] = dividend.wrapping_div(divisor) as i32 as i64
+            }
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0200403b,
+        name: "DIVW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.x[f.rs1] as i32;
+            let divisor = cpu.x[f.rs2] as i32;
+            if divisor == 0 {
+                cpu.x[f.rd] = -1;
+            } else if dividend == std::i32::MIN && divisor == -1 {
+                cpu.x[f.rd] = dividend as i32 as i64;
+            } else {
+                cpu.x[f.rd] = dividend.wrapping_div(divisor) as i32 as i64
+            }
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xffffffff,
+        data: 0x00100073,
+        name: "EBREAK",
+        operation: |_cpu, _word, _address| {
+            // @TODO: Implement
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0xffffffff,
+        data: 0x00000073,
+        name: "ECALL",
+        operation: |cpu, _word, address| {
+            let exception_type = match cpu.privilege_mode {
+                PrivilegeMode::User => TrapType::EnvironmentCallFromUMode,
+                PrivilegeMode::Supervisor => TrapType::EnvironmentCallFromSMode,
+                PrivilegeMode::Machine => TrapType::EnvironmentCallFromMMode,
+                PrivilegeMode::Reserved => panic!("Unknown Privilege mode"),
+            };
+            return Err(Trap {
+                trap_type: exception_type,
+                value: address,
+            });
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0xfe00007f,
+        data: 0x02000053,
+        name: "FADD.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.f[f.rd] = cpu.f[f.rs1] + cpu.f[f.rs2];
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0007f,
+        data: 0xd2200053,
+        name: "FCVT.D.L",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.f[f.rd] = cpu.x[f.rs1] as f64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0007f,
+        data: 0x42000053,
+        name: "FCVT.D.S",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // Is this implementation correct?
+            cpu.f[f.rd] = f32::from_bits(cpu.f[f.rs1].to_bits() as u32) as f64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0007f,
+        data: 0xd2000053,
+        name: "FCVT.D.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.f[f.rd] = cpu.x[f.rs1] as i32 as f64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0007f,
+        data: 0xd2100053,
+        name: "FCVT.D.WU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.f[f.rd] = cpu.x[f.rs1] as u32 as f64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0007f,
+        data: 0x40100053,
+        name: "FCVT.S.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // Is this implementation correct?
+            cpu.f[f.rd] = cpu.f[f.rs1] as f32 as f64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0007f,
+        data: 0xc2000053,
+        name: "FCVT.W.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // Is this implementation correct?
+            cpu.x[f.rd] = cpu.f[f.rs1] as u32 as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00007f,
+        data: 0x1a000053,
+        name: "FDIV.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.f[f.rs1];
+            let divisor = cpu.f[f.rs2];
+            // Is this implementation correct?
+            if divisor == 0.0 {
+                cpu.f[f.rd] = std::f64::INFINITY;
+                cpu.set_fcsr_dz();
+            } else if divisor == -0.0 {
+                cpu.f[f.rd] = std::f64::NEG_INFINITY;
+                cpu.set_fcsr_dz();
+            } else {
+                cpu.f[f.rd] = dividend / divisor;
+            }
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x0000000f,
+        name: "FENCE",
+        operation: |_cpu, _word, _address| {
+            // Do nothing?
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x0000100f,
+        name: "FENCE.I",
+        operation: |_cpu, _word, _address| {
+            // Do nothing?
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0xa2002053,
+        name: "FEQ.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.f[f.rs1] == cpu.f[f.rs2] {
+                true => 1,
+                false => 0,
+            };
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00003007,
+        name: "FLD",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.f[f.rd] = match cpu
+                .mmu
+                .load_doubleword(cpu.x[f.rs1].wrapping_add(f.imm) as u64)
+            {
+                Ok(data) => f64::from_bits(data),
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0xa2000053,
+        name: "FLE.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.f[f.rs1] <= cpu.f[f.rs2] {
+                true => 1,
+                false => 0,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0xa2001053,
+        name: "FLT.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.f[f.rs1] < cpu.f[f.rs2] {
+                true => 1,
+                false => 0,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00002007,
+        name: "FLW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.f[f.rd] = match cpu.mmu.load_word(cpu.x[f.rs1].wrapping_add(f.imm) as u64) {
+                Ok(data) => f64::from_bits(data as i32 as i64 as u64),
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0x0600007f,
+        data: 0x02000043,
+        name: "FMADD.D",
+        operation: |cpu, word, _address| {
+            // @TODO: Update fcsr if needed?
+            let f = parse_format_r2(word);
+            cpu.f[f.rd] = cpu.f[f.rs1] * cpu.f[f.rs2] + cpu.f[f.rs3];
+            Ok(())
+        },
+        disassemble: dump_format_r2,
+    },
+    Instruction {
+        mask: 0xfe00007f,
+        data: 0x12000053,
+        name: "FMUL.D",
+        operation: |cpu, word, _address| {
+            // @TODO: Update fcsr if needed?
+            let f = parse_format_r(word);
+            cpu.f[f.rd] = cpu.f[f.rs1] * cpu.f[f.rs2];
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0707f,
+        data: 0xf2000053,
+        name: "FMV.D.X",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.f[f.rd] = f64::from_bits(cpu.x[f.rs1] as u64);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0707f,
+        data: 0xe2000053,
+        name: "FMV.X.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.f[f.rs1].to_bits() as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0707f,
+        data: 0xe0000053,
+        name: "FMV.X.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.f[f.rs1].to_bits() as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfff0707f,
+        data: 0xf0000053,
+        name: "FMV.W.X",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.f[f.rd] = f64::from_bits(cpu.x[f.rs1] as u32 as u64);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0600007f,
+        data: 0x0200004b,
+        name: "FNMSUB.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r2(word);
+            cpu.f[f.rd] = -(cpu.f[f.rs1] * cpu.f[f.rs2]) + cpu.f[f.rs3];
+            Ok(())
+        },
+        disassemble: dump_format_r2,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00003027,
+        name: "FSD",
+        operation: |cpu, word, _address| {
+            let f = parse_format_s(word);
+            cpu.mmu.store_doubleword(
+                cpu.x[f.rs1].wrapping_add(f.imm) as u64,
+                cpu.f[f.rs2].to_bits(),
+            )
+        },
+        disassemble: dump_format_s,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x22000053,
+        name: "FSGNJ.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let rs1_bits = cpu.f[f.rs1].to_bits();
+            let rs2_bits = cpu.f[f.rs2].to_bits();
+            let sign_bit = rs2_bits & 0x8000000000000000;
+            cpu.f[f.rd] = f64::from_bits(sign_bit | (rs1_bits & 0x7fffffffffffffff));
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x22002053,
+        name: "FSGNJX.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let rs1_bits = cpu.f[f.rs1].to_bits();
+            let rs2_bits = cpu.f[f.rs2].to_bits();
+            let sign_bit = (rs1_bits ^ rs2_bits) & 0x8000000000000000;
+            cpu.f[f.rd] = f64::from_bits(sign_bit | (rs1_bits & 0x7fffffffffffffff));
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00007f,
+        data: 0x0a000053,
+        name: "FSUB.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // @TODO: Update fcsr if needed?
+            cpu.f[f.rd] = cpu.f[f.rs1] - cpu.f[f.rs2];
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00002027,
+        name: "FSW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_s(word);
+            cpu.mmu.store_word(
+                cpu.x[f.rs1].wrapping_add(f.imm) as u64,
+                cpu.f[f.rs2].to_bits() as u32,
+            )
+        },
+        disassemble: dump_format_s,
+    },
+    Instruction {
+        mask: 0x0000007f,
+        data: 0x0000006f,
+        name: "JAL",
+        operation: |cpu, word, address| {
+            let f = parse_format_j(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.pc as i64);
+            cpu.pc = address.wrapping_add(f.imm);
+            Ok(())
+        },
+        disassemble: dump_format_j,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00000067,
+        name: "JALR",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            let tmp = cpu.sign_extend(cpu.pc as i64);
+            cpu.pc = (cpu.x[f.rs1] as u64).wrapping_add(f.imm as u64);
+            cpu.x[f.rd] = tmp;
+            Ok(())
+        },
+        disassemble: |cpu, word, _address, evaluate| {
+            let f = parse_format_i(word);
+            let mut s = String::new();
+            s += &format!("{}", get_register_name(f.rd));
+            if evaluate {
+                s += &format!(":{:x}", cpu.x[f.rd]);
+            }
+            s += &format!(",{:x}({}", f.imm, get_register_name(f.rs1));
+            if evaluate {
+                s += &format!(":{:x}", cpu.x[f.rs1]);
+            }
+            s += &format!(")");
+            s
+        },
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00000003,
+        name: "LB",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu.mmu.load(cpu.x[f.rs1].wrapping_add(f.imm) as u64) {
+                Ok(data) => data as i8 as i64,
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00004003,
+        name: "LBU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu.mmu.load(cpu.x[f.rs1].wrapping_add(f.imm) as u64) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00003003,
+        name: "LD",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu
+                .mmu
+                .load_doubleword(cpu.x[f.rs1].wrapping_add(f.imm) as u64)
+            {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00001003,
+        name: "LH",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu
+                .mmu
+                .load_halfword(cpu.x[f.rs1].wrapping_add(f.imm) as u64)
+            {
+                Ok(data) => data as i16 as i64,
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00005003,
+        name: "LHU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu
+                .mmu
+                .load_halfword(cpu.x[f.rs1].wrapping_add(f.imm) as u64)
+            {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0xf9f0707f,
+        data: 0x1000302f,
+        name: "LR.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // @TODO: Implement properly
+            cpu.x[f.rd] = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+                Ok(data) => {
+                    cpu.is_reservation_set = true;
+                    cpu.reservation = cpu.x[f.rs1] as u64; // Is virtual address ok?
+                    data as i64
+                }
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf9f0707f,
+        data: 0x1000202f,
+        name: "LR.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // @TODO: Implement properly
+            cpu.x[f.rd] = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+                Ok(data) => {
+                    cpu.is_reservation_set = true;
+                    cpu.reservation = cpu.x[f.rs1] as u64; // Is virtual address ok?
+                    data as i32 as i64
+                }
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000007f,
+        data: 0x00000037,
+        name: "LUI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_u(word);
+            cpu.x[f.rd] = f.imm as i64;
+            Ok(())
+        },
+        disassemble: dump_format_u,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00002003,
+        name: "LW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu.mmu.load_word(cpu.x[f.rs1].wrapping_add(f.imm) as u64) {
+                Ok(data) => data as i32 as i64,
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00006003,
+        name: "LWU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu.mmu.load_word(cpu.x[f.rs1].wrapping_add(f.imm) as u64) {
+                Ok(data) => data as i64,
+                Err(e) => return Err(e),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i_mem,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02000033,
+        name: "MUL",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1].wrapping_mul(cpu.x[f.rs2]));
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02001033,
+        name: "MULH",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.xlen {
+                Xlen::Bit32 => cpu.sign_extend((cpu.x[f.rs1] * cpu.x[f.rs2]) >> 32),
+                Xlen::Bit64 => (((cpu.x[f.rs1] as i128) * (cpu.x[f.rs2] as i128)) >> 64) as i64,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02003033,
+        name: "MULHU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.xlen {
+                Xlen::Bit32 => cpu.sign_extend(
+                    (((cpu.x[f.rs1] as u32 as u64) * (cpu.x[f.rs2] as u32 as u64)) >> 32) as i64,
+                ),
+                Xlen::Bit64 => {
+                    ((cpu.x[f.rs1] as u64 as u128).wrapping_mul(cpu.x[f.rs2] as u64 as u128) >> 64)
+                        as i64
+                }
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02002033,
+        name: "MULHSU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.xlen {
+                Xlen::Bit32 => cpu.sign_extend(
+                    ((cpu.x[f.rs1] as i64).wrapping_mul(cpu.x[f.rs2] as u32 as i64) >> 32) as i64,
+                ),
+                Xlen::Bit64 => {
+                    ((cpu.x[f.rs1] as u128).wrapping_mul(cpu.x[f.rs2] as u64 as u128) >> 64) as i64
+                }
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0200003b,
+        name: "MULW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] =
+                cpu.sign_extend((cpu.x[f.rs1] as i32).wrapping_mul(cpu.x[f.rs2] as i32) as i64);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xffffffff,
+        data: 0x30200073,
+        name: "MRET",
+        operation: |cpu, _word, _address| {
+            cpu.pc = match cpu.read_csr(CSR_MEPC_ADDRESS) {
+                Ok(data) => data,
+                Err(e) => return Err(e),
+            };
+            let status = cpu.read_csr_raw(CSR_MSTATUS_ADDRESS);
+            let mpie = (status >> 7) & 1;
+            let mpp = (status >> 11) & 0x3;
+            let mprv = match get_privilege_mode(mpp) {
+                PrivilegeMode::Machine => (status >> 17) & 1,
+                _ => 0,
+            };
+            // Override MIE[3] with MPIE[7], set MPIE[7] to 1, set MPP[12:11] to 0
+            // and override MPRV[17]
+            let new_status = (status & !0x21888) | (mprv << 17) | (mpie << 3) | (1 << 7);
+            cpu.write_csr_raw(CSR_MSTATUS_ADDRESS, new_status);
+            cpu.privilege_mode = match mpp {
+                0 => PrivilegeMode::User,
+                1 => PrivilegeMode::Supervisor,
+                3 => PrivilegeMode::Machine,
+                _ => panic!(), // Shouldn't happen
+            };
+            cpu.mmu.update_privilege_mode(cpu.privilege_mode.clone());
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00006033,
+        name: "OR",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] | cpu.x[f.rs2]);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00006013,
+        name: "ORI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] | f.imm);
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02006033,
+        name: "REM",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.x[f.rs1];
+            let divisor = cpu.x[f.rs2];
+            if divisor == 0 {
+                cpu.x[f.rd] = dividend;
+            } else if dividend == cpu.most_negative() && divisor == -1 {
+                cpu.x[f.rd] = 0;
+            } else {
+                cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1].wrapping_rem(cpu.x[f.rs2]));
+            }
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x02007033,
+        name: "REMU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.unsigned_data(cpu.x[f.rs1]);
+            let divisor = cpu.unsigned_data(cpu.x[f.rs2]);
+            cpu.x[f.rd] = match divisor {
+                0 => cpu.sign_extend(dividend as i64),
+                _ => cpu.sign_extend(dividend.wrapping_rem(divisor) as i64),
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0200703b,
+        name: "REMUW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.x[f.rs1] as u32;
+            let divisor = cpu.x[f.rs2] as u32;
+            cpu.x[f.rd] = match divisor {
+                0 => dividend as i32 as i64,
+                _ => dividend.wrapping_rem(divisor) as i32 as i64,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0200603b,
+        name: "REMW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let dividend = cpu.x[f.rs1] as i32;
+            let divisor = cpu.x[f.rs2] as i32;
+            if divisor == 0 {
+                cpu.x[f.rd] = dividend as i64;
+            } else if dividend == std::i32::MIN && divisor == -1 {
+                cpu.x[f.rd] = 0;
+            } else {
+                cpu.x[f.rd] = dividend.wrapping_rem(divisor) as i64;
+            }
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00000023,
+        name: "SB",
+        operation: |cpu, word, _address| {
+            let f = parse_format_s(word);
+            cpu.mmu
+                .store(cpu.x[f.rs1].wrapping_add(f.imm) as u64, cpu.x[f.rs2] as u8)
+        },
+        disassemble: dump_format_s,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x1800302f,
+        name: "SC.D",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // @TODO: Implement properly
+            cpu.x[f.rd] = match cpu.is_reservation_set && cpu.reservation == (cpu.x[f.rs1] as u64) {
+                true => match cpu
+                    .mmu
+                    .store_doubleword(cpu.x[f.rs1] as u64, cpu.x[f.rs2] as u64)
+                {
+                    Ok(()) => {
+                        cpu.is_reservation_set = false;
+                        0
+                    }
+                    Err(e) => return Err(e),
+                },
+                false => 1,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xf800707f,
+        data: 0x1800202f,
+        name: "SC.W",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            // @TODO: Implement properly
+            cpu.x[f.rd] = match cpu.is_reservation_set && cpu.reservation == (cpu.x[f.rs1] as u64) {
+                true => match cpu.mmu.store_word(cpu.x[f.rs1] as u64, cpu.x[f.rs2] as u32) {
+                    Ok(()) => {
+                        cpu.is_reservation_set = false;
+                        0
+                    }
+                    Err(e) => return Err(e),
+                },
+                false => 1,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00003023,
+        name: "SD",
+        operation: |cpu, word, _address| {
+            let f = parse_format_s(word);
+            cpu.mmu
+                .store_doubleword(cpu.x[f.rs1].wrapping_add(f.imm) as u64, cpu.x[f.rs2] as u64)
+        },
+        disassemble: dump_format_s,
+    },
+    Instruction {
+        mask: 0xfe007fff,
+        data: 0x12000073,
+        name: "SFENCE.VMA",
+        operation: |_cpu, _word, _address| {
+            // Do nothing?
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00001023,
+        name: "SH",
+        operation: |cpu, word, _address| {
+            let f = parse_format_s(word);
+            cpu.mmu
+                .store_halfword(cpu.x[f.rs1].wrapping_add(f.imm) as u64, cpu.x[f.rs2] as u16)
+        },
+        disassemble: dump_format_s,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00001033,
+        name: "SLL",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1].wrapping_shl(cpu.x[f.rs2] as u32));
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfc00707f,
+        data: 0x00001013,
+        name: "SLLI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let mask = match cpu.xlen {
+                Xlen::Bit32 => 0x1f,
+                Xlen::Bit64 => 0x3f,
+            };
+            let shamt = (word >> 20) & mask;
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] << shamt);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0000101b,
+        name: "SLLIW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let shamt = f.rs2 as u32;
+            cpu.x[f.rd] = (cpu.x[f.rs1] << shamt) as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0000103b,
+        name: "SLLW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = (cpu.x[f.rs1] as u32).wrapping_shl(cpu.x[f.rs2] as u32) as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00002033,
+        name: "SLT",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.x[f.rs1] < cpu.x[f.rs2] {
+                true => 1,
+                false => 0,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00002013,
+        name: "SLTI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu.x[f.rs1] < f.imm {
+                true => 1,
+                false => 0,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00003013,
+        name: "SLTIU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = match cpu.unsigned_data(cpu.x[f.rs1]) < cpu.unsigned_data(f.imm) {
+                true => 1,
+                false => 0,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00003033,
+        name: "SLTU",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = match cpu.unsigned_data(cpu.x[f.rs1]) < cpu.unsigned_data(cpu.x[f.rs2]) {
+                true => 1,
+                false => 0,
+            };
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x40005033,
+        name: "SRA",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1].wrapping_shr(cpu.x[f.rs2] as u32));
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfc00707f,
+        data: 0x40005013,
+        name: "SRAI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let mask = match cpu.xlen {
+                Xlen::Bit32 => 0x1f,
+                Xlen::Bit64 => 0x3f,
+            };
+            let shamt = (word >> 20) & mask;
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] >> shamt);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfc00707f,
+        data: 0x4000501b,
+        name: "SRAIW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let shamt = ((word >> 20) & 0x1f) as u32;
+            cpu.x[f.rd] = ((cpu.x[f.rs1] as i32) >> shamt) as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x4000503b,
+        name: "SRAW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = (cpu.x[f.rs1] as i32).wrapping_shr(cpu.x[f.rs2] as u32) as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xffffffff,
+        data: 0x10200073,
+        name: "SRET",
+        operation: |cpu, _word, _address| {
+            // @TODO: Throw error if higher privilege return instruction is executed
+            cpu.pc = match cpu.read_csr(CSR_SEPC_ADDRESS) {
+                Ok(data) => data,
+                Err(e) => return Err(e),
+            };
+            let status = cpu.read_csr_raw(CSR_SSTATUS_ADDRESS);
+            let spie = (status >> 5) & 1;
+            let spp = (status >> 8) & 1;
+            let mprv = match get_privilege_mode(spp) {
+                PrivilegeMode::Machine => (status >> 17) & 1,
+                _ => 0,
+            };
+            // Override SIE[1] with SPIE[5], set SPIE[5] to 1, set SPP[8] to 0,
+            // and override MPRV[17]
+            let new_status = (status & !0x20122) | (mprv << 17) | (spie << 1) | (1 << 5);
+            cpu.write_csr_raw(CSR_SSTATUS_ADDRESS, new_status);
+            cpu.privilege_mode = match spp {
+                0 => PrivilegeMode::User,
+                1 => PrivilegeMode::Supervisor,
+                _ => panic!(), // Shouldn't happen
+            };
+            cpu.mmu.update_privilege_mode(cpu.privilege_mode.clone());
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00005033,
+        name: "SRL",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(
+                cpu.unsigned_data(cpu.x[f.rs1])
+                    .wrapping_shr(cpu.x[f.rs2] as u32) as i64,
+            );
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfc00707f,
+        data: 0x00005013,
+        name: "SRLI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let mask = match cpu.xlen {
+                Xlen::Bit32 => 0x1f,
+                Xlen::Bit64 => 0x3f,
+            };
+            let shamt = (word >> 20) & mask;
+            cpu.x[f.rd] = cpu.sign_extend((cpu.unsigned_data(cpu.x[f.rs1]) >> shamt) as i64);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfc00707f,
+        data: 0x0000501b,
+        name: "SRLIW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            let mask = match cpu.xlen {
+                Xlen::Bit32 => 0x1f,
+                Xlen::Bit64 => 0x3f,
+            };
+            let shamt = (word >> 20) & mask;
+            cpu.x[f.rd] = ((cpu.x[f.rs1] as u32) >> shamt) as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x0000503b,
+        name: "SRLW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = (cpu.x[f.rs1] as u32).wrapping_shr(cpu.x[f.rs2] as u32) as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x40000033,
+        name: "SUB",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1].wrapping_sub(cpu.x[f.rs2]));
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x4000003b,
+        name: "SUBW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.x[f.rs1].wrapping_sub(cpu.x[f.rs2]) as i32 as i64;
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00002023,
+        name: "SW",
+        operation: |cpu, word, _address| {
+            let f = parse_format_s(word);
+            cpu.mmu
+                .store_word(cpu.x[f.rs1].wrapping_add(f.imm) as u64, cpu.x[f.rs2] as u32)
+        },
+        disassemble: dump_format_s,
+    },
+    Instruction {
+        mask: 0xffffffff,
+        data: 0x00200073,
+        name: "URET",
+        operation: |_cpu, _word, _address| {
+            // @TODO: Implement
+            panic!("URET instruction is not implemented yet.");
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0xffffffff,
+        data: 0x10500073,
+        name: "WFI",
+        operation: |cpu, _word, _address| {
+            cpu.wfi = true;
+            Ok(())
+        },
+        disassemble: dump_empty,
+    },
+    Instruction {
+        mask: 0xfe00707f,
+        data: 0x00004033,
+        name: "XOR",
+        operation: |cpu, word, _address| {
+            let f = parse_format_r(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] ^ cpu.x[f.rs2]);
+            Ok(())
+        },
+        disassemble: dump_format_r,
+    },
+    Instruction {
+        mask: 0x0000707f,
+        data: 0x00004013,
+        name: "XORI",
+        operation: |cpu, word, _address| {
+            let f = parse_format_i(word);
+            cpu.x[f.rd] = cpu.sign_extend(cpu.x[f.rs1] ^ f.imm);
+            Ok(())
+        },
+        disassemble: dump_format_i,
+    },
+];
+
+/// The number of results [`DecodeCache`](struct.DecodeCache.html) holds.
+/// You need to carefully choose the number. Too small number causes
+/// bad cache hit ratio. Too large number causes memory consumption
+/// and host hardware CPU cache memory miss.
+const DECODE_CACHE_ENTRY_NUM: usize = 0x1000;
+
+const INVALID_CACHE_ENTRY: usize = INSTRUCTION_NUM;
+const NULL_ENTRY: usize = DECODE_CACHE_ENTRY_NUM;
+
+/// `DecodeCache` provides a cache system for instruction decoding.
+/// It holds the recent [`DECODE_CACHE_ENTRY_NUM`](constant.DECODE_CACHE_ENTRY_NUM.html)
+/// instruction decode results. If it has a cache (called "hit") for passed
+/// word data, it returns decoding result very quickly. Decoding is one of the
+/// slowest parts in CPU. This cache system improves the CPU processing speed
+/// by skipping decoding. Especially it should work well for loop. It is said
+/// that some loops in a program consume the majority of time then this cache
+/// system is expected to reduce the decoding time very well.
+///
+/// This cache system is based on LRU algorithm, and consists of a hash map and
+/// a linked list. Linked list is for LRU, front means recently used and back
+/// means least recently used. A content in hash map points to an entry in the
+/// linked list. This is the key to achieve computing in O(1).
+///
+// @TODO: Write performance benchmark test to confirm this cache actually
+//        improves the speed.
+struct DecodeCache {
+    /// Holds mappings from word instruction data to an index of `entries`
+    /// pointing to the entry having the decoding result. Containing the word
+    /// means cache hit.
+    // hash_map: FnvHashMap::<u32, usize>,
+    hash_map: HashMap<u32, usize>,
+
+    /// Holds the entries [`DecodeCacheEntry`](struct.DecodeCacheEntry.html)
+    /// forming linked list.
+    entries: Vec<DecodeCacheEntry>,
+
+    /// An index of `entries` pointing to the head entry in the linked list
+    front_index: usize,
+
+    /// An index of `entries` pointing to the tail entry in the linked list
+    back_index: usize,
+
+    /// Cache hit count for debugging purpose
+    hit_count: u64,
+
+    /// Cache miss count for debugging purpose
+    miss_count: u64,
+}
+
+impl DecodeCache {
+    /// Creates a new `DecodeCache`.
+    fn new() -> Self {
+        // Initialize linked list
+        let mut entries = Vec::new();
+        for i in 0..DECODE_CACHE_ENTRY_NUM {
+            let next_index = match i == DECODE_CACHE_ENTRY_NUM - 1 {
+                true => NULL_ENTRY,
+                false => i + 1,
+            };
+            let prev_index = match i == 0 {
+                true => NULL_ENTRY,
+                false => i - 1,
+            };
+            entries.push(DecodeCacheEntry::new(next_index, prev_index));
+        }
+
+        DecodeCache {
+            // hash_map: FnvHashMap::default(),
+            hash_map: HashMap::default(),
+            entries,
+            front_index: 0,
+            back_index: DECODE_CACHE_ENTRY_NUM - 1,
+            hit_count: 0,
+            miss_count: 0,
+        }
+    }
+
+    /// Gets the cached decoding result. If hits this method moves the
+    /// cache entry to front of the linked list and returns an index of
+    /// [`INSTRUCTIONS`](constant.INSTRUCTIONS.html).
+    /// Otherwise returns `None`. This operation should compute in O(1) time.
+    ///
+    /// # Arguments
+    /// * `word` word instruction data
+    fn get(&mut self, word: u32) -> Option<usize> {
+        let result = match self.hash_map.get(&word) {
+            Some(index) => {
+                self.hit_count += 1;
+                // Move the entry to front of the list unless it is at front.
+                if self.front_index != *index {
+                    let next_index = self.entries[*index].next_index;
+                    let prev_index = self.entries[*index].prev_index;
+
+                    // Remove the entry from the list
+                    if self.back_index == *index {
+                        self.back_index = prev_index;
+                    } else {
+                        self.entries[next_index].prev_index = prev_index;
+                    }
+                    self.entries[prev_index].next_index = next_index;
+
+                    // Push the entry to front
+                    self.entries[*index].prev_index = NULL_ENTRY;
+                    self.entries[*index].next_index = self.front_index;
+                    self.entries[self.front_index].prev_index = *index;
+                    self.front_index = *index;
+                }
+                Some(self.entries[*index].instruction_index)
+            }
+            None => {
+                self.miss_count += 1;
+                None
+            }
+        };
+        //println!("Hit:{:X}, Miss:{:X}, Ratio:{}", self.hit_count, self.miss_count,
+        //	(self.hit_count as f64) / (self.hit_count + self.miss_count) as f64);
+        result
+    }
+
+    /// Inserts a new decode result to front of the linked list while removing
+    /// the least recently used result from the list. This operation should
+    /// compute in O(1) time.
+    ///
+    /// # Arguments
+    /// * `word`
+    /// * `instruction_index`
+    fn insert(&mut self, word: u32, instruction_index: usize) {
+        let index = self.back_index;
+
+        // Remove the least recently used entry. The entry resource
+        // is reused as new entry.
+        if self.entries[index].instruction_index != INVALID_CACHE_ENTRY {
+            self.hash_map.remove(&self.entries[index].word);
+        }
+        self.back_index = self.entries[index].prev_index;
+        self.entries[self.back_index].next_index = NULL_ENTRY;
+
+        // Push the new entry to front of the linked list
+        self.hash_map.insert(word, index);
+        self.entries[index].prev_index = NULL_ENTRY;
+        self.entries[index].next_index = self.front_index;
+        self.entries[index].word = word;
+        self.entries[index].instruction_index = instruction_index;
+        self.entries[self.front_index].prev_index = index;
+        self.front_index = index;
+    }
+}
+
+/// An entry of linked list managed by [`DecodeCache`](struct.DecodeCache.html).
+/// An entry consists of a mapping from word instruction data to an index of
+/// [`INSTRUCTIONS`](constant.INSTRUCTIONS.html) and next/previous entry index
+/// in the linked list.
+struct DecodeCacheEntry {
+    /// Instruction word data
+    word: u32,
+
+    /// The result of decoding `word`. An index of [`INSTRUCTIONS`](constant.INSTRUCTIONS.html).
+    instruction_index: usize,
+
+    /// Next entry index in the linked list. [`NULL_ENTRY`](constant.NULL_ENTRY.html)
+    /// represents no next entry, meaning the entry is at tail.
+    next_index: usize,
+
+    /// Previous entry index in the linked list. [`NULL_ENTRY`](constant.NULL_ENTRY.html)
+    /// represents no previous entry, meaning the entry is at head.
+    prev_index: usize,
+}
+
+impl DecodeCacheEntry {
+    /// Creates a new entry. Initial `instruction_index` is
+    /// `INVALID_CACHE_ENTRY` meaning the entry is invalid.
+    ///
+    /// # Arguments
+    /// * `next_index`
+    /// * `prev_index`
+    fn new(next_index: usize, prev_index: usize) -> Self {
+        DecodeCacheEntry {
+            word: 0,
+            instruction_index: INVALID_CACHE_ENTRY,
+            next_index,
+            prev_index,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_cpu {
+    use super::*;
+    use mmu::DRAM_BASE;
+    use terminal::DummyTerminal;
+
+    fn create_cpu() -> Cpu {
+        Cpu::new()
+    }
+
+    #[test]
+    fn initialize() {
+        let _cpu = create_cpu();
+    }
+
+    #[test]
+    fn update_pc() {
+        let mut cpu = create_cpu();
+        assert_eq!(0, cpu.read_pc());
+        cpu.update_pc(1);
+        assert_eq!(1, cpu.read_pc());
+        cpu.update_pc(0xffffffffffffffff);
+        assert_eq!(0xffffffffffffffff, cpu.read_pc());
+    }
+
+    #[test]
+    fn update_xlen() {
+        let mut cpu = create_cpu();
+        assert!(matches!(cpu.xlen, Xlen::Bit64));
+        cpu.update_xlen(Xlen::Bit32);
+        assert!(matches!(cpu.xlen, Xlen::Bit32));
+        cpu.update_xlen(Xlen::Bit64);
+        assert!(matches!(cpu.xlen, Xlen::Bit64));
+        // Note: cpu.update_xlen() updates cpu.mmu.xlen, too.
+        // The test for mmu.xlen should be in Mmu?
+    }
+
+    #[test]
+    fn read_register() {
+        let mut cpu = create_cpu();
+        // Initial register values are 0 other than 0xb th register.
+        // Initial value of 0xb th register is temporal for Linux boot and
+        // I'm not sure if the value is correct. Then skipping so far.
+        for i in 0..31 {
+            if i != 0xb {
+                assert_eq!(0, cpu.read_register(i));
             }
         }
-        Ok(())
+
+        for i in 0..31 {
+            cpu.x[i] = i as i64 + 1;
+        }
+
+        for i in 0..31 {
+            match i {
+                // 0th register is hardwired zero
+                0 => assert_eq!(0, cpu.read_register(i)),
+                _ => assert_eq!(i as i64 + 1, cpu.read_register(i)),
+            }
+        }
+
+        for i in 0..31 {
+            cpu.x[i] = (0xffffffffffffffff - i) as i64;
+        }
+
+        for i in 0..31 {
+            match i {
+                // 0th register is hardwired zero
+                0 => assert_eq!(0, cpu.read_register(i)),
+                _ => assert_eq!(-(i as i64 + 1), cpu.read_register(i)),
+            }
+        }
+
+        // @TODO: Should I test the case where the argument equals to or is
+        // greater than 32?
+    }
+
+    #[test]
+    fn tick() {
+        let mut cpu = create_cpu();
+        cpu.get_mut_mmu().init_memory(4);
+        cpu.update_pc(DRAM_BASE);
+
+        // Write non-compressed "addi x1, x1, 1" instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0x00108093) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        // Write compressed "addi x8, x0, 8" instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE + 4, 0x20) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+
+        cpu.tick();
+
+        assert_eq!(DRAM_BASE + 4, cpu.read_pc());
+        assert_eq!(1, cpu.read_register(1));
+
+        cpu.tick();
+
+        assert_eq!(DRAM_BASE + 6, cpu.read_pc());
+        assert_eq!(8, cpu.read_register(8));
+    }
+
+    #[test]
+    fn tick_operate() {
+        let mut cpu = create_cpu();
+        cpu.get_mut_mmu().init_memory(4);
+        cpu.update_pc(DRAM_BASE);
+        // write non-compressed "addi a0, a0, 12" instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0xc50513) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        assert_eq!(DRAM_BASE, cpu.read_pc());
+        assert_eq!(0, cpu.read_register(10));
+        match cpu.tick_operate() {
+            Ok(()) => {}
+            Err(_e) => panic!("tick_operate() unexpectedly did panic"),
+        };
+        // .tick_operate() increments the program counter by 4 for
+        // non-compressed instruction.
+        assert_eq!(DRAM_BASE + 4, cpu.read_pc());
+        // "addi a0, a0, a12" instruction writes 12 to a0 register.
+        assert_eq!(12, cpu.read_register(10));
+        // @TODO: Test compressed instruction operation
+    }
+
+    #[test]
+    fn fetch() {
+        // .fetch() reads four bytes from the memory
+        // at the address the program counter points to.
+        // .fetch() doesn't increment the program counter.
+        // .tick_operate() does.
+        let mut cpu = create_cpu();
+        cpu.get_mut_mmu().init_memory(4);
+        cpu.update_pc(DRAM_BASE);
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0xaaaaaaaa) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        match cpu.fetch() {
+            Ok(data) => assert_eq!(0xaaaaaaaa, data),
+            Err(_e) => panic!("Failed to fetch"),
+        };
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0x55555555) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        match cpu.fetch() {
+            Ok(data) => assert_eq!(0x55555555, data),
+            Err(_e) => panic!("Failed to fetch"),
+        };
+        // @TODO: Write test cases where Trap happens
+    }
+
+    #[test]
+    fn decode() {
+        let mut cpu = create_cpu();
+        // 0x13 is addi instruction
+        match cpu.decode(0x13) {
+            Ok(inst) => assert_eq!(inst.name, "ADDI"),
+            Err(_e) => panic!("Failed to decode"),
+        };
+        // .decode() returns error for invalid word data.
+        match cpu.decode(0x0) {
+            Ok(_inst) => panic!("Unexpectedly succeeded in decoding"),
+            Err(()) => assert!(true),
+        };
+        // @TODO: Should I test all instructions?
+    }
+
+    #[test]
+    fn uncompress() {
+        let mut cpu = create_cpu();
+        // .uncompress() doesn't directly return an instruction but
+        // it returns uncompressed word. Then you need to call .decode().
+        match cpu.decode(cpu.uncompress(0x20)) {
+            Ok(inst) => assert_eq!(inst.name, "ADDI"),
+            Err(_e) => panic!("Failed to decode"),
+        };
+        // @TODO: Should I test all compressed instructions?
+    }
+
+    #[test]
+    fn wfi() {
+        let wfi_instruction = 0x10500073;
+        let mut cpu = create_cpu();
+        // Just in case
+        match cpu.decode(wfi_instruction) {
+            Ok(inst) => assert_eq!(inst.name, "WFI"),
+            Err(_e) => panic!("Failed to decode"),
+        };
+        cpu.get_mut_mmu().init_memory(4);
+        cpu.update_pc(DRAM_BASE);
+        // write WFI instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, wfi_instruction) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        cpu.tick();
+        assert_eq!(DRAM_BASE + 4, cpu.read_pc());
+        for _i in 0..10 {
+            // Until interrupt happens, .tick() does nothing
+            // @TODO: Check accurately that the state is unchanged
+            cpu.tick();
+            assert_eq!(DRAM_BASE + 4, cpu.read_pc());
+        }
+        // Machine timer interrupt
+        cpu.write_csr_raw(CSR_MIE_ADDRESS, MIP_MTIP);
+        cpu.write_csr_raw(CSR_MIP_ADDRESS, MIP_MTIP);
+        cpu.write_csr_raw(CSR_MSTATUS_ADDRESS, 0x8);
+        cpu.write_csr_raw(CSR_MTVEC_ADDRESS, 0x0);
+        cpu.tick();
+        // Interrupt happened and moved to handler
+        assert_eq!(0, cpu.read_pc());
+    }
+
+    #[test]
+    fn interrupt() {
+        let handler_vector = 0x10000000;
+        let mut cpu = create_cpu();
+        cpu.get_mut_mmu().init_memory(4);
+        // Write non-compressed "addi x0, x0, 1" instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0x00100013) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        cpu.update_pc(DRAM_BASE);
+
+        // Machine timer interrupt but mie in mstatus is not enabled yet
+        cpu.write_csr_raw(CSR_MIE_ADDRESS, MIP_MTIP);
+        cpu.write_csr_raw(CSR_MIP_ADDRESS, MIP_MTIP);
+        cpu.write_csr_raw(CSR_MTVEC_ADDRESS, handler_vector);
+
+        cpu.tick();
+
+        // Interrupt isn't caught because mie is disabled
+        assert_eq!(DRAM_BASE + 4, cpu.read_pc());
+
+        cpu.update_pc(DRAM_BASE);
+        // Enable mie in mstatus
+        cpu.write_csr_raw(CSR_MSTATUS_ADDRESS, 0x8);
+
+        cpu.tick();
+
+        // Interrupt happened and moved to handler
+        assert_eq!(handler_vector, cpu.read_pc());
+
+        // CSR Cause register holds the reason what caused the interrupt
+        assert_eq!(0x8000000000000007, cpu.read_csr_raw(CSR_MCAUSE_ADDRESS));
+
+        // @TODO: Test post CSR status register
+        // @TODO: Test xIE bit in CSR status register
+        // @TODO: Test privilege levels
+        // @TODO: Test delegation
+        // @TODO: Test vector type handlers
+    }
+
+    #[test]
+    fn exception() {
+        let handler_vector = 0x10000000;
+        let mut cpu = create_cpu();
+        cpu.get_mut_mmu().init_memory(4);
+        // Write ECALL instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0x00000073) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        cpu.write_csr_raw(CSR_MTVEC_ADDRESS, handler_vector);
+        cpu.update_pc(DRAM_BASE);
+
+        cpu.tick();
+
+        // Interrupt happened and moved to handler
+        assert_eq!(handler_vector, cpu.read_pc());
+
+        // CSR Cause register holds the reason what caused the trap
+        assert_eq!(0xb, cpu.read_csr_raw(CSR_MCAUSE_ADDRESS));
+
+        // @TODO: Test post CSR status register
+        // @TODO: Test privilege levels
+        // @TODO: Test delegation
+        // @TODO: Test vector type handlers
+    }
+
+    #[test]
+    fn hardocded_zero() {
+        let mut cpu = create_cpu();
+        cpu.get_mut_mmu().init_memory(8);
+        cpu.update_pc(DRAM_BASE);
+
+        // Write non-compressed "addi x0, x0, 1" instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0x00100013) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+        // Write non-compressed "addi x1, x1, 1" instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE + 4, 0x00108093) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+
+        // Test x0
+        assert_eq!(0, cpu.read_register(0));
+        cpu.tick(); // Execute  "addi x0, x0, 1"
+                    // x0 is still zero because it's hardcoded zero
+        assert_eq!(0, cpu.read_register(0));
+
+        // Test x1
+        assert_eq!(0, cpu.read_register(1));
+        cpu.tick(); // Execute  "addi x1, x1, 1"
+                    // x1 is not hardcoded zero
+        assert_eq!(1, cpu.read_register(1));
+    }
+
+    #[test]
+    fn disassemble_next_instruction() {
+        let mut cpu = create_cpu();
+        cpu.get_mut_mmu().init_memory(4);
+        cpu.update_pc(DRAM_BASE);
+
+        // Write non-compressed "addi x0, x0, 1" instruction
+        match cpu.get_mut_mmu().store_word(DRAM_BASE, 0x00100013) {
+            Ok(()) => {}
+            Err(_e) => panic!("Failed to store"),
+        };
+
+        assert_eq!(
+            "PC:0000000080000000 00100013 ADDI zero:0,zero:0,1",
+            cpu.disassemble_next_instruction()
+        );
+
+        // No effect to PC
+        assert_eq!(DRAM_BASE, cpu.read_pc());
+    }
+}
+
+#[cfg(test)]
+
+mod test_decode_cache {
+    use super::*;
+
+    #[test]
+    fn initialize() {
+        let _cache = DecodeCache::new();
+    }
+
+    #[test]
+    fn insert() {
+        let mut cache = DecodeCache::new();
+        cache.insert(0, 0);
+    }
+
+    #[test]
+    fn get() {
+        let mut cache = DecodeCache::new();
+        cache.insert(1, 2);
+
+        // Cache hit test
+        match cache.get(1) {
+            Some(index) => assert_eq!(2, index),
+            None => panic!("Unexpected cache miss"),
+        };
+
+        // Cache miss test
+        match cache.get(2) {
+            Some(_index) => panic!("Unexpected cache hit"),
+            None => {}
+        };
+    }
+
+    #[test]
+    fn lru() {
+        let mut cache = DecodeCache::new();
+        cache.insert(0, 1);
+
+        match cache.get(0) {
+            Some(index) => assert_eq!(1, index),
+            None => panic!("Unexpected cache miss"),
+        };
+
+        for i in 1..DECODE_CACHE_ENTRY_NUM + 1 {
+            cache.insert(i as u32, i + 1);
+        }
+
+        // The oldest entry should have been removed because of the overflow
+        match cache.get(0) {
+            Some(_index) => panic!("Unexpected cache hit"),
+            None => {}
+        };
+
+        // With this .get(), the entry with the word "1" moves to the tail of the list
+        // and the entry with the word "2" becomes the oldest entry.
+        match cache.get(1) {
+            Some(index) => assert_eq!(2, index),
+            None => {}
+        };
+
+        // The oldest entry with the word "2" will be removed due to the overflow
+        cache.insert(
+            DECODE_CACHE_ENTRY_NUM as u32 + 1,
+            DECODE_CACHE_ENTRY_NUM + 2,
+        );
+
+        match cache.get(2) {
+            Some(_index) => panic!("Unexpected cache hit"),
+            None => {}
+        };
     }
 }

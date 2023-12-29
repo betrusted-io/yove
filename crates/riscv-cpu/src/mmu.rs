@@ -4,7 +4,7 @@ pub const DRAM_BASE: u64 = 0x80000000;
 
 use std::collections::HashMap;
 
-use crate::riscv::{
+use crate::{
     cpu::{get_privilege_mode, PrivilegeMode, Trap, TrapType, Xlen},
     memory::Memory,
 };

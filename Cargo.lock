@@ -3,5 +3,12 @@
 version = 3
 
 [[package]]
+name = "riscv-cpu"
+version = "0.1.0"
+
+[[package]]
 name = "rouns"
 version = "0.1.0"
+dependencies = [
+ "riscv-cpu",
+]

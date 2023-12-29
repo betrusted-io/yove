@@ -1,10 +1,6 @@
-// extern crate fnv;
-
-// use self::fnv::FnvHashMap;
 use std::collections::HashMap;
 
-use crate::riscv::mmu::{AddressingMode, Mmu};
-// use terminal::Terminal;
+use crate::mmu::{AddressingMode, Mmu};
 
 const CSR_CAPACITY: usize = 4096;
 
@@ -213,13 +209,39 @@ fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
     }
 }
 
-impl Cpu {
-    /// Creates a new `Cpu`.
-    ///
-    /// # Arguments
-    /// * `Terminal`
+pub struct CpuBuilder {
+    xlen: Xlen,
+    memory_size: u64,
+}
+
+impl CpuBuilder {
     pub fn new() -> Self {
-        let mut cpu = Cpu {
+        CpuBuilder {
+            xlen: Xlen::Bit64,
+            memory_size: 0,
+        }
+    }
+
+    pub fn xlen(mut self, xlen: Xlen) -> Self {
+        self.xlen = xlen;
+        self
+    }
+
+    pub fn memory_size(mut self, memory_size: u64) -> Self {
+        self.memory_size = memory_size;
+        self
+    }
+
+    pub fn build(self) -> Cpu {
+        let mut cpu = Cpu::new();
+        cpu.update_xlen(self.xlen.clone());
+        cpu
+    }
+}
+
+impl Default for Cpu {
+    fn default() -> Self {
+        Cpu {
             clock: 0,
             xlen: Xlen::Bit64,
             privilege_mode: PrivilegeMode::Machine,
@@ -234,10 +256,21 @@ impl Cpu {
             _dump_flag: false,
             decode_cache: DecodeCache::new(),
             unsigned_data_mask: 0xffffffffffffffff,
-        };
-        cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
-        cpu.write_csr_raw(CSR_MISA_ADDRESS, 0x800000008014312f);
-        cpu
+        }
+    }
+}
+
+impl Cpu {
+    /// Creates a new `Cpu`.
+    ///
+    /// # Arguments
+    /// * `Terminal`
+    pub fn new() -> Self {
+        Default::default()
+        // let mut cpu = ;
+        // cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
+        // cpu.write_csr_raw(CSR_MISA_ADDRESS, 0x800000008014312f);
+        // cpu
     }
 
     /// Updates Program Counter content
@@ -324,7 +357,7 @@ impl Cpu {
             Ok(inst) => {
                 let result = (inst.operation)(self, word, instruction_address);
                 self.x[0] = 0; // hardwired zero
-                return result;
+                result
             }
             Err(()) => {
                 panic!(
@@ -332,7 +365,7 @@ impl Cpu {
                     instruction_address, original_word
                 );
             }
-        };
+        }
     }
 
     /// Decodes a word instruction data and returns a reference to
@@ -341,7 +374,7 @@ impl Cpu {
     /// The result will be stored to cache.
     fn decode(&mut self, word: u32) -> Result<&Instruction, ()> {
         match self.decode_cache.get(word) {
-            Some(index) => return Ok(&INSTRUCTIONS[index]),
+            Some(index) => Ok(&INSTRUCTIONS[index]),
             None => match self.decode_and_get_instruction_index(word) {
                 Ok(index) => {
                     self.decode_cache.insert(word, index);
@@ -382,14 +415,16 @@ impl Cpu {
         // @TODO: Optimize
         let minterrupt = self.read_csr_raw(CSR_MIP_ADDRESS) & self.read_csr_raw(CSR_MIE_ADDRESS);
 
-        if (minterrupt & MIP_MEIP) != 0 && self.handle_trap(
+        if (minterrupt & MIP_MEIP) != 0
+            && self.handle_trap(
                 Trap {
                     trap_type: TrapType::MachineExternalInterrupt,
                     value: self.pc, // dummy
                 },
                 instruction_address,
                 true,
-            ) {
+            )
+        {
             // Who should clear mip bit?
             self.write_csr_raw(
                 CSR_MIP_ADDRESS,
@@ -398,14 +433,16 @@ impl Cpu {
             self.wfi = false;
             return;
         }
-        if (minterrupt & MIP_MSIP) != 0 && self.handle_trap(
+        if (minterrupt & MIP_MSIP) != 0
+            && self.handle_trap(
                 Trap {
                     trap_type: TrapType::MachineSoftwareInterrupt,
                     value: self.pc, // dummy
                 },
                 instruction_address,
                 true,
-            ) {
+            )
+        {
             self.write_csr_raw(
                 CSR_MIP_ADDRESS,
                 self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_MSIP,
@@ -413,14 +450,16 @@ impl Cpu {
             self.wfi = false;
             return;
         }
-        if (minterrupt & MIP_MTIP) != 0 && self.handle_trap(
+        if (minterrupt & MIP_MTIP) != 0
+            && self.handle_trap(
                 Trap {
                     trap_type: TrapType::MachineTimerInterrupt,
                     value: self.pc, // dummy
                 },
                 instruction_address,
                 true,
-            ) {
+            )
+        {
             self.write_csr_raw(
                 CSR_MIP_ADDRESS,
                 self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_MTIP,
@@ -428,14 +467,16 @@ impl Cpu {
             self.wfi = false;
             return;
         }
-        if (minterrupt & MIP_SEIP) != 0 && self.handle_trap(
+        if (minterrupt & MIP_SEIP) != 0
+            && self.handle_trap(
                 Trap {
                     trap_type: TrapType::SupervisorExternalInterrupt,
                     value: self.pc, // dummy
                 },
                 instruction_address,
                 true,
-            ) {
+            )
+        {
             self.write_csr_raw(
                 CSR_MIP_ADDRESS,
                 self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_SEIP,
@@ -443,14 +484,16 @@ impl Cpu {
             self.wfi = false;
             return;
         }
-        if (minterrupt & MIP_SSIP) != 0 && self.handle_trap(
+        if (minterrupt & MIP_SSIP) != 0
+            && self.handle_trap(
                 Trap {
                     trap_type: TrapType::SupervisorSoftwareInterrupt,
                     value: self.pc, // dummy
                 },
                 instruction_address,
                 true,
-            ) {
+            )
+        {
             self.write_csr_raw(
                 CSR_MIP_ADDRESS,
                 self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_SSIP,
@@ -458,14 +501,16 @@ impl Cpu {
             self.wfi = false;
             return;
         }
-        if (minterrupt & MIP_STIP) != 0 && self.handle_trap(
+        if (minterrupt & MIP_STIP) != 0
+            && self.handle_trap(
                 Trap {
                     trap_type: TrapType::SupervisorTimerInterrupt,
                     value: self.pc, // dummy
                 },
                 instruction_address,
                 true,
-            ) {
+            )
+        {
             self.write_csr_raw(
                 CSR_MIP_ADDRESS,
                 self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_STIP,

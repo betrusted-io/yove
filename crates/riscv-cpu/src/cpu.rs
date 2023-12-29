@@ -3817,42 +3817,44 @@ mod test_cpu {
     #[test]
     fn tick() {
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         cpu.get_mut_mmu().init_memory(4);
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
 
         // Write non-compressed "addi x1, x1, 1" instruction
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0x00108093) {
+        match cpu.get_mut_mmu().store_word(memory_base, 0x00108093) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
         // Write compressed "addi x8, x0, 8" instruction
-        match cpu.get_mut_mmu().store_word(cpu.memory_base() + 4, 0x20) {
+        match cpu.get_mut_mmu().store_word(memory_base + 4, 0x20) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
 
         cpu.tick();
 
-        assert_eq!(cpu.memory_base() + 4, cpu.read_pc());
+        assert_eq!(memory_base + 4, cpu.read_pc());
         assert_eq!(1, cpu.read_register(1));
 
         cpu.tick();
 
-        assert_eq!(cpu.memory_base() + 6, cpu.read_pc());
+        assert_eq!(memory_base + 6, cpu.read_pc());
         assert_eq!(8, cpu.read_register(8));
     }
 
     #[test]
     fn tick_operate() {
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         cpu.get_mut_mmu().init_memory(4);
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
         // write non-compressed "addi a0, a0, 12" instruction
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0xc50513) {
+        match cpu.get_mut_mmu().store_word(memory_base, 0xc50513) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
-        assert_eq!(cpu.memory_base(), cpu.read_pc());
+        assert_eq!(memory_base, cpu.read_pc());
         assert_eq!(0, cpu.read_register(10));
         match cpu.tick_operate() {
             Ok(()) => {}
@@ -3860,7 +3862,7 @@ mod test_cpu {
         };
         // .tick_operate() increments the program counter by 4 for
         // non-compressed instruction.
-        assert_eq!(cpu.memory_base() + 4, cpu.read_pc());
+        assert_eq!(memory_base + 4, cpu.read_pc());
         // "addi a0, a0, a12" instruction writes 12 to a0 register.
         assert_eq!(12, cpu.read_register(10));
         // @TODO: Test compressed instruction operation
@@ -3873,9 +3875,10 @@ mod test_cpu {
         // .fetch() doesn't increment the program counter.
         // .tick_operate() does.
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         cpu.get_mut_mmu().init_memory(4);
-        cpu.update_pc(cpu.memory_base());
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0xaaaaaaaa) {
+        cpu.update_pc(memory_base);
+        match cpu.get_mut_mmu().store_word(memory_base, 0xaaaaaaaa) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
@@ -3883,7 +3886,7 @@ mod test_cpu {
             Ok(data) => assert_eq!(0xaaaaaaaa, data),
             Err(_e) => panic!("Failed to fetch"),
         };
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0x55555555) {
+        match cpu.get_mut_mmu().store_word(memory_base, 0x55555555) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
@@ -3926,28 +3929,29 @@ mod test_cpu {
     fn wfi() {
         let wfi_instruction = 0x10500073;
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         // Just in case
         match cpu.decode(wfi_instruction) {
             Ok(inst) => assert_eq!(inst.name, "WFI"),
             Err(_e) => panic!("Failed to decode"),
         };
         cpu.get_mut_mmu().init_memory(4);
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
         // write WFI instruction
         match cpu
             .get_mut_mmu()
-            .store_word(cpu.memory_base(), wfi_instruction)
+            .store_word(memory_base, wfi_instruction)
         {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
         cpu.tick();
-        assert_eq!(cpu.memory_base() + 4, cpu.read_pc());
+        assert_eq!(memory_base + 4, cpu.read_pc());
         for _i in 0..10 {
             // Until interrupt happens, .tick() does nothing
             // @TODO: Check accurately that the state is unchanged
             cpu.tick();
-            assert_eq!(cpu.memory_base() + 4, cpu.read_pc());
+            assert_eq!(memory_base + 4, cpu.read_pc());
         }
         // Machine timer interrupt
         cpu.write_csr_raw(CSR_MIE_ADDRESS, MIP_MTIP);
@@ -3963,13 +3967,14 @@ mod test_cpu {
     fn interrupt() {
         let handler_vector = 0x10000000;
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         cpu.get_mut_mmu().init_memory(4);
         // Write non-compressed "addi x0, x0, 1" instruction
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0x00100013) {
+        match cpu.get_mut_mmu().store_word(memory_base, 0x00100013) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
 
         // Machine timer interrupt but mie in mstatus is not enabled yet
         cpu.write_csr_raw(CSR_MIE_ADDRESS, MIP_MTIP);
@@ -3979,9 +3984,9 @@ mod test_cpu {
         cpu.tick();
 
         // Interrupt isn't caught because mie is disabled
-        assert_eq!(cpu.memory_base() + 4, cpu.read_pc());
+        assert_eq!(memory_base + 4, cpu.read_pc());
 
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
         // Enable mie in mstatus
         cpu.write_csr_raw(CSR_MSTATUS_ADDRESS, 0x8);
 
@@ -4004,14 +4009,15 @@ mod test_cpu {
     fn exception() {
         let handler_vector = 0x10000000;
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         cpu.get_mut_mmu().init_memory(4);
         // Write ECALL instruction
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0x00000073) {
+        match cpu.get_mut_mmu().store_word(memory_base, 0x00000073) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
         cpu.write_csr_raw(CSR_MTVEC_ADDRESS, handler_vector);
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
 
         cpu.tick();
 
@@ -4030,18 +4036,19 @@ mod test_cpu {
     #[test]
     fn hardocded_zero() {
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         cpu.get_mut_mmu().init_memory(8);
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
 
         // Write non-compressed "addi x0, x0, 1" instruction
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0x00100013) {
+        match cpu.get_mut_mmu().store_word(memory_base, 0x00100013) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
         // Write non-compressed "addi x1, x1, 1" instruction
         match cpu
             .get_mut_mmu()
-            .store_word(cpu.memory_base() + 4, 0x00108093)
+            .store_word(memory_base + 4, 0x00108093)
         {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
@@ -4063,11 +4070,12 @@ mod test_cpu {
     #[test]
     fn disassemble_next_instruction() {
         let mut cpu = create_cpu();
+        let memory_base = cpu.memory_base();
         cpu.get_mut_mmu().init_memory(4);
-        cpu.update_pc(cpu.memory_base());
+        cpu.update_pc(memory_base);
 
         // Write non-compressed "addi x0, x0, 1" instruction
-        match cpu.get_mut_mmu().store_word(cpu.memory_base(), 0x00100013) {
+        match cpu.get_mut_mmu().store_word(memory_base, 0x00100013) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
@@ -4078,7 +4086,7 @@ mod test_cpu {
         );
 
         // No effect to PC
-        assert_eq!(cpu.memory_base(), cpu.read_pc());
+        assert_eq!(memory_base, cpu.read_pc());
     }
 }
 

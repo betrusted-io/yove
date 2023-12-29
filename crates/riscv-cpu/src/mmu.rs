@@ -128,7 +128,7 @@ impl Mmu {
     }
 
     /// Runs one cycle of MMU and peripheral devices.
-    pub fn tick(&mut self, mip: &mut u64) {}
+    pub fn tick(&mut self, _mip: &mut u64) {}
 
     /// Updates addressing mode
     ///

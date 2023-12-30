@@ -1515,7 +1515,15 @@ impl Cpu {
         self.mmu.memory_size()
     }
 
-    pub fn phys_read_u8(&mut self, address: u64) -> u8 {
+    pub fn phys_read_u32(&self, address: u64) -> u32 {
+        self.mmu.load_word_raw(address)
+    }
+
+    pub fn phys_write_u32(&mut self, address: u64, value: u32) {
+        self.mmu.store_word_raw(address, value)
+    }
+
+    pub fn phys_read_u8(&self, address: u64) -> u8 {
         self.mmu.load_raw(address)
     }
 
@@ -2458,9 +2466,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                     *dest = *src;
                 }
                 cpu.handler = Some(handler);
-                return Ok(())
+                return Ok(());
             }
-            
+
             let exception_type = match cpu.privilege_mode {
                 PrivilegeMode::User => TrapType::EnvironmentCallFromUMode,
                 PrivilegeMode::Supervisor => TrapType::EnvironmentCallFromSMode,

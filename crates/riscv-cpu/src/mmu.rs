@@ -173,7 +173,7 @@ impl Mmu {
         self.clear_page_cache();
     }
 
-    fn get_effective_address(&self, address: u64) -> u64 {
+    fn trim_to_xlen(&self, address: u64) -> u64 {
         match self.xlen {
             Xlen::Bit32 => address & 0xffffffff,
             Xlen::Bit64 => address,
@@ -204,7 +204,7 @@ impl Mmu {
         if (v_address & 0xfff) <= (0x1000 - width) {
             // Fast path. All bytes fetched are in the same page so
             // translating an address only once.
-            let effective_address = self.get_effective_address(v_address);
+            let effective_address = self.trim_to_xlen(v_address);
             self.translate_address(effective_address, &MemoryAccessType::Execute)
                 .map(|p_address| self.load_word_raw(p_address))
                 .map_err(|()| Trap {
@@ -229,7 +229,7 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     pub fn load(&mut self, v_address: u64) -> Result<u8, Trap> {
-        let effective_address = self.get_effective_address(v_address);
+        let effective_address = self.trim_to_xlen(v_address);
         match self.translate_address(effective_address, &MemoryAccessType::Read) {
             Ok(p_address) => Ok(self.load_raw(p_address)),
             Err(()) => Err(Trap {
@@ -403,8 +403,8 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `p_address` Physical address
-    pub(crate) fn load_raw(&mut self, p_address: u64) -> u8 {
-        self.memory.read_byte(self.get_effective_address(p_address))
+    pub(crate) fn load_raw(&self, p_address: u64) -> u8 {
+        self.memory.read_byte(self.trim_to_xlen(p_address))
     }
 
     /// Loads two bytes from main memory or peripheral devices depending on
@@ -412,9 +412,8 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `p_address` Physical address
-    fn load_halfword_raw(&mut self, p_address: u64) -> u16 {
-        self.memory
-            .read_halfword(self.get_effective_address(p_address))
+    fn load_halfword_raw(&self, p_address: u64) -> u16 {
+        self.memory.read_halfword(self.trim_to_xlen(p_address))
     }
 
     /// Loads four bytes from main memory or peripheral devices depending on
@@ -422,10 +421,8 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `p_address` Physical address
-    pub fn load_word_raw(&mut self, p_address: u64) -> u32 {
-        let val = self.memory.read_word(self.get_effective_address(p_address));
-        // println!("Read value from {:08x}: {:08x}", p_address, val);
-        val
+    pub fn load_word_raw(&self, p_address: u64) -> u32 {
+        self.memory.read_word(self.trim_to_xlen(p_address))
     }
 
     /// Loads eight bytes from main memory or peripheral devices depending on
@@ -433,9 +430,8 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `p_address` Physical address
-    fn load_doubleword_raw(&mut self, p_address: u64) -> u64 {
-        self.memory
-            .read_doubleword(self.get_effective_address(p_address))
+    fn load_doubleword_raw(&self, p_address: u64) -> u64 {
+        self.memory.read_doubleword(self.trim_to_xlen(p_address))
     }
 
     /// Stores a byte to main memory or peripheral devices depending on
@@ -445,8 +441,7 @@ impl Mmu {
     /// * `p_address` Physical address
     /// * `value` data written
     pub(crate) fn store_raw(&mut self, p_address: u64, value: u8) {
-        self.memory
-            .write_byte(self.get_effective_address(p_address), value)
+        self.memory.write_byte(self.trim_to_xlen(p_address), value)
     }
 
     /// Stores two bytes to main memory or peripheral devices depending on
@@ -455,9 +450,9 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     /// * `value` data written
-    fn store_halfword_raw(&mut self, p_address: u64, value: u16) {
+    pub(crate) fn store_halfword_raw(&mut self, p_address: u64, value: u16) {
         self.memory
-            .write_halfword(self.get_effective_address(p_address), value)
+            .write_halfword(self.trim_to_xlen(p_address), value)
     }
 
     /// Stores four bytes to main memory or peripheral devices depending on
@@ -466,9 +461,8 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     /// * `value` data written
-    fn store_word_raw(&mut self, p_address: u64, value: u32) {
-        self.memory
-            .write_word(self.get_effective_address(p_address), value)
+    pub(crate) fn store_word_raw(&mut self, p_address: u64, value: u32) {
+        self.memory.write_word(self.trim_to_xlen(p_address), value)
     }
 
     /// Stores eight bytes to main memory or peripheral devices depending on
@@ -479,7 +473,7 @@ impl Mmu {
     /// * `value` data written
     fn store_doubleword_raw(&mut self, p_address: u64, value: u64) {
         self.memory
-            .write_doubleword(self.get_effective_address(p_address), value)
+            .write_doubleword(self.trim_to_xlen(p_address), value)
     }
 
     /// Checks if passed virtual address is valid (pointing a certain device) or not.
@@ -489,10 +483,7 @@ impl Mmu {
     /// * `v_address` Virtual address
     pub fn validate_address(&mut self, v_address: u64) -> Option<bool> {
         if let Ok(p_address) = self.translate_address(v_address, &MemoryAccessType::DontCare) {
-            Some(
-                self.memory
-                    .validate_address(self.get_effective_address(p_address)),
-            )
+            Some(self.memory.validate_address(self.trim_to_xlen(p_address)))
         } else {
             None
         }
@@ -503,7 +494,7 @@ impl Mmu {
         v_address: u64,
         access_type: &MemoryAccessType,
     ) -> Result<u64, ()> {
-        let address = self.get_effective_address(v_address);
+        let address = self.trim_to_xlen(v_address);
         let v_page = address & !0xfff;
         if let Some(p_page) = match self.page_cache_enabled {
             true => match access_type {
@@ -750,7 +741,7 @@ impl MemoryWrapper {
         self.memory.init(capacity);
     }
 
-    pub fn read_byte(&mut self, p_address: u64) -> u8 {
+    pub fn read_byte(&self, p_address: u64) -> u8 {
         debug_assert!(
             p_address >= self.dram_base,
             "Memory address must equals to or bigger than self.dram_base. {:X}",
@@ -759,7 +750,7 @@ impl MemoryWrapper {
         self.memory.read_byte(p_address - self.dram_base)
     }
 
-    pub fn read_halfword(&mut self, p_address: u64) -> u16 {
+    pub fn read_halfword(&self, p_address: u64) -> u16 {
         debug_assert!(
             p_address >= self.dram_base && p_address.wrapping_add(1) >= self.dram_base,
             "Memory address must equals to or bigger than self.dram_base. {:X}",
@@ -768,7 +759,7 @@ impl MemoryWrapper {
         self.memory.read_halfword(p_address - self.dram_base)
     }
 
-    pub fn read_word(&mut self, p_address: u64) -> u32 {
+    pub fn read_word(&self, p_address: u64) -> u32 {
         debug_assert!(
             p_address >= self.dram_base && p_address.wrapping_add(3) >= self.dram_base,
             "Memory address must equals to or bigger than self.dram_base. {:X}",
@@ -777,7 +768,7 @@ impl MemoryWrapper {
         self.memory.read_word(p_address - self.dram_base)
     }
 
-    pub fn read_doubleword(&mut self, p_address: u64) -> u64 {
+    pub fn read_doubleword(&self, p_address: u64) -> u64 {
         debug_assert!(
             p_address >= self.dram_base && p_address.wrapping_add(7) >= self.dram_base,
             "Memory address must equals to or bigger than self.dram_base. {:X}",

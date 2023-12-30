@@ -23,12 +23,12 @@ const CSR_SIDELEG_ADDRESS: u16 = 0x103;
 const CSR_SIE_ADDRESS: u16 = 0x104;
 const CSR_STVEC_ADDRESS: u16 = 0x105;
 const _CSR_SSCRATCH_ADDRESS: u16 = 0x140;
-const CSR_SEPC_ADDRESS: u16 = 0x141;
+pub const CSR_SEPC_ADDRESS: u16 = 0x141;
 const CSR_SCAUSE_ADDRESS: u16 = 0x142;
 const CSR_STVAL_ADDRESS: u16 = 0x143;
 const CSR_SIP_ADDRESS: u16 = 0x144;
-const CSR_SATP_ADDRESS: u16 = 0x180;
-const CSR_MSTATUS_ADDRESS: u16 = 0x300;
+pub const CSR_SATP_ADDRESS: u16 = 0x180;
+pub const CSR_MSTATUS_ADDRESS: u16 = 0x300;
 // const CSR_MISA_ADDRESS: u16 = 0x301;
 const CSR_MEDELEG_ADDRESS: u16 = 0x302;
 const CSR_MIDELEG_ADDRESS: u16 = 0x303;
@@ -82,8 +82,7 @@ pub enum Xlen {
     Bit64, // @TODO: Support Bit128
 }
 
-#[derive(Clone)]
-#[allow(dead_code)]
+#[derive(Clone, Debug)]
 pub enum PrivilegeMode {
     User,
     Supervisor,
@@ -91,12 +90,13 @@ pub enum PrivilegeMode {
     Machine,
 }
 
+#[derive(Debug)]
 pub struct Trap {
     pub trap_type: TrapType,
     pub value: u64, // Trap type specific value
 }
 
-#[allow(dead_code)]
+#[derive(Debug)]
 pub enum TrapType {
     InstructionAddressMisaligned,
     InstructionAccessFault,
@@ -319,6 +319,19 @@ impl Cpu {
         }
     }
 
+    /// Writes integer register content
+    ///
+    /// # Arguments
+    /// * `reg` Register number. Must be 0-31
+    /// * `val` 64-bit value
+    pub fn write_register(&mut self, reg: u8, val: i64) {
+        debug_assert!(reg <= 31, "reg must be 0-31. {}", reg);
+        if reg == 0 {
+            return;
+        }
+        self.x[reg as usize] = val;
+    }
+
     /// Reads Program counter content
     pub fn read_pc(&self) -> u64 {
         self.pc
@@ -350,35 +363,37 @@ impl Cpu {
             return Ok(());
         }
 
-        let original_word = match self.fetch() {
-            Ok(word) => word,
-            Err(e) => return Err(e),
-        };
+        let original_word = self.fetch()?;
         let instruction_address = self.pc;
-        let word = match (original_word & 0x3) == 0x3 {
-            true => {
-                self.pc = self.pc.wrapping_add(4); // 32-bit length non-compressed instruction
-                original_word
-            }
-            false => {
-                self.pc = self.pc.wrapping_add(2); // 16-bit length compressed instruction
-                self.uncompress(original_word & 0xffff)
-            }
+        let word = if (original_word & 0x3) == 0x3 {
+            self.pc = self.pc.wrapping_add(4); // 32-bit length non-compressed instruction
+            original_word
+        } else {
+            self.pc = self.pc.wrapping_add(2); // 16-bit length compressed instruction
+            self.uncompress(original_word & 0xffff)
         };
 
-        match self.decode(word) {
-            Ok(inst) => {
-                let result = (inst.operation)(self, word, instruction_address);
-                self.x[0] = 0; // hardwired zero
-                result
-            }
-            Err(()) => {
-                panic!(
-                    "Unknown instruction PC:{:x} WORD:{:x}",
-                    instruction_address, original_word
-                );
-            }
-        }
+        let Ok(inst) = self.decode_raw(word) else {
+            panic!(
+                "Unknown instruction PC:{:x} WORD:{:x}",
+                instruction_address, original_word
+            );
+        };
+
+        println!(
+            "pc @ 0x{:08x}: {:08x} {} {}",
+            instruction_address,
+            original_word,
+            inst.name,
+            (inst.disassemble)(self, original_word, self.pc, true)
+        );
+        let result = (inst.operation)(self, word, instruction_address);
+        self.x[0] = 0; // hardwired zero
+        result
+    }
+
+    pub fn execute_opcode(&mut self, op: u32) -> Result<(), Trap> {
+        (self.decode_raw(op)?.operation)(self, op, self.pc)
     }
 
     /// Decodes a word instruction data and returns a reference to
@@ -386,27 +401,27 @@ impl Cpu {
     /// so if cache hits this method returns the result very quickly.
     /// The result will be stored to cache.
     fn decode(&mut self, word: u32) -> Result<&Instruction, ()> {
-        match self.decode_cache.get(word) {
-            Some(index) => Ok(&INSTRUCTIONS[index]),
-            None => match self.decode_and_get_instruction_index(word) {
-                Ok(index) => {
-                    self.decode_cache.insert(word, index);
-                    Ok(&INSTRUCTIONS[index])
-                }
-                Err(()) => Err(()),
-            },
+        if let Some(index) = self.decode_cache.get(word) {
+            return Ok(&INSTRUCTIONS[index]);
         }
+        let Ok(index) = self.decode_and_get_instruction_index(word) else {
+            return Err(());
+        };
+        self.decode_cache.insert(word, index);
+        Ok(&INSTRUCTIONS[index])
     }
 
     /// Decodes a word instruction data and returns a reference to
     /// [`Instruction`](struct.Instruction.html). Not Using [`DecodeCache`](struct.DecodeCache.html)
     /// so if you don't want to pollute the cache you should use this method
     /// instead of `decode`.
-    fn decode_raw(&self, word: u32) -> Result<&Instruction, ()> {
-        match self.decode_and_get_instruction_index(word) {
-            Ok(index) => Ok(&INSTRUCTIONS[index]),
-            Err(()) => Err(()),
-        }
+    fn decode_raw(&self, word: u32) -> Result<&Instruction, Trap> {
+        self.decode_and_get_instruction_index(word)
+            .map(|index| &INSTRUCTIONS[index])
+            .map_err(|_| Trap {
+                value: self.pc.wrapping_sub(4),
+                trap_type: TrapType::IllegalInstruction,
+            })
     }
 
     /// Decodes a word instruction data and returns an index of
@@ -744,14 +759,12 @@ impl Cpu {
     }
 
     fn fetch(&mut self) -> Result<u32, Trap> {
-        let word = match self.mmu.fetch_word(self.pc) {
-            Ok(word) => word,
-            Err(e) => {
-                self.pc = self.pc.wrapping_add(4); // @TODO: What if instruction is compressed?
-                return Err(e);
-            }
-        };
-        Ok(word)
+        // println!("Fetching word from {:08x}...", self.pc);
+        self.mmu.fetch_word(self.pc).map_err(|e| {
+            self.pc = self.pc.wrapping_add(4); // @TODO: What if instruction is compressed?
+            println!("Fetch error: {:x?}", e);
+            e
+        })
     }
 
     fn has_csr_access_privilege(&self, address: u16) -> bool {
@@ -769,7 +782,7 @@ impl Cpu {
         }
     }
 
-    fn write_csr(&mut self, address: u16, value: u64) -> Result<(), Trap> {
+    pub fn write_csr(&mut self, address: u16, value: u64) -> Result<(), Trap> {
         match self.has_csr_access_privilege(address) {
             true => {
                 /*
@@ -1442,31 +1455,22 @@ impl Cpu {
         // for example updating page table entry or update peripheral hardware registers.
         // But ideally disassembling doesn't want to cause any side effect.
         // How can we avoid side effect?
-        let mut original_word = match self.mmu.fetch_word(self.pc) {
-            Ok(data) => data,
-            Err(_e) => {
-                return format!("PC:{:016x}, InstructionPageFault Trap!\n", self.pc);
-            }
+        let Ok(mut original_word) = self.mmu.fetch_word(self.pc) else {
+            return format!("PC:{:016x}, InstructionPageFault Trap!\n", self.pc);
         };
 
-        let word = match (original_word & 0x3) == 0x3 {
-            true => original_word,
-            false => {
-                original_word &= 0xffff;
-                self.uncompress(original_word)
-            }
+        let word = if (original_word & 0x3) == 0x3 {
+            original_word
+        } else {
+            original_word &= 0xffff;
+            self.uncompress(original_word)
         };
 
-        let inst = {
-            match self.decode_raw(word) {
-                Ok(inst) => inst,
-                Err(()) => {
-                    return format!(
-                        "Unknown instruction PC:{:x} WORD:{:x}",
-                        self.pc, original_word
-                    );
-                }
-            }
+        let Ok(inst) = self.decode_raw(word) else {
+            return format!(
+                "Unknown instruction PC:{:x} WORD:{:x}",
+                self.pc, original_word
+            );
         };
 
         let mut s = format!("PC:{:016x} ", self.unsigned_data(self.pc as i64));
@@ -1484,6 +1488,18 @@ impl Cpu {
     pub fn memory_base(&self) -> u64 {
         self.memory_base
     }
+
+    pub fn memory_size(&self) -> u64 {
+        self.mmu.memory_size()
+    }
+
+    pub fn phys_read_u8(&mut self, address: u64) -> u8 {
+        self.mmu.load_raw(address)
+    }
+
+    pub fn phys_write_u8(&mut self, address: u64, value: u8) {
+        self.mmu.store_raw(address, value)
+    }
 }
 
 struct Instruction {
@@ -1491,7 +1507,7 @@ struct Instruction {
     data: u32, // @TODO: rename
     name: &'static str,
     operation: fn(cpu: &mut Cpu, word: u32, address: u64) -> Result<(), Trap>,
-    disassemble: fn(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String,
+    disassemble: fn(cpu: &Cpu, word: u32, address: u64, evaluate: bool) -> String,
 }
 
 struct FormatB {
@@ -1517,7 +1533,7 @@ fn parse_format_b(word: u32) -> FormatB {
     }
 }
 
-fn dump_format_b(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String {
+fn dump_format_b(cpu: &Cpu, word: u32, address: u64, evaluate: bool) -> String {
     let f = parse_format_b(word);
     let mut s = String::new();
     s += get_register_name(f.rs1);
@@ -1546,7 +1562,7 @@ fn parse_format_csr(word: u32) -> FormatCSR {
     }
 }
 
-fn dump_format_csr(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+fn dump_format_csr(cpu: &Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_csr(word);
     let mut s = String::new();
     s += get_register_name(f.rd);
@@ -1586,7 +1602,7 @@ fn parse_format_i(word: u32) -> FormatI {
     }
 }
 
-fn dump_format_i(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+fn dump_format_i(cpu: &Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_i(word);
     let mut s = String::new();
     s += get_register_name(f.rd);
@@ -1601,7 +1617,7 @@ fn dump_format_i(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> Str
     s
 }
 
-fn dump_format_i_mem(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+fn dump_format_i_mem(cpu: &Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_i(word);
     let mut s = String::new();
     s += get_register_name(f.rd);
@@ -1637,7 +1653,7 @@ fn parse_format_j(word: u32) -> FormatJ {
     }
 }
 
-fn dump_format_j(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String {
+fn dump_format_j(cpu: &Cpu, word: u32, address: u64, evaluate: bool) -> String {
     let f = parse_format_j(word);
     let mut s = String::new();
     s += get_register_name(f.rd);
@@ -1662,7 +1678,7 @@ fn parse_format_r(word: u32) -> FormatR {
     }
 }
 
-fn dump_format_r(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+fn dump_format_r(cpu: &Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_r(word);
     let mut s = String::new();
     s += get_register_name(f.rd);
@@ -1697,7 +1713,7 @@ fn parse_format_r2(word: u32) -> FormatR2 {
     }
 }
 
-fn dump_format_r2(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+fn dump_format_r2(cpu: &Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_r2(word);
     let mut s = String::new();
     s += get_register_name(f.rd);
@@ -1741,7 +1757,7 @@ fn parse_format_s(word: u32) -> FormatS {
     }
 }
 
-fn dump_format_s(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+fn dump_format_s(cpu: &Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_s(word);
     let mut s = String::new();
     s += get_register_name(f.rs2);
@@ -1775,7 +1791,7 @@ fn parse_format_u(word: u32) -> FormatU {
     }
 }
 
-fn dump_format_u(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
+fn dump_format_u(cpu: &Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_u(word);
     let mut s = String::new();
     s += get_register_name(f.rd);
@@ -1786,7 +1802,7 @@ fn dump_format_u(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> Str
     s
 }
 
-fn dump_empty(_cpu: &mut Cpu, _word: u32, _address: u64, _evaluate: bool) -> String {
+fn dump_empty(_cpu: &Cpu, _word: u32, _address: u64, _evaluate: bool) -> String {
     String::new()
 }
 
@@ -3424,6 +3440,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                 1 => PrivilegeMode::Supervisor,
                 _ => panic!(), // Shouldn't happen
             };
+            println!("Updating privilege mode to {:?}", cpu.privilege_mode);
             cpu.mmu.update_privilege_mode(cpu.privilege_mode.clone());
             Ok(())
         },

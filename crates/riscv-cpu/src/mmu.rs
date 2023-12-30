@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, num::NonZeroU64};
 
 use crate::{
     cpu::{get_privilege_mode, PrivilegeMode, Trap, TrapType, Xlen},
@@ -17,6 +17,9 @@ pub struct Mmu {
     addressing_mode: AddressingMode,
     privilege_mode: PrivilegeMode,
     memory: MemoryWrapper,
+
+    /// The size of main memory (if initialized)
+    memory_length: Option<NonZeroU64>,
 
     /// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
     /// then `Mmu` has copy of it.
@@ -39,6 +42,7 @@ pub struct Mmu {
     store_page_cache: HashMap<u64, u64>,
 }
 
+#[derive(Debug)]
 pub enum AddressingMode {
     None,
     SV32,
@@ -87,6 +91,7 @@ impl Mmu {
             fetch_page_cache: HashMap::default(),
             load_page_cache: HashMap::default(),
             store_page_cache: HashMap::default(),
+            memory_length: None,
         }
     }
 
@@ -104,7 +109,13 @@ impl Mmu {
     /// # Arguments
     /// * `capacity`
     pub fn init_memory(&mut self, capacity: u64) {
+        assert!(self.memory_length.is_none());
+        self.memory_length = Some(NonZeroU64::new(capacity).unwrap());
         self.memory.init(capacity);
+    }
+
+    pub fn memory_size(&self) -> u64 {
+        self.memory_length.unwrap().get()
     }
 
     /// Enables or disables page cache optimization.
@@ -190,29 +201,25 @@ impl Mmu {
     /// * `v_address` Virtual address
     pub fn fetch_word(&mut self, v_address: u64) -> Result<u32, Trap> {
         let width = 4;
-        match (v_address & 0xfff) <= (0x1000 - width) {
-            true => {
-                // Fast path. All bytes fetched are in the same page so
-                // translating an address only once.
-                let effective_address = self.get_effective_address(v_address);
-                match self.translate_address(effective_address, &MemoryAccessType::Execute) {
-                    Ok(p_address) => Ok(self.load_word_raw(p_address)),
-                    Err(()) => Err(Trap {
-                        trap_type: TrapType::InstructionPageFault,
-                        value: effective_address,
-                    }),
-                }
+        if (v_address & 0xfff) <= (0x1000 - width) {
+            // Fast path. All bytes fetched are in the same page so
+            // translating an address only once.
+            let effective_address = self.get_effective_address(v_address);
+            self.translate_address(effective_address, &MemoryAccessType::Execute)
+                .map(|p_address| self.load_word_raw(p_address))
+                .map_err(|()| Trap {
+                    trap_type: TrapType::InstructionPageFault,
+                    value: effective_address,
+                })
+        } else {
+            let mut data = 0;
+            for i in 0..width {
+                match self.fetch(v_address.wrapping_add(i)) {
+                    Ok(byte) => data |= (byte as u32) << (i * 8),
+                    Err(e) => return Err(e),
+                };
             }
-            false => {
-                let mut data = 0;
-                for i in 0..width {
-                    match self.fetch(v_address.wrapping_add(i)) {
-                        Ok(byte) => data |= (byte as u32) << (i * 8),
-                        Err(e) => return Err(e),
-                    };
-                }
-                Ok(data)
-            }
+            Ok(data)
         }
     }
 
@@ -396,7 +403,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `p_address` Physical address
-    fn load_raw(&mut self, p_address: u64) -> u8 {
+    pub(crate) fn load_raw(&mut self, p_address: u64) -> u8 {
         self.memory.read_byte(self.get_effective_address(p_address))
     }
 
@@ -416,7 +423,9 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     pub fn load_word_raw(&mut self, p_address: u64) -> u32 {
-        self.memory.read_word(self.get_effective_address(p_address))
+        let val = self.memory.read_word(self.get_effective_address(p_address));
+        // println!("Read value from {:08x}: {:08x}", p_address, val);
+        val
     }
 
     /// Loads eight bytes from main memory or peripheral devices depending on
@@ -435,7 +444,7 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     /// * `value` data written
-    pub fn store_raw(&mut self, p_address: u64, value: u8) {
+    pub(crate) fn store_raw(&mut self, p_address: u64, value: u8) {
         self.memory
             .write_byte(self.get_effective_address(p_address), value)
     }
@@ -496,7 +505,7 @@ impl Mmu {
     ) -> Result<u64, ()> {
         let address = self.get_effective_address(v_address);
         let v_page = address & !0xfff;
-        let cache = match self.page_cache_enabled {
+        if let Some(p_page) = match self.page_cache_enabled {
             true => match access_type {
                 MemoryAccessType::Execute => self.fetch_page_cache.get(&v_page),
                 MemoryAccessType::Read => self.load_page_cache.get(&v_page),
@@ -504,106 +513,94 @@ impl Mmu {
                 MemoryAccessType::DontCare => None,
             },
             false => None,
-        };
-        match cache {
-            Some(p_page) => Ok(p_page | (address & 0xfff)),
-            None => {
-                let p_address = match self.addressing_mode {
-                    AddressingMode::None => Ok(address),
-                    AddressingMode::SV32 => match self.privilege_mode {
-                        // @TODO: Optimize
-                        PrivilegeMode::Machine => match access_type {
-                            MemoryAccessType::Execute => Ok(address),
-                            // @TODO: Remove magic number
-                            _ => match (self.mstatus >> 17) & 1 {
-                                0 => Ok(address),
+        } {
+            return Ok(p_page | (address & 0xfff));
+        }
+
+        let p_address = match self.addressing_mode {
+            AddressingMode::None => Ok(address),
+            AddressingMode::SV32 => match self.privilege_mode {
+                // @TODO: Optimize
+                PrivilegeMode::Machine => match access_type {
+                    MemoryAccessType::Execute => Ok(address),
+                    // @TODO: Remove magic number
+                    _ => match (self.mstatus >> 17) & 1 {
+                        0 => Ok(address),
+                        _ => {
+                            let privilege_mode = get_privilege_mode((self.mstatus >> 9) & 3);
+                            match privilege_mode {
+                                PrivilegeMode::Machine => Ok(address),
                                 _ => {
-                                    let privilege_mode =
-                                        get_privilege_mode((self.mstatus >> 9) & 3);
-                                    match privilege_mode {
-                                        PrivilegeMode::Machine => Ok(address),
-                                        _ => {
-                                            let current_privilege_mode =
-                                                self.privilege_mode.clone();
-                                            self.update_privilege_mode(privilege_mode);
-                                            let result =
-                                                self.translate_address(v_address, access_type);
-                                            self.update_privilege_mode(current_privilege_mode);
-                                            result
-                                        }
-                                    }
+                                    let current_privilege_mode = self.privilege_mode.clone();
+                                    self.update_privilege_mode(privilege_mode);
+                                    let result = self.translate_address(v_address, access_type);
+                                    self.update_privilege_mode(current_privilege_mode);
+                                    result
                                 }
-                            },
-                        },
-                        PrivilegeMode::User | PrivilegeMode::Supervisor => {
-                            let vpns = [(address >> 12) & 0x3ff, (address >> 22) & 0x3ff];
-                            self.traverse_page(address, 2 - 1, self.ppn, &vpns, access_type)
+                            }
                         }
-                        _ => Ok(address),
                     },
-                    AddressingMode::SV39 => match self.privilege_mode {
-                        // @TODO: Optimize
-                        // @TODO: Remove duplicated code with SV32
-                        PrivilegeMode::Machine => match access_type {
-                            MemoryAccessType::Execute => Ok(address),
-                            // @TODO: Remove magic number
-                            _ => match (self.mstatus >> 17) & 1 {
-                                0 => Ok(address),
-                                _ => {
-                                    let privilege_mode =
-                                        get_privilege_mode((self.mstatus >> 9) & 3);
-                                    match privilege_mode {
-                                        PrivilegeMode::Machine => Ok(address),
-                                        _ => {
-                                            let current_privilege_mode =
-                                                self.privilege_mode.clone();
-                                            self.update_privilege_mode(privilege_mode);
-                                            let result =
-                                                self.translate_address(v_address, access_type);
-                                            self.update_privilege_mode(current_privilege_mode);
-                                            result
-                                        }
-                                    }
-                                }
-                            },
-                        },
-                        PrivilegeMode::User | PrivilegeMode::Supervisor => {
-                            let vpns = [
-                                (address >> 12) & 0x1ff,
-                                (address >> 21) & 0x1ff,
-                                (address >> 30) & 0x1ff,
-                            ];
-                            self.traverse_page(address, 3 - 1, self.ppn, &vpns, access_type)
-                        }
-                        _ => Ok(address),
-                    },
-                    AddressingMode::SV48 => {
-                        panic!("AddressingMode SV48 is not supported yet.");
-                    }
-                };
-                match self.page_cache_enabled {
-                    true => match p_address {
-                        Ok(p_address) => {
-                            let p_page = p_address & !0xfff;
-                            match access_type {
-                                MemoryAccessType::Execute => {
-                                    self.fetch_page_cache.insert(v_page, p_page)
-                                }
-                                MemoryAccessType::Read => {
-                                    self.load_page_cache.insert(v_page, p_page)
-                                }
-                                MemoryAccessType::Write => {
-                                    self.store_page_cache.insert(v_page, p_page)
-                                }
-                                MemoryAccessType::DontCare => None,
-                            };
-                            Ok(p_address)
-                        }
-                        Err(()) => Err(()),
-                    },
-                    false => p_address,
+                },
+                PrivilegeMode::User | PrivilegeMode::Supervisor => {
+                    let vpns = [(address >> 12) & 0x3ff, (address >> 22) & 0x3ff];
+                    self.traverse_page(address, 2 - 1, self.ppn, &vpns, access_type)
                 }
+                _ => Ok(address),
+            },
+            AddressingMode::SV39 => match self.privilege_mode {
+                // @TODO: Optimize
+                // @TODO: Remove duplicated code with SV32
+                PrivilegeMode::Machine => match access_type {
+                    MemoryAccessType::Execute => Ok(address),
+                    // @TODO: Remove magic number
+                    _ => match (self.mstatus >> 17) & 1 {
+                        0 => Ok(address),
+                        _ => {
+                            let privilege_mode = get_privilege_mode((self.mstatus >> 9) & 3);
+                            match privilege_mode {
+                                PrivilegeMode::Machine => Ok(address),
+                                _ => {
+                                    let current_privilege_mode = self.privilege_mode.clone();
+                                    self.update_privilege_mode(privilege_mode);
+                                    let result = self.translate_address(v_address, access_type);
+                                    self.update_privilege_mode(current_privilege_mode);
+                                    result
+                                }
+                            }
+                        }
+                    },
+                },
+                PrivilegeMode::User | PrivilegeMode::Supervisor => {
+                    let vpns = [
+                        (address >> 12) & 0x1ff,
+                        (address >> 21) & 0x1ff,
+                        (address >> 30) & 0x1ff,
+                    ];
+                    self.traverse_page(address, 3 - 1, self.ppn, &vpns, access_type)
+                }
+                _ => Ok(address),
+            },
+            AddressingMode::SV48 => {
+                panic!("AddressingMode SV48 is not supported yet.");
             }
+        };
+
+        if self.page_cache_enabled {
+            match p_address {
+                Ok(p_address) => {
+                    let p_page = p_address & !0xfff;
+                    match access_type {
+                        MemoryAccessType::Execute => self.fetch_page_cache.insert(v_page, p_page),
+                        MemoryAccessType::Read => self.load_page_cache.insert(v_page, p_page),
+                        MemoryAccessType::Write => self.store_page_cache.insert(v_page, p_page),
+                        MemoryAccessType::DontCare => None,
+                    };
+                    Ok(p_address)
+                }
+                Err(()) => Err(()),
+            }
+        } else {
+            p_address
         }
     }
 

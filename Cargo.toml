@@ -9,3 +9,4 @@ edition = "2021"
 
 [dependencies]
 riscv-cpu = { path = "crates/riscv-cpu" }
+goblin = { version = "0.7.1", features = [ "std", "elf32", "alloc" ]}

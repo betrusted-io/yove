@@ -29,7 +29,7 @@ const CSR_STVAL_ADDRESS: u16 = 0x143;
 const CSR_SIP_ADDRESS: u16 = 0x144;
 const CSR_SATP_ADDRESS: u16 = 0x180;
 const CSR_MSTATUS_ADDRESS: u16 = 0x300;
-const CSR_MISA_ADDRESS: u16 = 0x301;
+// const CSR_MISA_ADDRESS: u16 = 0x301;
 const CSR_MEDELEG_ADDRESS: u16 = 0x302;
 const CSR_MIDELEG_ADDRESS: u16 = 0x303;
 const CSR_MIE_ADDRESS: u16 = 0x304;
@@ -44,7 +44,7 @@ const _CSR_PMPCFG0_ADDRESS: u16 = 0x3a0;
 const _CSR_PMPADDR0_ADDRESS: u16 = 0x3b0;
 const _CSR_MCYCLE_ADDRESS: u16 = 0xb00;
 const CSR_CYCLE_ADDRESS: u16 = 0xc00;
-const CSR_TIME_ADDRESS: u16 = 0xc01;
+// const CSR_TIME_ADDRESS: u16 = 0xc01;
 const _CSR_INSERT_ADDRESS: u16 = 0xc02;
 const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
 
@@ -182,8 +182,8 @@ fn _get_trap_type_name(trap_type: &TrapType) -> &'static str {
 
 fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
     let interrupt_bit = match xlen {
-        Xlen::Bit32 => 0x80000000 as u64,
-        Xlen::Bit64 => 0x8000000000000000 as u64,
+        Xlen::Bit32 => 0x80000000_u64,
+        Xlen::Bit64 => 0x8000000000000000_u64,
     };
     match trap.trap_type {
         TrapType::InstructionAddressMisaligned => 0,
@@ -215,6 +215,7 @@ fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
 pub struct CpuBuilder {
     xlen: Xlen,
     memory_size: u64,
+    memory_base: u64,
 }
 
 impl CpuBuilder {
@@ -222,6 +223,7 @@ impl CpuBuilder {
         CpuBuilder {
             xlen: Xlen::Bit64,
             memory_size: 0,
+            memory_base: DEFAULT_MEMORY_BASE,
         }
     }
 
@@ -236,14 +238,31 @@ impl CpuBuilder {
     }
 
     pub fn build(self) -> Cpu {
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(self.memory_base);
         cpu.update_xlen(self.xlen.clone());
+        cpu.mmu.init_memory(self.memory_size);
         cpu
+    }
+}
+
+impl Default for CpuBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Default for Cpu {
     fn default() -> Self {
+        Self::new(DEFAULT_MEMORY_BASE)
+    }
+}
+
+impl Cpu {
+    /// Creates a new `Cpu`.
+    ///
+    /// # Arguments
+    /// * `Terminal`
+    pub fn new(memory_base: u64) -> Self {
         Cpu {
             clock: 0,
             xlen: Xlen::Bit64,
@@ -253,24 +272,14 @@ impl Default for Cpu {
             f: [0.0; 32],
             pc: 0,
             csr: [0; CSR_CAPACITY],
-            mmu: Mmu::new(Xlen::Bit64),
+            mmu: Mmu::new(Xlen::Bit64, memory_base),
             reservation: 0,
             is_reservation_set: false,
             _dump_flag: false,
             decode_cache: DecodeCache::new(),
             unsigned_data_mask: 0xffffffffffffffff,
-            memory_base: DEFAULT_MEMORY_BASE,
+            memory_base,
         }
-    }
-}
-
-impl Cpu {
-    /// Creates a new `Cpu`.
-    ///
-    /// # Arguments
-    /// * `Terminal`
-    pub fn new() -> Self {
-        Default::default()
         // let mut cpu = ;
         // cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
         // cpu.write_csr_raw(CSR_MISA_ADDRESS, 0x800000008014312f);
@@ -406,10 +415,9 @@ impl Cpu {
     /// # Arguments
     /// * `word` word instruction data decoded
     fn decode_and_get_instruction_index(&self, word: u32) -> Result<usize, ()> {
-        for i in 0..INSTRUCTION_NUM {
-            let inst = &INSTRUCTIONS[i];
+        for (idx, inst) in INSTRUCTIONS.iter().enumerate() {
             if (word & inst.mask) == inst.data {
-                return Ok(i);
+                return Ok(idx);
             }
         }
         Err(())
@@ -520,7 +528,6 @@ impl Cpu {
                 self.read_csr_raw(CSR_MIP_ADDRESS) & !MIP_STIP,
             );
             self.wfi = false;
-            return;
         }
     }
 
@@ -595,7 +602,9 @@ impl Cpu {
 
             if new_privilege_encoding < current_privilege_encoding {
                 return false;
-            } else if current_privilege_encoding == new_privilege_encoding {
+            }
+
+            if current_privilege_encoding == new_privilege_encoding {
                 match self.privilege_mode {
                     PrivilegeMode::Machine => {
                         if current_mie == 0 {
@@ -1463,7 +1472,7 @@ impl Cpu {
         let mut s = format!("PC:{:016x} ", self.unsigned_data(self.pc as i64));
         s += &format!("{:08x} ", original_word);
         s += &format!("{} ", inst.name);
-        s += &format!("{}", (inst.disassemble)(self, word, self.pc, true));
+        s += &(inst.disassemble)(self, word, self.pc, true).to_string();
         s
     }
 
@@ -1511,7 +1520,7 @@ fn parse_format_b(word: u32) -> FormatB {
 fn dump_format_b(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String {
     let f = parse_format_b(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rs1));
+    s += get_register_name(f.rs1);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rs1]);
     }
@@ -1540,7 +1549,7 @@ fn parse_format_csr(word: u32) -> FormatCSR {
 fn dump_format_csr(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_csr(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rd));
+    s += get_register_name(f.rd);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rd]);
     }
@@ -1580,7 +1589,7 @@ fn parse_format_i(word: u32) -> FormatI {
 fn dump_format_i(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_i(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rd));
+    s += get_register_name(f.rd);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rd]);
     }
@@ -1595,7 +1604,7 @@ fn dump_format_i(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> Str
 fn dump_format_i_mem(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_i(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rd));
+    s += get_register_name(f.rd);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rd]);
     }
@@ -1603,7 +1612,7 @@ fn dump_format_i_mem(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) ->
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rs1]);
     }
-    s += &format!(")");
+    s += ")";
     s
 }
 
@@ -1631,7 +1640,7 @@ fn parse_format_j(word: u32) -> FormatJ {
 fn dump_format_j(cpu: &mut Cpu, word: u32, address: u64, evaluate: bool) -> String {
     let f = parse_format_j(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rd));
+    s += get_register_name(f.rd);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rd]);
     }
@@ -1656,7 +1665,7 @@ fn parse_format_r(word: u32) -> FormatR {
 fn dump_format_r(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_r(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rd));
+    s += get_register_name(f.rd);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rd]);
     }
@@ -1691,7 +1700,7 @@ fn parse_format_r2(word: u32) -> FormatR2 {
 fn dump_format_r2(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_r2(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rd));
+    s += get_register_name(f.rd);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rd]);
     }
@@ -1735,7 +1744,7 @@ fn parse_format_s(word: u32) -> FormatS {
 fn dump_format_s(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_s(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rs2));
+    s += get_register_name(f.rs2);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rs2]);
     }
@@ -1743,7 +1752,7 @@ fn dump_format_s(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> Str
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rs1]);
     }
-    s += &format!(")");
+    s += ")";
     s
 }
 
@@ -1762,14 +1771,14 @@ fn parse_format_u(word: u32) -> FormatU {
 			} | // imm[63:32] = [31]
 			((word as u64) & 0xfffff000)
             // imm[31:12] = [31:12]
-        ) as u64,
+        ),
     }
 }
 
 fn dump_format_u(cpu: &mut Cpu, word: u32, _address: u64, evaluate: bool) -> String {
     let f = parse_format_u(word);
     let mut s = String::new();
-    s += &format!("{}", get_register_name(f.rd));
+    s += get_register_name(f.rd);
     if evaluate {
         s += &format!(":{:x}", cpu.x[f.rd]);
     }
@@ -2407,10 +2416,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                 PrivilegeMode::Machine => TrapType::EnvironmentCallFromMMode,
                 PrivilegeMode::Reserved => panic!("Unknown Privilege mode"),
             };
-            return Err(Trap {
+            Err(Trap {
                 trap_type: exception_type,
                 value: address,
-            });
+            })
         },
         disassemble: dump_empty,
     },
@@ -2780,7 +2789,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: |cpu, word, _address, evaluate| {
             let f = parse_format_i(word);
             let mut s = String::new();
-            s += &format!("{}", get_register_name(f.rd));
+            s += get_register_name(f.rd);
             if evaluate {
                 s += &format!(":{:x}", cpu.x[f.rd]);
             }
@@ -2788,7 +2797,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             if evaluate {
                 s += &format!(":{:x}", cpu.x[f.rs1]);
             }
-            s += &format!(")");
+            s += ")";
             s
         },
     },
@@ -3372,7 +3381,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         name: "SRAIW",
         operation: |cpu, word, _address| {
             let f = parse_format_r(word);
-            let shamt = ((word >> 20) & 0x1f) as u32;
+            let shamt = (word >> 20) & 0x1f;
             cpu.x[f.rd] = ((cpu.x[f.rs1] as i32) >> shamt) as i64;
             Ok(())
         },
@@ -3744,7 +3753,7 @@ mod test_cpu {
     use super::*;
 
     fn create_cpu() -> Cpu {
-        Cpu::new()
+        Cpu::default()
     }
 
     #[test]
@@ -3938,10 +3947,7 @@ mod test_cpu {
         cpu.get_mut_mmu().init_memory(4);
         cpu.update_pc(memory_base);
         // write WFI instruction
-        match cpu
-            .get_mut_mmu()
-            .store_word(memory_base, wfi_instruction)
-        {
+        match cpu.get_mut_mmu().store_word(memory_base, wfi_instruction) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };
@@ -4046,10 +4052,7 @@ mod test_cpu {
             Err(_e) => panic!("Failed to store"),
         };
         // Write non-compressed "addi x1, x1, 1" instruction
-        match cpu
-            .get_mut_mmu()
-            .store_word(memory_base + 4, 0x00108093)
-        {
+        match cpu.get_mut_mmu().store_word(memory_base + 4, 0x00108093) {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         };

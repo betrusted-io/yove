@@ -29,7 +29,7 @@ impl Memory {
 	/// * `address`
 	pub fn read_byte(&self, address: u64) -> u8 {
 		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
+		let pos = (address % 8) * 8;
 		(self.data[index] >> pos) as u8
 	}
 
@@ -40,7 +40,7 @@ impl Memory {
 	pub fn read_halfword(&self, address: u64) -> u16 {
 		if (address % 2) == 0 {
 			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
+			let pos = (address % 8) * 8;
 			(self.data[index] >> pos) as u16
 		} else {
 			self.read_bytes(address, 2) as u16
@@ -54,7 +54,7 @@ impl Memory {
 	pub fn read_word(&self, address: u64) -> u32 {
 		if (address % 4) == 0 {
 			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
+			let pos = (address % 8) * 8;
 			(self.data[index] >> pos) as u32
 		} else {
 			self.read_bytes(address, 4) as u32
@@ -82,7 +82,7 @@ impl Memory {
 	/// * `address`
 	/// * `width` up to eight
 	pub fn read_bytes(&self, address: u64, width: u64) -> u64 {
-		let mut data = 0 as u64;
+		let mut data = 0;
 		for i in 0..width {
 			data |= (self.read_byte(address.wrapping_add(i)) as u64) << (i * 8);
 		}
@@ -96,7 +96,7 @@ impl Memory {
 	/// * `value`
 	pub fn write_byte(&mut self, address: u64, value: u8) {
 		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
+		let pos = (address % 8) * 8;
 		self.data[index] = (self.data[index] & !(0xff << pos)) | ((value as u64) << pos);
 	}
 
@@ -108,7 +108,7 @@ impl Memory {
 	pub fn write_halfword(&mut self, address: u64, value: u16) {
 		if (address % 2) == 0 {
 			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
+			let pos = (address % 8) * 8;
 			self.data[index] = (self.data[index] & !(0xffff << pos)) | ((value as u64) << pos);
 		} else {
 			self.write_bytes(address, value as u64, 2);
@@ -123,7 +123,7 @@ impl Memory {
 	pub fn write_word(&mut self, address: u64, value: u32) {
 		if (address % 4) == 0 {
 			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
+			let pos = (address % 8) * 8;
 			self.data[index] = (self.data[index] & !(0xffffffff << pos)) | ((value as u64) << pos);
 		} else {
 			self.write_bytes(address, value as u64, 4);
@@ -164,6 +164,12 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	pub fn validate_address(&self, address: u64) -> bool {
-		return (address as usize) < self.data.len()
+		(address as usize) < self.data.len()
 	}
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self::new()
+    }
 }

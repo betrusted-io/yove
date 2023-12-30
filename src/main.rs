@@ -1,5 +1,7 @@
 use std::io::Read;
 
+mod xous;
+
 #[derive(Debug)]
 enum LoadError {
     IncorrectFormat,
@@ -359,6 +361,7 @@ fn main() {
     let mut cpu = riscv_cpu::CpuBuilder::new()
         .memory_size(16 * 1024 * 1024)
         .xlen(riscv_cpu::Xlen::Bit32)
+        .handler(Box::new(xous::XousHandler {}))
         .build();
 
     load_program_to_cpu(&mut cpu, &std_tests).expect("couldn't load std-tests");

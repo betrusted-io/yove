@@ -542,7 +542,7 @@ impl Mmu {
             return Ok(p_page | (address & 0xfff));
         }
 
-        let p_address = match self.addressing_mode {
+        match self.addressing_mode {
             AddressingMode::None => Ok(address),
             AddressingMode::SV32 => match privilege_mode {
                 // @TODO: Optimize
@@ -600,7 +600,7 @@ impl Mmu {
             AddressingMode::SV48 => {
                 panic!("AddressingMode SV48 is not supported yet.");
             }
-        };
+        }
 
         // if self.page_cache_enabled {
         //     match p_address {
@@ -617,7 +617,7 @@ impl Mmu {
         //         Err(()) => Err(()),
         //     }
         // } else {
-        p_address
+        // p_address
         // }
     }
 

@@ -3,8 +3,6 @@ use std::sync::{Arc, RwLock};
 pub use super::mmu::Memory;
 use super::mmu::{AddressingMode, Mmu};
 
-const DEFAULT_MEMORY_BASE: u64 = 0x80000000;
-
 const CSR_CAPACITY: usize = 4096;
 
 const CSR_USTATUS_ADDRESS: u16 = 0x000;
@@ -361,13 +359,13 @@ impl Cpu {
             );
         };
 
-        println!(
-            "pc @ 0x{:08x}: {:08x} {} {}",
-            instruction_address,
-            original_word,
-            inst.name,
-            (inst.disassemble)(self, original_word, self.pc, true)
-        );
+        // println!(
+        //     "pc @ 0x{:08x}: {:08x} {} {}",
+        //     instruction_address,
+        //     original_word,
+        //     inst.name,
+        //     (inst.disassemble)(self, original_word, self.pc, true)
+        // );
         let result = (inst.operation)(self, word, instruction_address);
         self.x[0] = 0; // hardwired zero
         result
@@ -528,6 +526,7 @@ impl Cpu {
     }
 
     fn handle_exception(&mut self, exception: Trap, instruction_address: u64) {
+        println!("!!! Exception Trap !!!: {:x?}", exception);
         self.handle_trap(exception, instruction_address, false);
     }
 
@@ -677,7 +676,7 @@ impl Cpu {
         // So, this trap should be taken
 
         self.privilege_mode = new_privilege_mode;
-        self.mmu.update_privilege_mode(self.privilege_mode.clone());
+        self.mmu.update_privilege_mode(self.privilege_mode);
         let csr_epc_address = match self.privilege_mode {
             PrivilegeMode::Machine => CSR_MEPC_ADDRESS,
             PrivilegeMode::Supervisor => CSR_SEPC_ADDRESS,
@@ -3072,7 +3071,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                 3 => PrivilegeMode::Machine,
                 _ => panic!(), // Shouldn't happen
             };
-            cpu.mmu.update_privilege_mode(cpu.privilege_mode.clone());
+            cpu.mmu.update_privilege_mode(cpu.privilege_mode);
             Ok(())
         },
         disassemble: dump_empty,
@@ -3440,7 +3439,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                 _ => panic!(), // Shouldn't happen
             };
             println!("Updating privilege mode to {:?}", cpu.privilege_mode);
-            cpu.mmu.update_privilege_mode(cpu.privilege_mode.clone());
+            cpu.mmu.update_privilege_mode(cpu.privilege_mode);
             Ok(())
         },
         disassemble: dump_empty,

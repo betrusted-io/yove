@@ -1,4 +1,7 @@
-use crate::mmu::{AddressingMode, Mmu};
+use std::sync::{Arc, RwLock};
+
+pub use super::mmu::Memory;
+use super::mmu::{AddressingMode, Mmu};
 
 const DEFAULT_MEMORY_BASE: u64 = 0x80000000;
 
@@ -53,10 +56,6 @@ pub const MIP_SEIP: u64 = 0x200;
 const MIP_STIP: u64 = 0x020;
 const MIP_SSIP: u64 = 0x002;
 
-pub trait EventHandler {
-    fn handle_event(&mut self, cpu: &mut Cpu, args: [i64; 8]) -> [i64; 8];
-}
-
 /// Emulates a RISC-V CPU core
 pub struct Cpu {
     clock: u64,
@@ -70,13 +69,12 @@ pub struct Cpu {
     pc: u64,
     csr: [u64; CSR_CAPACITY],
     mmu: Mmu,
+    memory: Arc<RwLock<dyn Memory + Send + Sync>>,
     reservation: u64, // @TODO: Should support multiple address reservations
     is_reservation_set: bool,
     _dump_flag: bool,
     // decode_cache: DecodeCache,
     unsigned_data_mask: u64,
-    memory_base: u64,
-    handler: Option<Box<dyn EventHandler>>,
 }
 
 #[derive(Clone)]
@@ -85,7 +83,7 @@ pub enum Xlen {
     Bit64, // @TODO: Support Bit128
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum PrivilegeMode {
     User,
     Supervisor,
@@ -146,7 +144,7 @@ fn get_privilege_encoding(mode: &PrivilegeMode) -> u8 {
 }
 
 /// Returns `PrivilegeMode` from encoded privilege mode bits
-pub fn get_privilege_mode(encoding: u64) -> PrivilegeMode {
+pub fn decode_privilege_mode(encoding: u64) -> PrivilegeMode {
     match encoding {
         0 => PrivilegeMode::User,
         1 => PrivilegeMode::Supervisor,
@@ -217,18 +215,14 @@ fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
 
 pub struct CpuBuilder {
     xlen: Xlen,
-    memory_size: u64,
-    memory_base: u64,
-    handler: Option<Box<dyn EventHandler>>,
+    memory: Arc<RwLock<dyn Memory + Send + Sync>>,
 }
 
 impl CpuBuilder {
-    pub fn new() -> Self {
+    pub fn new(memory: Arc<RwLock<dyn Memory + Send + Sync>>) -> Self {
         CpuBuilder {
             xlen: Xlen::Bit64,
-            memory_size: 0,
-            memory_base: DEFAULT_MEMORY_BASE,
-            handler: None,
+            memory,
         }
     }
 
@@ -237,36 +231,10 @@ impl CpuBuilder {
         self
     }
 
-    pub fn memory_size(mut self, memory_size: u64) -> Self {
-        self.memory_size = memory_size;
-        self
-    }
-
-    pub fn handler(mut self, handler: Box<dyn EventHandler>) -> Self {
-        self.handler = Some(handler);
-        self
-    }
-
     pub fn build(self) -> Cpu {
-        let mut cpu = Cpu::new(self.memory_base);
+        let mut cpu = Cpu::new(self.memory);
         cpu.update_xlen(self.xlen.clone());
-        cpu.mmu.init_memory(self.memory_size);
-        if self.handler.is_some() {
-            cpu.set_handler(self.handler);
-        }
         cpu
-    }
-}
-
-impl Default for CpuBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Default for Cpu {
-    fn default() -> Self {
-        Self::new(DEFAULT_MEMORY_BASE)
     }
 }
 
@@ -275,7 +243,7 @@ impl Cpu {
     ///
     /// # Arguments
     /// * `Terminal`
-    pub fn new(memory_base: u64) -> Self {
+    pub fn new(memory: Arc<RwLock<dyn Memory + Send + Sync>>) -> Self {
         Cpu {
             clock: 0,
             xlen: Xlen::Bit64,
@@ -285,27 +253,18 @@ impl Cpu {
             f: [0.0; 32],
             pc: 0,
             csr: [0; CSR_CAPACITY],
-            mmu: Mmu::new(Xlen::Bit64, memory_base),
+            mmu: Mmu::new(Xlen::Bit64, memory.clone()),
             reservation: 0,
             is_reservation_set: false,
             _dump_flag: false,
             // decode_cache: DecodeCache::new(),
             unsigned_data_mask: 0xffffffffffffffff,
-            memory_base,
-            handler: None,
+            memory,
         }
         // let mut cpu = ;
         // cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
         // cpu.write_csr_raw(CSR_MISA_ADDRESS, 0x800000008014312f);
         // cpu
-    }
-
-    /// Assigns an event handler to the CPU.
-    ///
-    /// # Arguments
-    /// * `handler` An object that implements the [`EventHandler`](trait.EventHandler.html) trait
-    pub fn set_handler(&mut self, handler: Option<Box<dyn EventHandler>>) {
-        self.handler = handler;
     }
 
     /// Updates Program Counter content
@@ -1507,13 +1466,13 @@ impl Cpu {
         &mut self.mmu
     }
 
-    pub fn memory_base(&self) -> u64 {
-        self.memory_base
-    }
+    // pub fn memory_base(&self) -> u64 {
+    //     self.memory_base
+    // }
 
-    pub fn memory_size(&self) -> u64 {
-        self.mmu.memory_size()
-    }
+    // pub fn memory_size(&self) -> u64 {
+    //     self.mmu.memory_size()
+    // }
 
     pub fn phys_read_u32(&self, address: u64) -> u32 {
         self.mmu.load_word_raw(address)
@@ -2455,30 +2414,27 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         mask: 0xffffffff,
         data: 0x00000073,
         name: "ECALL",
-        operation: |cpu, _word, address| {
-            if let Some(mut handler) = cpu.handler.take() {
-                let mut args = [0i64; 8];
-                for (src, dest) in cpu.x[10..].iter().zip(args.iter_mut()) {
-                    *dest = *src;
-                }
-                let result = handler.handle_event(cpu, args);
-                for (src, dest) in result.iter().zip(cpu.x[10..].iter_mut()) {
-                    *dest = *src;
-                }
-                cpu.handler = Some(handler);
-                return Ok(());
+        operation: |cpu, _word, _address| {
+            let mut args = [0i64; 8];
+            for (src, dest) in cpu.x[10..].iter().zip(args.iter_mut()) {
+                *dest = *src;
             }
+            let result = cpu.memory.write().unwrap().syscall(args);
+            for (src, dest) in result.iter().zip(cpu.x[10..].iter_mut()) {
+                *dest = *src;
+            }
+            Ok(())
 
-            let exception_type = match cpu.privilege_mode {
-                PrivilegeMode::User => TrapType::EnvironmentCallFromUMode,
-                PrivilegeMode::Supervisor => TrapType::EnvironmentCallFromSMode,
-                PrivilegeMode::Machine => TrapType::EnvironmentCallFromMMode,
-                PrivilegeMode::Reserved => panic!("Unknown Privilege mode"),
-            };
-            Err(Trap {
-                trap_type: exception_type,
-                value: address,
-            })
+            // let exception_type = match cpu.privilege_mode {
+            //     PrivilegeMode::User => TrapType::EnvironmentCallFromUMode,
+            //     PrivilegeMode::Supervisor => TrapType::EnvironmentCallFromSMode,
+            //     PrivilegeMode::Machine => TrapType::EnvironmentCallFromMMode,
+            //     PrivilegeMode::Reserved => panic!("Unknown Privilege mode"),
+            // };
+            // Err(Trap {
+            //     trap_type: exception_type,
+            //     value: address,
+            // })
         },
         disassemble: dump_empty,
     },
@@ -3102,7 +3058,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             let status = cpu.read_csr_raw(CSR_MSTATUS_ADDRESS);
             let mpie = (status >> 7) & 1;
             let mpp = (status >> 11) & 0x3;
-            let mprv = match get_privilege_mode(mpp) {
+            let mprv = match decode_privilege_mode(mpp) {
                 PrivilegeMode::Machine => (status >> 17) & 1,
                 _ => 0,
             };
@@ -3470,7 +3426,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             let status = cpu.read_csr_raw(CSR_SSTATUS_ADDRESS);
             let spie = (status >> 5) & 1;
             let spp = (status >> 8) & 1;
-            let mprv = match get_privilege_mode(spp) {
+            let mprv = match decode_privilege_mode(spp) {
                 PrivilegeMode::Machine => (status >> 17) & 1,
                 _ => 0,
             };

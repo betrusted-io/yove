@@ -22,6 +22,12 @@ pub enum Syscall {
         i64, /* number of bytes to add */
         i64, /* memory flags */
     ),
+    MapMemory(
+        i64, /* address */
+        i64, /* size */
+        i64, /* flags */
+        i64, /* name */
+    ),
 }
 
 #[derive(Debug)]
@@ -50,6 +56,7 @@ impl From<[i64; 8]> for Syscall {
     fn from(value: [i64; 8]) -> Self {
         match value[0].into() {
             SyscallNumber::IncreaseHeap => Syscall::IncreaseHeap(value[1], value[2]),
+            SyscallNumber::MapMemory => Syscall::MapMemory(value[1], value[2], value[3], value[4]),
             _ => Syscall::Unknown(value),
         }
     }

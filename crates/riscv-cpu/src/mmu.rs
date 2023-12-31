@@ -1,9 +1,22 @@
-use std::{collections::HashMap, num::NonZeroU64};
-
-use crate::{
-    cpu::{get_privilege_mode, PrivilegeMode, Trap, TrapType, Xlen},
-    memory::Memory,
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
 };
+
+use crate::cpu::{decode_privilege_mode, PrivilegeMode, Trap, TrapType, Xlen};
+
+pub trait Memory {
+    fn read_u8(&self, p_address: u64) -> u8;
+    fn read_u16(&self, p_address: u64) -> u16;
+    fn read_u32(&self, p_address: u64) -> u32;
+    fn read_u64(&self, p_address: u64) -> u64;
+    fn write_u8(&mut self, p_address: u64, value: u8);
+    fn write_u16(&mut self, p_address: u64, value: u16);
+    fn write_u32(&mut self, p_address: u64, value: u32);
+    fn write_u64(&mut self, p_address: u64, value: u64);
+    fn validate_address(&self, address: u64) -> bool;
+    fn syscall(&mut self, args: [i64; 8]) -> [i64; 8];
+}
 
 /// Emulates Memory Management Unit. It holds the Main memory and peripheral
 /// devices, maps address to them, and accesses them depending on address.
@@ -16,11 +29,10 @@ pub struct Mmu {
     ppn: u64,
     addressing_mode: AddressingMode,
     privilege_mode: PrivilegeMode,
-    memory: MemoryWrapper,
+    memory: Arc<RwLock<dyn Memory + Send + Sync>>,
 
-    /// The size of main memory (if initialized)
-    memory_length: Option<NonZeroU64>,
-
+    // /// The size of main memory (if initialized)
+    // memory_length: Option<NonZeroU64>,
     /// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
     /// then `Mmu` has copy of it.
     mstatus: u64,
@@ -71,27 +83,19 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `xlen`
-    /// * `terminal`
-    pub fn new(xlen: Xlen, dram_base: u64) -> Self {
-        // // Load default device tree binary content
-        // let content = include_bytes!("./device/dtb.dtb");
-        // for i in 0..content.len() {
-        // 	dtb[i] = content[i];
-        // }
-
+    pub fn new(xlen: Xlen, memory: Arc<RwLock<dyn Memory + Send + Sync>>) -> Self {
         Mmu {
             // clock: 0,
             xlen,
             ppn: 0,
             addressing_mode: AddressingMode::None,
             privilege_mode: PrivilegeMode::Machine,
-            memory: MemoryWrapper::new(dram_base),
+            memory,
             mstatus: 0,
             page_cache_enabled: false,
             fetch_page_cache: HashMap::default(),
             load_page_cache: HashMap::default(),
             store_page_cache: HashMap::default(),
-            memory_length: None,
         }
     }
 
@@ -104,19 +108,19 @@ impl Mmu {
         self.clear_page_cache();
     }
 
-    /// Initializes Main memory. This method is expected to be called only once.
-    ///
-    /// # Arguments
-    /// * `capacity`
-    pub fn init_memory(&mut self, capacity: u64) {
-        assert!(self.memory_length.is_none());
-        self.memory_length = Some(NonZeroU64::new(capacity).unwrap());
-        self.memory.init(capacity);
-    }
+    // /// Initializes Main memory. This method is expected to be called only once.
+    // ///
+    // /// # Arguments
+    // /// * `capacity`
+    // pub fn init_memory(&mut self, capacity: u64) {
+    //     assert!(self.memory_length.is_none());
+    //     self.memory_length = Some(NonZeroU64::new(capacity).unwrap());
+    //     self.memory.init(capacity);
+    // }
 
-    pub fn memory_size(&self) -> u64 {
-        self.memory_length.unwrap().get()
-    }
+    // pub fn memory_size(&self) -> u64 {
+    //     self.memory_length.unwrap().get()
+    // }
 
     /// Enables or disables page cache optimization.
     ///
@@ -185,7 +189,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `v_address` Virtual address
-    fn fetch(&mut self, v_address: u64) -> Result<u8, Trap> {
+    fn fetch(&self, v_address: u64) -> Result<u8, Trap> {
         self.translate_address(v_address, &MemoryAccessType::Execute)
             .map(|p_address| self.load_raw(p_address))
             .map_err(|()| Trap {
@@ -199,7 +203,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `v_address` Virtual address
-    pub fn fetch_word(&mut self, v_address: u64) -> Result<u32, Trap> {
+    pub fn fetch_word(&self, v_address: u64) -> Result<u32, Trap> {
         let width = 4;
         if (v_address & 0xfff) <= (0x1000 - width) {
             // Fast path. All bytes fetched are in the same page so
@@ -228,7 +232,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `v_address` Virtual address
-    pub fn load(&mut self, v_address: u64) -> Result<u8, Trap> {
+    pub fn load(&self, v_address: u64) -> Result<u8, Trap> {
         let effective_address = self.trim_to_xlen(v_address);
         match self.translate_address(effective_address, &MemoryAccessType::Read) {
             Ok(p_address) => Ok(self.load_raw(p_address)),
@@ -245,7 +249,7 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     /// * `width` Must be 1, 2, 4, or 8
-    fn load_bytes(&mut self, v_address: u64, width: u64) -> Result<u64, Trap> {
+    fn load_bytes(&self, v_address: u64, width: u64) -> Result<u64, Trap> {
         debug_assert!(
             width == 1 || width == 2 || width == 4 || width == 8,
             "Width must be 1, 2, 4, or 8. {:X}",
@@ -287,7 +291,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `v_address` Virtual address
-    pub fn load_halfword(&mut self, v_address: u64) -> Result<u16, Trap> {
+    pub fn load_halfword(&self, v_address: u64) -> Result<u16, Trap> {
         self.load_bytes(v_address, 2).map(|data| data as u16)
     }
 
@@ -296,7 +300,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `v_address` Virtual address
-    pub fn load_word(&mut self, v_address: u64) -> Result<u32, Trap> {
+    pub fn load_word(&self, v_address: u64) -> Result<u32, Trap> {
         self.load_bytes(v_address, 4).map(|data| data as u32)
     }
 
@@ -305,7 +309,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `v_address` Virtual address
-    pub fn load_doubleword(&mut self, v_address: u64) -> Result<u64, Trap> {
+    pub fn load_doubleword(&self, v_address: u64) -> Result<u64, Trap> {
         self.load_bytes(v_address, 8)
     }
 
@@ -315,7 +319,7 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     /// * `value`
-    pub fn store(&mut self, v_address: u64, value: u8) -> Result<(), Trap> {
+    pub fn store(&self, v_address: u64, value: u8) -> Result<(), Trap> {
         self.translate_address(v_address, &MemoryAccessType::Write)
             .map(|p_address| self.store_raw(p_address, value))
             .map_err(|()| Trap {
@@ -331,7 +335,7 @@ impl Mmu {
     /// * `v_address` Virtual address
     /// * `value` data written
     /// * `width` Must be 1, 2, 4, or 8
-    fn store_bytes(&mut self, v_address: u64, value: u64, width: u64) -> Result<(), Trap> {
+    fn store_bytes(&self, v_address: u64, value: u64, width: u64) -> Result<(), Trap> {
         debug_assert!(
             width == 1 || width == 2 || width == 4 || width == 8,
             "Width must be 1, 2, 4, or 8. {:X}",
@@ -374,7 +378,7 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     /// * `value` data written
-    pub fn store_halfword(&mut self, v_address: u64, value: u16) -> Result<(), Trap> {
+    pub fn store_halfword(&self, v_address: u64, value: u16) -> Result<(), Trap> {
         self.store_bytes(v_address, value as u64, 2)
     }
 
@@ -384,7 +388,7 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     /// * `value` data written
-    pub fn store_word(&mut self, v_address: u64, value: u32) -> Result<(), Trap> {
+    pub fn store_word(&self, v_address: u64, value: u32) -> Result<(), Trap> {
         self.store_bytes(v_address, value as u64, 4)
     }
 
@@ -394,7 +398,7 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     /// * `value` data written
-    pub fn store_doubleword(&mut self, v_address: u64, value: u64) -> Result<(), Trap> {
+    pub fn store_doubleword(&self, v_address: u64, value: u64) -> Result<(), Trap> {
         self.store_bytes(v_address, value, 8)
     }
 
@@ -404,7 +408,10 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     pub(crate) fn load_raw(&self, p_address: u64) -> u8 {
-        self.memory.read_byte(self.trim_to_xlen(p_address))
+        self.memory
+            .read()
+            .unwrap()
+            .read_u8(self.trim_to_xlen(p_address))
     }
 
     /// Loads two bytes from main memory or peripheral devices depending on
@@ -413,7 +420,10 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     fn load_halfword_raw(&self, p_address: u64) -> u16 {
-        self.memory.read_halfword(self.trim_to_xlen(p_address))
+        self.memory
+            .read()
+            .unwrap()
+            .read_u16(self.trim_to_xlen(p_address))
     }
 
     /// Loads four bytes from main memory or peripheral devices depending on
@@ -422,7 +432,10 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     pub fn load_word_raw(&self, p_address: u64) -> u32 {
-        self.memory.read_word(self.trim_to_xlen(p_address))
+        self.memory
+            .read()
+            .unwrap()
+            .read_u32(self.trim_to_xlen(p_address))
     }
 
     /// Loads eight bytes from main memory or peripheral devices depending on
@@ -431,7 +444,10 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     fn load_doubleword_raw(&self, p_address: u64) -> u64 {
-        self.memory.read_doubleword(self.trim_to_xlen(p_address))
+        self.memory
+            .read()
+            .unwrap()
+            .read_u64(self.trim_to_xlen(p_address))
     }
 
     /// Stores a byte to main memory or peripheral devices depending on
@@ -440,8 +456,11 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     /// * `value` data written
-    pub(crate) fn store_raw(&mut self, p_address: u64, value: u8) {
-        self.memory.write_byte(self.trim_to_xlen(p_address), value)
+    pub(crate) fn store_raw(&self, p_address: u64, value: u8) {
+        self.memory
+            .write()
+            .unwrap()
+            .write_u8(self.trim_to_xlen(p_address), value)
     }
 
     /// Stores two bytes to main memory or peripheral devices depending on
@@ -450,9 +469,11 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     /// * `value` data written
-    pub(crate) fn store_halfword_raw(&mut self, p_address: u64, value: u16) {
+    pub(crate) fn store_halfword_raw(&self, p_address: u64, value: u16) {
         self.memory
-            .write_halfword(self.trim_to_xlen(p_address), value)
+            .write()
+            .unwrap()
+            .write_u16(self.trim_to_xlen(p_address), value)
     }
 
     /// Stores four bytes to main memory or peripheral devices depending on
@@ -461,8 +482,11 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     /// * `value` data written
-    pub(crate) fn store_word_raw(&mut self, p_address: u64, value: u32) {
-        self.memory.write_word(self.trim_to_xlen(p_address), value)
+    pub(crate) fn store_word_raw(&self, p_address: u64, value: u32) {
+        self.memory
+            .write()
+            .unwrap()
+            .write_u32(self.trim_to_xlen(p_address), value)
     }
 
     /// Stores eight bytes to main memory or peripheral devices depending on
@@ -471,9 +495,11 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     /// * `value` data written
-    fn store_doubleword_raw(&mut self, p_address: u64, value: u64) {
+    fn store_doubleword_raw(&self, p_address: u64, value: u64) {
         self.memory
-            .write_doubleword(self.trim_to_xlen(p_address), value)
+            .write()
+            .unwrap()
+            .write_u64(self.trim_to_xlen(p_address), value)
     }
 
     /// Checks if passed virtual address is valid (pointing a certain device) or not.
@@ -481,18 +507,26 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `v_address` Virtual address
-    pub fn validate_address(&mut self, v_address: u64) -> Option<bool> {
-        if let Ok(p_address) = self.translate_address(v_address, &MemoryAccessType::DontCare) {
-            Some(self.memory.validate_address(self.trim_to_xlen(p_address)))
-        } else {
-            None
-        }
+    pub fn validate_address(&self, v_address: u64) -> Option<bool> {
+        self.translate_address(v_address, &MemoryAccessType::DontCare)
+            .ok()
+            .map(|p_address| {
+                self.memory
+                    .write()
+                    .unwrap()
+                    .validate_address(self.trim_to_xlen(p_address))
+            })
     }
 
-    fn translate_address(
-        &mut self,
+    fn translate_address(&self, v_address: u64, access_type: &MemoryAccessType) -> Result<u64, ()> {
+        self.translate_address_with_privilege_mode(v_address, access_type, self.privilege_mode)
+    }
+
+    fn translate_address_with_privilege_mode(
+        &self,
         v_address: u64,
         access_type: &MemoryAccessType,
+        privilege_mode: PrivilegeMode,
     ) -> Result<u64, ()> {
         let address = self.trim_to_xlen(v_address);
         let v_page = address & !0xfff;
@@ -510,28 +544,24 @@ impl Mmu {
 
         let p_address = match self.addressing_mode {
             AddressingMode::None => Ok(address),
-            AddressingMode::SV32 => match self.privilege_mode {
+            AddressingMode::SV32 => match privilege_mode {
                 // @TODO: Optimize
-                PrivilegeMode::Machine => match access_type {
-                    MemoryAccessType::Execute => Ok(address),
-                    // @TODO: Remove magic number
-                    _ => match (self.mstatus >> 17) & 1 {
-                        0 => Ok(address),
-                        _ => {
-                            let privilege_mode = get_privilege_mode((self.mstatus >> 9) & 3);
-                            match privilege_mode {
-                                PrivilegeMode::Machine => Ok(address),
-                                _ => {
-                                    let current_privilege_mode = self.privilege_mode.clone();
-                                    self.update_privilege_mode(privilege_mode);
-                                    let result = self.translate_address(v_address, access_type);
-                                    self.update_privilege_mode(current_privilege_mode);
-                                    result
-                                }
-                            }
+                PrivilegeMode::Machine => {
+                    if let MemoryAccessType::Execute = access_type {
+                        Ok(address)
+                    } else if (self.mstatus >> 17) & 1 == 0 {
+                        Ok(address)
+                    } else {
+                        match decode_privilege_mode((self.mstatus >> 9) & 3) {
+                            PrivilegeMode::Machine => Ok(address),
+                            temp_privilege_mode => self.translate_address_with_privilege_mode(
+                                v_address,
+                                access_type,
+                                temp_privilege_mode,
+                            ),
                         }
-                    },
-                },
+                    }
+                }
                 PrivilegeMode::User | PrivilegeMode::Supervisor => {
                     let vpns = [(address >> 12) & 0x3ff, (address >> 22) & 0x3ff];
                     self.traverse_page(address, 2 - 1, self.ppn, &vpns, access_type)
@@ -541,26 +571,22 @@ impl Mmu {
             AddressingMode::SV39 => match self.privilege_mode {
                 // @TODO: Optimize
                 // @TODO: Remove duplicated code with SV32
-                PrivilegeMode::Machine => match access_type {
-                    MemoryAccessType::Execute => Ok(address),
-                    // @TODO: Remove magic number
-                    _ => match (self.mstatus >> 17) & 1 {
-                        0 => Ok(address),
-                        _ => {
-                            let privilege_mode = get_privilege_mode((self.mstatus >> 9) & 3);
-                            match privilege_mode {
-                                PrivilegeMode::Machine => Ok(address),
-                                _ => {
-                                    let current_privilege_mode = self.privilege_mode.clone();
-                                    self.update_privilege_mode(privilege_mode);
-                                    let result = self.translate_address(v_address, access_type);
-                                    self.update_privilege_mode(current_privilege_mode);
-                                    result
-                                }
-                            }
+                PrivilegeMode::Machine => {
+                    if let MemoryAccessType::Execute = access_type {
+                        Ok(address)
+                    } else if (self.mstatus >> 17) & 1 == 0 {
+                        Ok(address)
+                    } else {
+                        match decode_privilege_mode((self.mstatus >> 9) & 3) {
+                            PrivilegeMode::Machine => Ok(address),
+                            temp_privilege_mode => self.translate_address_with_privilege_mode(
+                                v_address,
+                                access_type,
+                                temp_privilege_mode,
+                            ),
                         }
-                    },
-                },
+                    }
+                }
                 PrivilegeMode::User | PrivilegeMode::Supervisor => {
                     let vpns = [
                         (address >> 12) & 0x1ff,
@@ -576,27 +602,27 @@ impl Mmu {
             }
         };
 
-        if self.page_cache_enabled {
-            match p_address {
-                Ok(p_address) => {
-                    let p_page = p_address & !0xfff;
-                    match access_type {
-                        MemoryAccessType::Execute => self.fetch_page_cache.insert(v_page, p_page),
-                        MemoryAccessType::Read => self.load_page_cache.insert(v_page, p_page),
-                        MemoryAccessType::Write => self.store_page_cache.insert(v_page, p_page),
-                        MemoryAccessType::DontCare => None,
-                    };
-                    Ok(p_address)
-                }
-                Err(()) => Err(()),
-            }
-        } else {
-            p_address
-        }
+        // if self.page_cache_enabled {
+        //     match p_address {
+        //         Ok(p_address) => {
+        //             let p_page = p_address & !0xfff;
+        //             match access_type {
+        //                 MemoryAccessType::Execute => self.fetch_page_cache.insert(v_page, p_page),
+        //                 MemoryAccessType::Read => self.load_page_cache.insert(v_page, p_page),
+        //                 MemoryAccessType::Write => self.store_page_cache.insert(v_page, p_page),
+        //                 MemoryAccessType::DontCare => None,
+        //             };
+        //             Ok(p_address)
+        //         }
+        //         Err(()) => Err(()),
+        //     }
+        // } else {
+        p_address
+        // }
     }
 
     fn traverse_page(
-        &mut self,
+        &self,
         v_address: u64,
         level: u8,
         parent_ppn: u64,
@@ -724,98 +750,98 @@ impl Mmu {
     }
 }
 
-pub struct MemoryWrapper {
-    memory: Memory,
-    dram_base: u64,
-}
+// pub struct MemoryWrapper {
+//     memory: Memory,
+//     dram_base: u64,
+// }
 
-impl MemoryWrapper {
-    fn new(dram_base: u64) -> Self {
-        MemoryWrapper {
-            memory: Memory::new(),
-            dram_base,
-        }
-    }
+// impl MemoryWrapper {
+//     fn new(dram_base: u64) -> Self {
+//         MemoryWrapper {
+//             memory: Memory::new(),
+//             dram_base,
+//         }
+//     }
 
-    fn init(&mut self, capacity: u64) {
-        self.memory.init(capacity);
-    }
+//     fn init(&mut self, capacity: u64) {
+//         self.memory.init(capacity);
+//     }
 
-    pub fn read_byte(&self, p_address: u64) -> u8 {
-        debug_assert!(
-            p_address >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory.read_byte(p_address - self.dram_base)
-    }
+//     pub fn read_byte(&self, p_address: u64) -> u8 {
+//         debug_assert!(
+//             p_address >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory.read_byte(p_address - self.dram_base)
+//     }
 
-    pub fn read_halfword(&self, p_address: u64) -> u16 {
-        debug_assert!(
-            p_address >= self.dram_base && p_address.wrapping_add(1) >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory.read_halfword(p_address - self.dram_base)
-    }
+//     pub fn read_halfword(&self, p_address: u64) -> u16 {
+//         debug_assert!(
+//             p_address >= self.dram_base && p_address.wrapping_add(1) >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory.read_halfword(p_address - self.dram_base)
+//     }
 
-    pub fn read_word(&self, p_address: u64) -> u32 {
-        debug_assert!(
-            p_address >= self.dram_base && p_address.wrapping_add(3) >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory.read_word(p_address - self.dram_base)
-    }
+//     pub fn read_word(&self, p_address: u64) -> u32 {
+//         debug_assert!(
+//             p_address >= self.dram_base && p_address.wrapping_add(3) >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory.read_word(p_address - self.dram_base)
+//     }
 
-    pub fn read_doubleword(&self, p_address: u64) -> u64 {
-        debug_assert!(
-            p_address >= self.dram_base && p_address.wrapping_add(7) >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory.read_doubleword(p_address - self.dram_base)
-    }
+//     pub fn read_doubleword(&self, p_address: u64) -> u64 {
+//         debug_assert!(
+//             p_address >= self.dram_base && p_address.wrapping_add(7) >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory.read_doubleword(p_address - self.dram_base)
+//     }
 
-    pub fn write_byte(&mut self, p_address: u64, value: u8) {
-        debug_assert!(
-            p_address >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory.write_byte(p_address - self.dram_base, value)
-    }
+//     pub fn write_byte(&mut self, p_address: u64, value: u8) {
+//         debug_assert!(
+//             p_address >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory.write_byte(p_address - self.dram_base, value)
+//     }
 
-    pub fn write_halfword(&mut self, p_address: u64, value: u16) {
-        debug_assert!(
-            p_address >= self.dram_base && p_address.wrapping_add(1) >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory
-            .write_halfword(p_address - self.dram_base, value)
-    }
+//     pub fn write_halfword(&mut self, p_address: u64, value: u16) {
+//         debug_assert!(
+//             p_address >= self.dram_base && p_address.wrapping_add(1) >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory
+//             .write_halfword(p_address - self.dram_base, value)
+//     }
 
-    pub fn write_word(&mut self, p_address: u64, value: u32) {
-        debug_assert!(
-            p_address >= self.dram_base && p_address.wrapping_add(3) >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory.write_word(p_address - self.dram_base, value)
-    }
+//     pub fn write_word(&mut self, p_address: u64, value: u32) {
+//         debug_assert!(
+//             p_address >= self.dram_base && p_address.wrapping_add(3) >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory.write_word(p_address - self.dram_base, value)
+//     }
 
-    pub fn write_doubleword(&mut self, p_address: u64, value: u64) {
-        debug_assert!(
-            p_address >= self.dram_base && p_address.wrapping_add(7) >= self.dram_base,
-            "Memory address must equals to or bigger than self.dram_base. {:X}",
-            p_address
-        );
-        self.memory
-            .write_doubleword(p_address - self.dram_base, value)
-    }
+//     pub fn write_doubleword(&mut self, p_address: u64, value: u64) {
+//         debug_assert!(
+//             p_address >= self.dram_base && p_address.wrapping_add(7) >= self.dram_base,
+//             "Memory address must equals to or bigger than self.dram_base. {:X}",
+//             p_address
+//         );
+//         self.memory
+//             .write_doubleword(p_address - self.dram_base, value)
+//     }
 
-    pub fn validate_address(&self, address: u64) -> bool {
-        self.memory.validate_address(address - self.dram_base)
-    }
-}
+//     pub fn validate_address(&self, address: u64) -> bool {
+//         self.memory.validate_address(address - self.dram_base)
+//     }
+// }

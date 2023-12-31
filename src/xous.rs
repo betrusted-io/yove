@@ -1,5 +1,7 @@
 use riscv_cpu::cpu::EventHandler;
-// mod mem;
+mod definitions;
+
+use definitions::{Syscall, SyscallNumber, SyscallResultNumber};
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -27,7 +29,7 @@ const MMUFLAG_READABLE: u32 = 0x02;
 const MMUFLAG_WRITABLE: u32 = 0x04;
 const MMUFLAG_EXECUTABLE: u32 = 0x8;
 const MMUFLAG_USERMODE: u32 = 0x10;
-const MMUFLAG_GLOBAL: u32 = 0x20;
+// const MMUFLAG_GLOBAL: u32 = 0x20;
 const MMUFLAG_ACCESSED: u32 = 0x40;
 const MMUFLAG_DIRTY: u32 = 0x80;
 
@@ -38,6 +40,8 @@ pub struct XousHandler {
     allocator_offset: u32,
     satp: u32,
     l1_pt: u32,
+    heap_start: u32,
+    heap_size: u32,
 }
 
 impl XousHandler {
@@ -50,6 +54,8 @@ impl XousHandler {
             l1_pt: memory_base + 4096,
             allocator_offset: 8192,
             satp: ((4096 + memory_base) >> 12) | 0x8000_0000,
+            heap_start: 0xa000_0000,
+            heap_size: 0,
         }
     }
 
@@ -62,19 +68,14 @@ impl XousHandler {
     fn write_bytes(&mut self, cpu: &mut riscv_cpu::Cpu, data: &[u8], start: u32) {
         for (i, byte) in data.iter().enumerate() {
             let i = i as u32;
-            // self.print_mmu(cpu);
             self.ensure_page(cpu, start + i);
             let phys = self.virt_to_phys(cpu, start + i).unwrap();
-            // println!("Writing byte to {:08x}...", start + i);
-            // self.print_mmu(cpu);
-            if start + i == 0x258062 {
-                println!("Writing {:02x} to {:08x}", byte, start + i);
-            }
 
             cpu.phys_write_u8(phys as u64, *byte);
         }
     }
 
+    #[allow(dead_code)]
     pub fn print_mmu(&self, cpu: &riscv_cpu::Cpu) {
         println!("Memory Map:");
         for vpn1 in (0..4096).step_by(4) {
@@ -246,67 +247,35 @@ impl XousHandler {
     }
 }
 
-#[derive(Debug)]
-enum Syscall {
-    Unknown([i64; 8]),
-    IncreaseHeap(
-        i64, /* number of bytes to add */
-        i64, /* memory flags */
-    ),
-}
-
-#[derive(Debug)]
-pub enum SyscallNumber {
-    MapMemory = 2,
-    Yield = 3,
-    IncreaseHeap = 10,
-    UpdateMemoryFlags = 12,
-    ReceiveMessage = 15,
-    SendMessage = 16,
-    Connect = 17,
-    CreateThread = 18,
-    UnmapMemory = 19,
-    ReturnMemory = 20,
-    TerminateProcess = 22,
-    TrySendMessage = 24,
-    TryConnect = 25,
-    GetThreadId = 32,
-    JoinThread = 36,
-    AdjustProcessLimit = 38,
-    ReturnScalar = 40,
-    Unknown = 0,
-}
-
-impl From<[i64; 8]> for Syscall {
-    fn from(value: [i64; 8]) -> Self {
-        match value[0].into() {
-            SyscallNumber::IncreaseHeap => Syscall::IncreaseHeap(value[1], value[2]),
-            _ => Syscall::Unknown(value),
-        }
-    }
-}
-
-impl From<i64> for SyscallNumber {
-    fn from(value: i64) -> Self {
-        match value {
-            2 => SyscallNumber::MapMemory,
-            3 => SyscallNumber::Yield,
-            10 => SyscallNumber::IncreaseHeap,
-            12 => SyscallNumber::UpdateMemoryFlags,
-            15 => SyscallNumber::ReceiveMessage,
-            16 => SyscallNumber::SendMessage,
-            17 => SyscallNumber::Connect,
-            18 => SyscallNumber::CreateThread,
-            19 => SyscallNumber::UnmapMemory,
-            20 => SyscallNumber::ReturnMemory,
-            22 => SyscallNumber::TerminateProcess,
-            24 => SyscallNumber::TrySendMessage,
-            25 => SyscallNumber::TryConnect,
-            32 => SyscallNumber::GetThreadId,
-            36 => SyscallNumber::JoinThread,
-            38 => SyscallNumber::AdjustProcessLimit,
-            40 => SyscallNumber::ReturnScalar,
-            _ => SyscallNumber::Unknown,
+impl XousHandler {
+    fn syscall(&mut self, cpu: &mut riscv_cpu::Cpu, syscall: Syscall) -> [i64; 8] {
+        match syscall {
+            Syscall::IncreaseHeap(bytes, flags) => {
+                let heap_address = self.heap_start + self.heap_size;
+                if bytes < 0 {
+                    self.heap_size -= bytes.abs() as u32;
+                    panic!("Reducing size not supported!");
+                } else if bytes > 0 {
+                    for new_address in (heap_address..(heap_address + bytes as u32)).step_by(4096) {
+                        self.ensure_page(cpu, new_address);
+                    }
+                    self.heap_size += bytes as u32;
+                }
+                [
+                    SyscallResultNumber::MemoryRange as i64,
+                    heap_address as i64,
+                    bytes,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]
+            }
+            Syscall::Unknown(args) => {
+                println!("Unknown syscall {:?}: {:?}", SyscallNumber::from(args[0]), args);
+                [SyscallResultNumber::Unimplemented as _, 0, 0, 0, 0, 0, 0, 0]
+            }
         }
     }
 }
@@ -315,6 +284,6 @@ impl EventHandler for XousHandler {
     fn handle_event(&mut self, cpu: &mut riscv_cpu::Cpu, args: [i64; 8]) -> [i64; 8] {
         let syscall: Syscall = args.into();
         println!("Syscall {:?} with args: {:?}", syscall, &args[1..]);
-        [0; 8]
+        self.syscall(cpu, syscall)
     }
 }

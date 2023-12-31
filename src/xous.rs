@@ -51,7 +51,7 @@ struct Memory {
     free_pages: BTreeSet<usize>,
     heap_start: u32,
     heap_size: u32,
-    allocation_start: u32,
+    // allocation_start: u32,
     allocation_previous: u32,
     l1_pt: u32,
     satp: u32,
@@ -59,18 +59,18 @@ struct Memory {
 
 enum WorkerCommand {
     Start,
-    MemoryRange(u32 /* address */, u32 /* size */),
+    // MemoryRange(u32 /* address */, u32 /* size */),
 }
 
 enum WorkerResponse {
-    Started,
+    // Started,
     Exited(u32),
-    AllocateMemory(
-        u32, /* phys */
-        u32, /* virt */
-        u32, /* size */
-        u32, /* flags */
-    ),
+    // AllocateMemory(
+    //     u32, /* phys */
+    //     u32, /* virt */
+    //     u32, /* size */
+    //     u32, /* flags */
+    // ),
 }
 
 struct Worker {
@@ -126,7 +126,7 @@ impl Memory {
             heap_start: 0x6000_0000,
             heap_size: 0,
             allocation_previous: 0x4000_0000,
-            allocation_start: 0x4000_0000,
+            // allocation_start: 0x4000_0000,
         }
     }
 
@@ -375,13 +375,12 @@ impl riscv_cpu::cpu::Memory for Memory {
 
     fn syscall(&mut self, args: [i64; 8]) -> [i64; 8] {
         let syscall: Syscall = args.into();
-        println!("Syscall {:?} with args: {:?}", syscall, &args[1..]);
+        // println!("Syscall {:?} with args: {:?}", syscall, &args[1..]);
 
         print!("Syscall: ");
         match syscall {
             Syscall::IncreaseHeap(bytes, _flags) => {
                 println!("IncreaseHeap({} bytes, flags: {:02x})", bytes, _flags);
-                let heap_start = self.heap_start;
                 let heap_address = self.heap_start + self.heap_size;
                 match bytes {
                     bytes if bytes < 0 => {
@@ -411,6 +410,10 @@ impl riscv_cpu::cpu::Memory for Memory {
             }
 
             Syscall::MapMemory(phys, virt, size, _flags) => {
+                println!(
+                    "MapMemory(phys: {:08x}, virt: {:08x}, bytes: {}, flags: {:02x})",
+                    phys, virt, size, _flags
+                );
                 if virt != 0 {
                     unimplemented!("Non-zero virt address");
                 }
@@ -528,7 +531,6 @@ impl Machine {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_tx = self.worker_response_tx.clone();
-        let mem = self.memory.clone();
         std::thread::spawn(move || Worker::new(cpu, rx, worker_tx).run());
 
         self.workers.push(WorkerHandle { tx });

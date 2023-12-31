@@ -3438,7 +3438,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                 1 => PrivilegeMode::Supervisor,
                 _ => panic!(), // Shouldn't happen
             };
-            println!("Updating privilege mode to {:?}", cpu.privilege_mode);
+            // println!("Updating privilege mode to {:?}", cpu.privilege_mode);
             cpu.mmu.update_privilege_mode(cpu.privilege_mode);
             Ok(())
         },

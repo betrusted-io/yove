@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc::Receiver};
 
 pub use super::mmu::Memory;
 use super::mmu::{AddressingMode, Mmu};
@@ -53,6 +53,13 @@ pub const MIP_MSIP: u64 = 0x008;
 pub const MIP_SEIP: u64 = 0x200;
 const MIP_STIP: u64 = 0x020;
 const MIP_SSIP: u64 = 0x002;
+
+pub enum TickResult {
+    Ok,
+    ExitThread(u64),
+    PauseEmulation(Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+}
+
 
 /// Emulates a RISC-V CPU core
 pub struct Cpu {
@@ -120,6 +127,7 @@ pub enum TrapType {
     UserExternalInterrupt,
     SupervisorExternalInterrupt,
     MachineExternalInterrupt,
+    PauseEmulation(std::sync::mpsc::Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
 }
 
 fn _get_privilege_mode_name(mode: &PrivilegeMode) -> &'static str {
@@ -176,6 +184,7 @@ fn _get_trap_type_name(trap_type: &TrapType) -> &'static str {
         TrapType::UserExternalInterrupt => "UserExternalInterrupt",
         TrapType::SupervisorExternalInterrupt => "SupervisorExternalInterrupt",
         TrapType::MachineExternalInterrupt => "MachineExternalInterrupt",
+        TrapType::PauseEmulation(_) => "PauseEmulation",
     }
 }
 
@@ -199,6 +208,7 @@ fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
         TrapType::InstructionPageFault => 12,
         TrapType::LoadPageFault => 13,
         TrapType::StorePageFault => 15,
+        TrapType::PauseEmulation(_) => 16,
         TrapType::UserSoftwareInterrupt => interrupt_bit,
         TrapType::SupervisorSoftwareInterrupt => interrupt_bit + 1,
         TrapType::MachineSoftwareInterrupt => interrupt_bit + 3,
@@ -213,6 +223,8 @@ fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
 
 pub struct CpuBuilder {
     xlen: Xlen,
+    pc: u64,
+    sp: u64,
     memory: Arc<RwLock<dyn Memory + Send + Sync>>,
 }
 
@@ -221,6 +233,8 @@ impl CpuBuilder {
         CpuBuilder {
             xlen: Xlen::Bit64,
             memory,
+            pc: 0,
+            sp: 0,
         }
     }
 
@@ -229,9 +243,20 @@ impl CpuBuilder {
         self
     }
 
+    pub fn pc(mut self, pc: u64) -> Self {
+        self.pc = pc;
+        self
+    }
+
+    pub fn sp(mut self, sp: u64) -> Self {
+        self.sp = sp;
+        self
+    }
     pub fn build(self) -> Cpu {
         let mut cpu = Cpu::new(self.memory);
         cpu.update_xlen(self.xlen.clone());
+        cpu.update_pc(self.pc);
+        cpu.write_register(2, self.sp as i64);
         cpu
     }
 }
@@ -317,10 +342,22 @@ impl Cpu {
     }
 
     /// Runs program one cycle. Fetch, decode, and execution are completed in a cycle so far.
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> TickResult {
         let instruction_address = self.pc;
         match self.tick_operate() {
             Ok(()) => {}
+            Err(Trap {
+                trap_type: TrapType::PauseEmulation(rx),
+                ..
+            }) => {
+                return TickResult::PauseEmulation(rx);
+            }
+            Err(Trap {
+                trap_type: TrapType::InstructionPageFault,
+                value: 0xff803000,
+            }) => {
+                return TickResult::ExitThread(self.read_register(10) as u64);
+            }
             Err(e) => self.handle_exception(e, instruction_address),
         }
         self.mmu.tick(&mut self.csr[CSR_MIP_ADDRESS as usize]);
@@ -331,6 +368,8 @@ impl Cpu {
         // just an arbiraty ratio.
         // @TODO: Implement more properly
         self.write_csr_raw(CSR_CYCLE_ADDRESS, self.clock * 8);
+
+        TickResult::Ok
     }
 
     // @TODO: Rename?
@@ -742,7 +781,7 @@ impl Cpu {
         // println!("Fetching word from {:08x}...", self.pc);
         self.mmu.fetch_word(self.pc).map_err(|e| {
             self.pc = self.pc.wrapping_add(4); // @TODO: What if instruction is compressed?
-            println!("Fetch error: {:x?}", e);
+            // println!("Fetch error: {:x?}", e);
             e
         })
     }
@@ -1464,14 +1503,6 @@ impl Cpu {
     pub fn get_mut_mmu(&mut self) -> &mut Mmu {
         &mut self.mmu
     }
-
-    // pub fn memory_base(&self) -> u64 {
-    //     self.memory_base
-    // }
-
-    // pub fn memory_size(&self) -> u64 {
-    //     self.mmu.memory_size()
-    // }
 
     pub fn phys_read_u32(&self, address: u64) -> u32 {
         self.mmu.load_word_raw(address)
@@ -2413,16 +2444,23 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         mask: 0xffffffff,
         data: 0x00000073,
         name: "ECALL",
-        operation: |cpu, _word, _address| {
+        operation: |cpu, _word, address| {
             let mut args = [0i64; 8];
             for (src, dest) in cpu.x[10..].iter().zip(args.iter_mut()) {
                 *dest = *src;
             }
-            let result = cpu.memory.write().unwrap().syscall(args);
-            for (src, dest) in result.iter().zip(cpu.x[10..].iter_mut()) {
-                *dest = *src;
+            match cpu.memory.write().unwrap().syscall(args) {
+                super::mmu::SyscallResult::Ok(result) => {
+                    for (src, dest) in result.iter().zip(cpu.x[10..].iter_mut()) {
+                        *dest = *src;
+                    }
+                    Ok(())
+                }
+                super::mmu::SyscallResult::Defer(receiver) => Err(Trap {
+                    trap_type: TrapType::PauseEmulation(receiver),
+                    value: address,
+                }),
             }
-            Ok(())
 
             // let exception_type = match cpu.privilege_mode {
             //     PrivilegeMode::User => TrapType::EnvironmentCallFromUMode,

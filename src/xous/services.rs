@@ -1,3 +1,4 @@
+use std::sync::mpsc::Receiver;
 pub mod log;
 pub mod ticktimer;
 
@@ -5,6 +6,12 @@ pub enum ScalarResult {
     Scalar1(u32),
     Scalar2([u32; 2]),
     Scalar5([u32; 5]),
+    WaitForResponse(Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+}
+
+pub enum LendResult {
+    MemoryReturned([u32; 2]),
+    WaitForResponse(Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
 }
 
 pub trait Service {
@@ -14,14 +21,33 @@ pub trait Service {
     fn blocking_scalar(&mut self, sender: u32, opcode: u32, _args: [u32; 4]) -> ScalarResult {
         panic!("Unknown scalar to service {}: {}", sender, opcode);
     }
-    fn lend(&mut self, sender: u32, opcode: u32, _buf: &[u8], extra: [u32; 2]) -> [u32; 2] {
-        panic!("Unknown lend to service {}: {} ({:?})", sender, opcode, extra);
+    fn lend(&mut self, sender: u32, opcode: u32, _buf: &[u8], extra: [u32; 2]) -> LendResult {
+        panic!(
+            "Unknown lend to service {}: {} ({:?})",
+            sender, opcode, extra
+        );
     }
-    fn lend_mut(&mut self, sender: u32, opcode: u32, _buf: &mut [u8], extra: [u32; 2]) -> [u32; 2] {
-        panic!("Unknown lend_mut to service {}: {} ({:?})", sender, opcode, extra);
+
+    /// Mutable lend messages may block
+    fn lend_mut(
+        &mut self,
+        sender: u32,
+        opcode: u32,
+        _buf: &mut [u8],
+        extra: [u32; 2],
+    ) -> LendResult {
+        panic!(
+            "Unknown lend_mut to service {}: {} ({:?})",
+            sender, opcode, extra
+        );
     }
+
+    /// Send-type messages return immediately, and memory is detached from the host process.
     fn send(&mut self, sender: u32, opcode: u32, _buf: &[u8], extra: [u32; 2]) {
-        panic!("Unknown send to service {}: {} ({:?})", sender, opcode, extra);
+        panic!(
+            "Unknown send to service {}: {} ({:?})",
+            sender, opcode, extra
+        );
     }
 }
 

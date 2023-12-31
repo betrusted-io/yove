@@ -1,10 +1,12 @@
-use riscv_cpu::cpu::Memory as OtherMemory;
+use riscv_cpu::{cpu::Memory as OtherMemory, mmu::SyscallResult};
 mod definitions;
+mod services;
 
 use definitions::{Syscall, SyscallNumber, SyscallResultNumber};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
+        atomic::{AtomicI64, Ordering},
         mpsc::{Receiver, Sender},
         Arc, RwLock,
     },
@@ -44,6 +46,22 @@ const MMUFLAG_DIRTY: u32 = 0x80;
 
 impl std::error::Error for LoadError {}
 
+enum MemoryCommand {
+    Exit,
+    ExitThread(u32 /* tid */, u32 /* result */),
+    CreateThread(
+        u32,         /* entry point */
+        u32,         /* stack pointer */
+        u32,         /* stack length */
+        u32,         /* argument 1 */
+        u32,         /* argument 2 */
+        u32,         /* argument 3 */
+        u32,         /* argument 4 */
+        Sender<i64>, /* Thread ID */
+    ),
+    JoinThread(u32, Sender<([i64; 8], Option<(Vec<u8>, u64)>)>),
+}
+
 struct Memory {
     base: u32,
     data: HashMap<usize, [u8; 4096]>,
@@ -55,57 +73,57 @@ struct Memory {
     allocation_previous: u32,
     l1_pt: u32,
     satp: u32,
-}
-
-enum WorkerCommand {
-    Start,
-    // MemoryRange(u32 /* address */, u32 /* size */),
-}
-
-enum WorkerResponse {
-    // Started,
-    Exited(u32),
-    // AllocateMemory(
-    //     u32, /* phys */
-    //     u32, /* virt */
-    //     u32, /* size */
-    //     u32, /* flags */
-    // ),
+    connections: HashMap<u32, Box<dyn services::Service + Send + Sync>>,
+    memory_cmd: Sender<MemoryCommand>,
 }
 
 struct Worker {
     cpu: riscv_cpu::Cpu,
-    tx: Sender<WorkerResponse>,
-    rx: Receiver<WorkerCommand>,
+    cmd: Sender<MemoryCommand>,
+    tid: i64,
 }
 
 impl Worker {
-    fn new(
-        cpu: riscv_cpu::Cpu,
-        rx: Receiver<WorkerCommand>,
-        worker_response_tx: Sender<WorkerResponse>,
-    ) -> Self {
-        Self {
-            cpu,
-            tx: worker_response_tx,
-            rx,
-        }
+    fn new(cpu: riscv_cpu::Cpu, cmd: Sender<MemoryCommand>, tid: i64) -> Self {
+        Self { cpu, cmd, tid }
     }
     fn run(&mut self) {
-        self.rx.recv().unwrap();
-        for _tick in 0..1000 {
-            self.cpu.tick();
+        use riscv_cpu::cpu::TickResult;
+        loop {
+            match self.cpu.tick() {
+                TickResult::PauseEmulation(e) => {
+                    let (result, data) = e.recv().unwrap();
+                    if let Some(data) = data {
+                        let start = data.1;
+                        let data = data.0;
+                        let mmu = self.cpu.get_mut_mmu();
+                        for (offset, byte) in data.into_iter().enumerate() {
+                            mmu.store(offset as u64 + start, byte).unwrap();
+                        }
+                    }
+                    for (index, value) in result.iter().enumerate() {
+                        self.cpu.write_register(10 + index as u8, *value);
+                    }
+                }
+                TickResult::ExitThread(val) => {
+                    self.cmd
+                        .send(MemoryCommand::ExitThread(self.tid as u32, val as u32))
+                        .unwrap();
+                    // println!("Thread {} exited", self.tid);
+                    break;
+                }
+                TickResult::Ok => {}
+            }
         }
-        self.tx.send(WorkerResponse::Exited(1)).unwrap();
     }
 }
 
 struct WorkerHandle {
-    tx: Sender<WorkerCommand>,
+    joiner: std::thread::JoinHandle<()>,
 }
 
 impl Memory {
-    pub fn new(base: u32, size: usize) -> Self {
+    pub fn new(base: u32, size: usize) -> (Self, Receiver<MemoryCommand>) {
         let mut data = HashMap::new();
         let mut free_pages = BTreeSet::new();
         let mut allocated_pages = BTreeSet::new();
@@ -116,24 +134,54 @@ impl Memory {
         // Remove the l0 page table
         free_pages.remove(&(MEMORY_BASE as usize + 4096));
         allocated_pages.insert(MEMORY_BASE as usize + 4096);
-        Self {
-            base,
-            data,
-            allocated_pages,
-            free_pages,
-            l1_pt: MEMORY_BASE + 4096,
-            satp: ((4096 + MEMORY_BASE) >> 12) | 0x8000_0000,
-            heap_start: 0x6000_0000,
-            heap_size: 0,
-            allocation_previous: 0x4000_0000,
-            // allocation_start: 0x4000_0000,
-        }
+        let (memory_cmd, memory_cmd_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                base,
+                data,
+                allocated_pages,
+                free_pages,
+                l1_pt: MEMORY_BASE + 4096,
+                satp: ((4096 + MEMORY_BASE) >> 12) | 0x8000_0000,
+                heap_start: 0x6000_0000,
+                heap_size: 0,
+                allocation_previous: 0x4000_0000,
+                connections: HashMap::new(),
+                memory_cmd,
+            },
+            memory_cmd_rx,
+        )
     }
 
     fn allocate_page(&mut self) -> u32 {
         let page = self.free_pages.pop_first().expect("out of memory");
         self.allocated_pages.insert(page);
         page as u32
+    }
+
+    fn free_page(&mut self, page: u32) -> Result<(), ()> {
+        let phys = self.virt_to_phys(page).ok_or(())?;
+        if !self.allocated_pages.remove(&(phys as usize)) {
+            panic!("Page wasn't allocated!");
+        }
+        self.free_pages.insert(phys as usize);
+
+        let vpn1 = ((page >> 22) & ((1 << 10) - 1)) as usize * 4;
+        let vpn0 = ((page >> 12) & ((1 << 10) - 1)) as usize * 4;
+
+        // The root (l1) pagetable is defined to be mapped into our virtual
+        // address space at this address.
+
+        // If the level 1 pagetable doesn't exist, then this address is invalid
+        let l1_pt_entry = self.read_u32(self.l1_pt as u64 + vpn1 as u64);
+        if l1_pt_entry & MMUFLAG_VALID == 0 {
+            return Ok(());
+        }
+
+        let l0_pt_phys = ((l1_pt_entry >> 10) << 12) + vpn0 as u32;
+        self.write_u32(l0_pt_phys as u64, 0);
+
+        Ok(())
     }
 
     fn allocate_virt_region(&mut self, size: usize) -> Option<u32> {
@@ -373,14 +421,13 @@ impl riscv_cpu::cpu::Memory for Memory {
         address < self.data.len()
     }
 
-    fn syscall(&mut self, args: [i64; 8]) -> [i64; 8] {
+    fn syscall(&mut self, args: [i64; 8]) -> SyscallResult {
         let syscall: Syscall = args.into();
-        // println!("Syscall {:?} with args: {:?}", syscall, &args[1..]);
 
-        print!("Syscall: ");
+        // print!("Syscall: ");
         match syscall {
             Syscall::IncreaseHeap(bytes, _flags) => {
-                println!("IncreaseHeap({} bytes, flags: {:02x})", bytes, _flags);
+                // println!("IncreaseHeap({} bytes, flags: {:02x})", bytes, _flags);
                 let heap_address = self.heap_start + self.heap_size;
                 match bytes {
                     bytes if bytes < 0 => {
@@ -407,13 +454,14 @@ impl riscv_cpu::cpu::Memory for Memory {
                     0,
                     0,
                 ]
+                .into()
             }
 
             Syscall::MapMemory(phys, virt, size, _flags) => {
-                println!(
-                    "MapMemory(phys: {:08x}, virt: {:08x}, bytes: {}, flags: {:02x})",
-                    phys, virt, size, _flags
-                );
+                // println!(
+                //     "MapMemory(phys: {:08x}, virt: {:08x}, bytes: {}, flags: {:02x})",
+                //     phys, virt, size, _flags
+                // );
                 if virt != 0 {
                     unimplemented!("Non-zero virt address");
                 }
@@ -433,6 +481,227 @@ impl riscv_cpu::cpu::Memory for Memory {
                     0,
                     0,
                 ]
+                .into()
+            }
+            Syscall::Connect(id) => {
+                // println!(
+                //     "Connect([0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}])",
+                //     id[0], id[1], id[2], id[3]
+                // );
+                if let Some(service) = services::get_service(&id) {
+                    let connection_id = self.connections.len() as u32 + 1;
+                    self.connections.insert(connection_id, service);
+                    [
+                        SyscallResultNumber::ConnectionId as i64,
+                        connection_id as i64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into()
+                } else {
+                    [
+                        SyscallResultNumber::ConnectionId as i64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into()
+                }
+            }
+            Syscall::SendMessage(connection_id, kind, opcode, args) => {
+                // println!(
+                //     "SendMessage({}, {}, {}: {:x?})",
+                //     connection_id, kind, opcode, args
+                // );
+                let memory_region = if kind == 1 || kind == 2 || kind == 3 {
+                    let mut memory_region = vec![0; args[1] as usize];
+                    for (offset, value) in memory_region.iter_mut().enumerate() {
+                        *value = self.read_u8(
+                            self.virt_to_phys(args[0] + offset as u32)
+                                .expect("invalid memory address")
+                                as u64,
+                        );
+                    }
+                    Some(memory_region)
+                } else {
+                    None
+                };
+                let Some(service) = self.connections.get_mut(&connection_id) else {
+                    println!("Unhandled connection ID {}", connection_id);
+                    return [
+                        SyscallResultNumber::Error as i64,
+                        9, /* ServerNotFound */
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into();
+                };
+                match kind {
+                    1..=3 => {
+                        let mut memory_region = memory_region.unwrap();
+                        let extra = [args[2], args[3]];
+                        match kind {
+                            1 => match service.lend_mut(0, opcode, &mut memory_region, extra) {
+                                services::LendResult::WaitForResponse(msg) => msg.into(),
+                                services::LendResult::MemoryReturned(result) => {
+                                    for (offset, value) in memory_region.into_iter().enumerate() {
+                                        self.write_u8(args[0] as u64 + offset as u64, value);
+                                    }
+                                    [
+                                        SyscallResultNumber::MemoryReturned as i64,
+                                        result[0] as i64,
+                                        result[1] as i64,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                    ]
+                                    .into()
+                                }
+                            },
+                            2 => match service.lend(0, opcode, &memory_region, extra) {
+                                services::LendResult::WaitForResponse(msg) => msg.into(),
+                                services::LendResult::MemoryReturned(result) => [
+                                    SyscallResultNumber::MemoryReturned as i64,
+                                    result[0] as i64,
+                                    result[1] as i64,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                ]
+                                .into(),
+                            },
+                            3 => {
+                                service.send(0, opcode, &memory_region, extra);
+                                [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    4 => {
+                        service.scalar(0, opcode, args);
+                        [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
+                    }
+                    5 => match service.blocking_scalar(0, opcode, args) {
+                        services::ScalarResult::Scalar1(result) => [
+                            SyscallResultNumber::Scalar1 as i64,
+                            result as i64,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ]
+                        .into(),
+                        services::ScalarResult::Scalar2(result) => [
+                            SyscallResultNumber::Scalar2 as i64,
+                            result[0] as i64,
+                            result[1] as i64,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ]
+                        .into(),
+                        services::ScalarResult::Scalar5(result) => [
+                            SyscallResultNumber::Scalar5 as i64,
+                            result[0] as i64,
+                            result[1] as i64,
+                            result[2] as i64,
+                            result[3] as i64,
+                            result[4] as i64,
+                            0,
+                            0,
+                        ]
+                        .into(),
+                        services::ScalarResult::WaitForResponse(msg) => msg.into(),
+                    },
+                    _ => {
+                        println!("Unknown message kind {}", kind);
+                        [
+                            SyscallResultNumber::Error as i64,
+                            9, /* ServerNotFound */
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ]
+                        .into()
+                    }
+                }
+            }
+            Syscall::UpdateMemoryFlags(_address, _range, _value) => {
+                [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
+            }
+            Syscall::Yield => [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into(),
+            Syscall::CreateThread(
+                entry_point,
+                stack_pointer,
+                stack_length,
+                argument_1,
+                argument_2,
+                argument_3,
+                argument_4,
+            ) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.memory_cmd
+                    .send(MemoryCommand::CreateThread(
+                        entry_point as _,
+                        stack_pointer as _,
+                        stack_length as _,
+                        argument_1 as _,
+                        argument_2 as _,
+                        argument_3 as _,
+                        argument_4 as _,
+                        tx,
+                    ))
+                    .unwrap();
+                let thread_id = rx.recv().unwrap();
+                [
+                    SyscallResultNumber::ThreadId as i64,
+                    thread_id,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]
+                .into()
+            }
+            Syscall::UnmapMemory(address, size) => {
+                // println!("UnmapMemory({:08x}, {})", address, size);
+                for offset in (address..address + size).step_by(4096) {
+                    self.free_page(offset as u32).unwrap();
+                }
+                [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
+            }
+            Syscall::JoinThread(thread_id) => {
+                // println!("JoinThread({})", thread_id);
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.memory_cmd
+                    .send(MemoryCommand::JoinThread(thread_id as _, tx))
+                    .unwrap();
+                rx.into()
             }
             Syscall::Unknown(args) => {
                 println!(
@@ -440,7 +709,8 @@ impl riscv_cpu::cpu::Memory for Memory {
                     SyscallNumber::from(args[0]),
                     &args[1..]
                 );
-                [SyscallResultNumber::Unimplemented as _, 0, 0, 0, 0, 0, 0, 0]
+                unimplemented!("Unhandled syscall");
+                // [SyscallResultNumber::Unimplemented as _, 0, 0, 0, 0, 0, 0, 0]
             }
         }
     }
@@ -449,20 +719,25 @@ impl riscv_cpu::cpu::Memory for Memory {
 pub struct Machine {
     memory: Arc<RwLock<Memory>>,
     workers: Vec<WorkerHandle>,
-    worker_response: Receiver<WorkerResponse>,
-    worker_response_tx: Sender<WorkerResponse>,
+    satp: u64,
+    memory_cmd_sender: Sender<MemoryCommand>,
+    memory_cmd: Receiver<MemoryCommand>,
+    thread_id: AtomicI64,
 }
 
 impl Machine {
     pub fn new(program: &[u8]) -> Result<Self, LoadError> {
-        let memory = Arc::new(RwLock::new(Memory::new(MEMORY_BASE, 16 * 1024 * 1024)));
+        let (memory, memory_cmd) = Memory::new(MEMORY_BASE, 16 * 1024 * 1024);
+        let memory_cmd_sender = memory.memory_cmd.clone();
+        let memory = Arc::new(RwLock::new(memory));
 
-        let (worker_response_tx, worker_response) = std::sync::mpsc::channel();
         let mut machine = Self {
             memory,
             workers: vec![],
-            worker_response_tx,
-            worker_response,
+            satp: 0,
+            memory_cmd,
+            memory_cmd_sender,
+            thread_id: AtomicI64::new(1),
         };
 
         machine.load_program(program)?;
@@ -529,37 +804,116 @@ impl Machine {
         // Update the stack pointer
         cpu.write_register(2, 0xc002_0000 - 4);
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker_tx = self.worker_response_tx.clone();
-        std::thread::spawn(move || Worker::new(cpu, rx, worker_tx).run());
+        let cmd = self.memory_cmd_sender.clone();
+        let joiner = std::thread::spawn(move || Worker::new(cpu, cmd, 0).run());
 
-        self.workers.push(WorkerHandle { tx });
+        self.workers.push(WorkerHandle { joiner });
+        self.satp = satp;
 
         Ok(())
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.workers[0].tx.send(WorkerCommand::Start)?;
-        self.worker_response.recv().unwrap();
+        let (join_tx, rx) = std::sync::mpsc::channel();
+        let main_worker: WorkerHandle = self.workers.pop().unwrap();
+        join_tx.send(main_worker.joiner).unwrap();
+        let memory_cmd_sender = self.memory_cmd_sender.clone();
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.try_recv() {
+                if let Err(_e) = msg.join() {}
+            }
+            memory_cmd_sender.send(MemoryCommand::Exit).unwrap();
+        });
+        let mut joining_threads = HashMap::new();
+        let mut exited_threads = HashSet::new();
+        while let Ok(msg) = self.memory_cmd.recv() {
+            match msg {
+                MemoryCommand::JoinThread(tid, sender) => {
+                    if exited_threads.contains(&tid) {
+                        sender
+                            .send((
+                                [SyscallResultNumber::Scalar1 as i64, 0, 0, 0, 0, 0, 0, 0],
+                                None,
+                            ))
+                            .unwrap();
+                    } else {
+                        joining_threads
+                            .entry(tid)
+                            .or_insert_with(Vec::new)
+                            .push(sender);
+                    }
+                }
+                MemoryCommand::ExitThread(tid, result) => {
+                    exited_threads.insert(tid);
+                    if let Some(joiners) = joining_threads.remove(&tid) {
+                        for joiner in joiners {
+                            joiner
+                                .send((
+                                    [
+                                        SyscallResultNumber::Scalar1 as i64,
+                                        result.into(),
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                    ],
+                                    None,
+                                ))
+                                .unwrap();
+                        }
+                    }
+                }
+                MemoryCommand::CreateThread(
+                    entry_point,
+                    stack_pointer,
+                    _stack_length,
+                    argument_1,
+                    argument_2,
+                    argument_3,
+                    argument_4,
+                    tx,
+                ) => {
+                    let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone())
+                        .xlen(riscv_cpu::Xlen::Bit32)
+                        .build();
+
+                    cpu.write_csr(riscv_cpu::cpu::CSR_SATP_ADDRESS, self.satp)
+                        .map_err(|_| LoadError::SatpWriteError)?;
+                    cpu.update_pc(entry_point as u64);
+
+                    // Return to User Mode (0 << 11) with interrupts disabled (1 << 5)
+                    cpu.write_csr(riscv_cpu::cpu::CSR_MSTATUS_ADDRESS, 1 << 5)
+                        .map_err(|_| LoadError::MstatusWriteError)?;
+
+                    cpu.write_csr(riscv_cpu::cpu::CSR_SEPC_ADDRESS, entry_point as u64)
+                        .unwrap();
+
+                    // SRET to return to user mode
+                    cpu.execute_opcode(0x10200073).map_err(LoadError::CpuTrap)?;
+
+                    // Update the stack pointer
+                    cpu.write_register(2, stack_pointer as i64 - 16);
+                    cpu.write_register(10, argument_1 as i64);
+                    cpu.write_register(11, argument_2 as i64);
+                    cpu.write_register(12, argument_3 as i64);
+                    cpu.write_register(13, argument_4 as i64);
+
+                    let cmd = self.memory_cmd_sender.clone();
+                    let tid = self.thread_id.fetch_add(1, Ordering::SeqCst);
+                    join_tx
+                        .send(std::thread::spawn(move || Worker::new(cpu, cmd, tid).run()))
+                        .unwrap();
+                    tx.send(tid).unwrap();
+                }
+                MemoryCommand::Exit => {
+                    break;
+                }
+            }
+        }
+        println!("Done! memory_cmd returned error");
 
         Ok(())
     }
 }
-
-// impl SyscallHandler for Worker {
-//     fn syscall(&mut self, cpu: &mut riscv_cpu::Cpu, args: [i64; 8]) -> [i64; 8] {
-//         let syscall: Syscall = args.into();
-//         println!("Syscall {:?} with args: {:?}", syscall, &args[1..]);
-//         // self.syscall(cpu, syscall)
-//         [
-//             SyscallResultNumber::Unimplemented as i64,
-//             0,
-//             0,
-//             0,
-//             0,
-//             0,
-//             0,
-//             0,
-//         ]
-//     }
-// }

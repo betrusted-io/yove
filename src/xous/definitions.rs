@@ -59,6 +59,8 @@ pub enum Syscall {
         i64, /* argument 3 */
         i64, /* argument 4 */
     ),
+    JoinThread(i64 /* thread ID */),
+    UnmapMemory(i64, /* address */ i64 /* size */),
 }
 
 #[derive(Debug)]
@@ -88,6 +90,7 @@ impl From<[i64; 8]> for Syscall {
         match value[0].into() {
             SyscallNumber::IncreaseHeap => Syscall::IncreaseHeap(value[1], value[2]),
             SyscallNumber::MapMemory => Syscall::MapMemory(value[1], value[2], value[3], value[4]),
+            SyscallNumber::UnmapMemory => Syscall::UnmapMemory(value[1], value[2]),
             SyscallNumber::Connect => Syscall::Connect([
                 value[1] as u32,
                 value[2] as u32,
@@ -112,6 +115,7 @@ impl From<[i64; 8]> for Syscall {
                 value[1], value[2], value[3], value[4], value[5], value[6], value[7],
             ),
             SyscallNumber::Yield => Syscall::Yield,
+            SyscallNumber::JoinThread => Syscall::JoinThread(value[1]),
             _ => Syscall::Unknown(value),
         }
     }

@@ -5,6 +5,23 @@ use std::{
 
 use crate::cpu::{decode_privilege_mode, PrivilegeMode, Trap, TrapType, Xlen};
 
+pub enum SyscallResult {
+    Ok([i64; 8]),
+    Defer(std::sync::mpsc::Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+}
+
+impl From<[i64; 8]> for SyscallResult {
+    fn from(args: [i64; 8]) -> Self {
+        SyscallResult::Ok(args)
+    }
+}
+
+impl From<std::sync::mpsc::Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>> for SyscallResult {
+    fn from(receiver: std::sync::mpsc::Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>) -> Self {
+        SyscallResult::Defer(receiver)
+    }
+}
+
 pub trait Memory {
     fn read_u8(&self, p_address: u64) -> u8;
     fn read_u16(&self, p_address: u64) -> u16;
@@ -15,7 +32,7 @@ pub trait Memory {
     fn write_u32(&mut self, p_address: u64, value: u32);
     fn write_u64(&mut self, p_address: u64, value: u64);
     fn validate_address(&self, address: u64) -> bool;
-    fn syscall(&mut self, args: [i64; 8]) -> [i64; 8];
+    fn syscall(&mut self, args: [i64; 8]) -> SyscallResult;
 }
 
 /// Emulates Memory Management Unit. It holds the Main memory and peripheral

@@ -249,17 +249,23 @@ impl XousHandler {
 
 impl XousHandler {
     fn syscall(&mut self, cpu: &mut riscv_cpu::Cpu, syscall: Syscall) -> [i64; 8] {
+        print!("Syscall: ");
         match syscall {
-            Syscall::IncreaseHeap(bytes, flags) => {
+            Syscall::IncreaseHeap(bytes, _flags) => {
+                println!("IncreaseHeap({} bytes, flags: {:02x})", bytes, _flags);
                 let heap_address = self.heap_start + self.heap_size;
-                if bytes < 0 {
-                    self.heap_size -= bytes.abs() as u32;
-                    panic!("Reducing size not supported!");
-                } else if bytes > 0 {
-                    for new_address in (heap_address..(heap_address + bytes as u32)).step_by(4096) {
-                        self.ensure_page(cpu, new_address);
-                    }
-                    self.heap_size += bytes as u32;
+                match bytes {
+                    bytes if bytes < 0 => {
+                        self.heap_size -= bytes.unsigned_abs() as u32;
+                        panic!("Reducing size not supported!");
+                    },
+                    bytes if bytes > 0 => {
+                        for new_address in (heap_address..(heap_address + bytes as u32)).step_by(4096) {
+                            self.ensure_page(cpu, new_address);
+                        }
+                        self.heap_size += bytes as u32;
+                    },
+                    _ => {},
                 }
                 [
                     SyscallResultNumber::MemoryRange as i64,
@@ -273,7 +279,7 @@ impl XousHandler {
                 ]
             }
             Syscall::Unknown(args) => {
-                println!("Unknown syscall {:?}: {:?}", SyscallNumber::from(args[0]), args);
+                println!("Unhandled {:?}: {:?}", SyscallNumber::from(args[0]), &args[1..]);
                 [SyscallResultNumber::Unimplemented as _, 0, 0, 0, 0, 0, 0, 0]
             }
         }
@@ -283,7 +289,7 @@ impl XousHandler {
 impl EventHandler for XousHandler {
     fn handle_event(&mut self, cpu: &mut riscv_cpu::Cpu, args: [i64; 8]) -> [i64; 8] {
         let syscall: Syscall = args.into();
-        println!("Syscall {:?} with args: {:?}", syscall, &args[1..]);
+        // println!("Syscall {:?} with args: {:?}", syscall, &args[1..]);
         self.syscall(cpu, syscall)
     }
 }

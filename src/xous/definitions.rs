@@ -1,6 +1,15 @@
 #![allow(dead_code)]
 
 #[derive(Debug, Copy, Clone)]
+pub enum Message {
+    MutableBorrow = 0,
+    Borrow = 1,
+    Move = 2,
+    Scalar = 3,
+    BlockingScalar = 4,
+}
+
+#[derive(Debug, Copy, Clone)]
 pub enum SyscallResultNumber {
     Ok = 0,
     Error = 1,
@@ -18,6 +27,7 @@ pub enum SyscallResultNumber {
 #[derive(Debug)]
 pub enum Syscall {
     Unknown([i64; 8]),
+    Yield,
     IncreaseHeap(
         i64, /* number of bytes to add */
         i64, /* memory flags */
@@ -27,6 +37,27 @@ pub enum Syscall {
         i64, /* size */
         i64, /* flags */
         i64, /* name */
+    ),
+    Connect([u32; 4] /* Server ID */),
+    SendMessage(
+        u32,      /* Connection ID */
+        u32,      /* message kind */
+        u32,      /* opcode */
+        [u32; 4], /* descriptor */
+    ),
+    UpdateMemoryFlags(
+        i64, /* address */
+        i64, /* range */
+        i64, /* flags */
+    ),
+    CreateThread(
+        i64, /* entry point */
+        i64, /* stack pointer */
+        i64, /* stack length */
+        i64, /* argument 1 */
+        i64, /* argument 2 */
+        i64, /* argument 3 */
+        i64, /* argument 4 */
     ),
 }
 
@@ -57,6 +88,30 @@ impl From<[i64; 8]> for Syscall {
         match value[0].into() {
             SyscallNumber::IncreaseHeap => Syscall::IncreaseHeap(value[1], value[2]),
             SyscallNumber::MapMemory => Syscall::MapMemory(value[1], value[2], value[3], value[4]),
+            SyscallNumber::Connect => Syscall::Connect([
+                value[1] as u32,
+                value[2] as u32,
+                value[3] as u32,
+                value[4] as u32,
+            ]),
+            SyscallNumber::SendMessage => Syscall::SendMessage(
+                value[1] as u32,
+                value[2] as u32,
+                value[3] as u32,
+                [
+                    value[4] as u32,
+                    value[5] as u32,
+                    value[6] as u32,
+                    value[7] as u32,
+                ],
+            ),
+            SyscallNumber::UpdateMemoryFlags => {
+                Syscall::UpdateMemoryFlags(value[1], value[2], value[3])
+            }
+            SyscallNumber::CreateThread => Syscall::CreateThread(
+                value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+            ),
+            SyscallNumber::Yield => Syscall::Yield,
             _ => Syscall::Unknown(value),
         }
     }

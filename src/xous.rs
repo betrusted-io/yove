@@ -904,8 +904,18 @@ impl Machine {
         memory_writer.turbo();
         for sh in elf.section_headers {
             if sh.sh_flags as u32 & goblin::elf::section_header::SHF_ALLOC == 0 {
+                // println!(
+                //     "Ignoring section {}...",
+                //     elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("???")
+                // );
                 continue;
             }
+
+            // Place the eh_frame offset into $a0 so the program can unwind correctly
+            if elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("???") == ".eh_frame" {
+                cpu.write_register(10, sh.sh_addr.try_into().unwrap());
+            }
+
             if sh.sh_type & goblin::elf::section_header::SHT_NOBITS != 0 {
                 for addr in sh.sh_addr..(sh.sh_addr + sh.sh_size) {
                     memory_writer.ensure_page(addr.try_into().unwrap());
@@ -918,7 +928,6 @@ impl Machine {
             }
         }
 
-        // memory_writer.print_mmu();
         memory_writer.normal();
 
         // TODO: Get memory permissions correct

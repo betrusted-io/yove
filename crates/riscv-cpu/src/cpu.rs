@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock, mpsc::Receiver};
+use std::sync::{mpsc::Receiver, Arc, RwLock};
 
 pub use super::mmu::Memory;
 use super::mmu::{AddressingMode, Mmu};
@@ -58,8 +58,8 @@ pub enum TickResult {
     Ok,
     ExitThread(u64),
     PauseEmulation(Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+    CpuTrap(Trap),
 }
-
 
 /// Emulates a RISC-V CPU core
 pub struct Cpu {
@@ -343,7 +343,6 @@ impl Cpu {
 
     /// Runs program one cycle. Fetch, decode, and execution are completed in a cycle so far.
     pub fn tick(&mut self) -> TickResult {
-        let instruction_address = self.pc;
         match self.tick_operate() {
             Ok(()) => {}
             Err(Trap {
@@ -358,7 +357,7 @@ impl Cpu {
             }) => {
                 return TickResult::ExitThread(self.read_register(10) as u64);
             }
-            Err(e) => self.handle_exception(e, instruction_address),
+            Err(e) => return TickResult::CpuTrap(e),
         }
         self.mmu.tick(&mut self.csr[CSR_MIP_ADDRESS as usize]);
         self.handle_interrupt(self.pc);
@@ -781,7 +780,7 @@ impl Cpu {
         // println!("Fetching word from {:08x}...", self.pc);
         self.mmu.fetch_word(self.pc).map_err(|e| {
             self.pc = self.pc.wrapping_add(4); // @TODO: What if instruction is compressed?
-            // println!("Fetch error: {:x?}", e);
+                                               // println!("Fetch error: {:x?}", e);
             e
         })
     }

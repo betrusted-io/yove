@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod memoryflags;
+
 #[derive(Debug, Copy, Clone)]
 pub enum Message {
     MutableBorrow = 0,

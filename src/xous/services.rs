@@ -2,16 +2,20 @@ use std::sync::mpsc::Receiver;
 pub mod log;
 pub mod ticktimer;
 
+pub type ResponseData = ([i64; 8], Option<(Vec<u8>, u64)>);
+
+#[allow(dead_code)]
 pub enum ScalarResult {
     Scalar1(u32),
     Scalar2([u32; 2]),
     Scalar5([u32; 5]),
-    WaitForResponse(Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+    WaitForResponse(Receiver<ResponseData>),
 }
 
+#[allow(dead_code)]
 pub enum LendResult {
     MemoryReturned([u32; 2]),
-    WaitForResponse(Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+    WaitForResponse(Receiver<ResponseData>),
 }
 
 pub trait Service {

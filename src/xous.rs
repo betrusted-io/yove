@@ -8,11 +8,17 @@ use std::{
     sync::{
         atomic::{AtomicI64, Ordering},
         mpsc::{Receiver, Sender},
-        Arc, RwLock,
+        Arc, Mutex,
     },
 };
 
+use crate::xous::definitions::SyscallErrorNumber;
+
 const MEMORY_BASE: u32 = 0x8000_0000;
+const ALLOCATION_START: u32 = 0x4000_0000;
+const ALLOCATION_END: u32 = ALLOCATION_START + 5 * 1024 * 1024;
+const HEAP_START: u32 = 0xa000_0000;
+const HEAP_END: u32 = HEAP_START + 5 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -45,6 +51,7 @@ const MMUFLAG_ACCESSED: u32 = 0x40;
 const MMUFLAG_DIRTY: u32 = 0x80;
 
 impl std::error::Error for LoadError {}
+pub type ResponseData = ([i64; 8], Option<(Vec<u8>, u64)>);
 
 enum MemoryCommand {
     Exit,
@@ -59,30 +66,14 @@ enum MemoryCommand {
         u32,         /* argument 4 */
         Sender<i64>, /* Thread ID */
     ),
-    JoinThread(u32, Sender<([i64; 8], Option<(Vec<u8>, u64)>)>),
-}
-
-struct Memory {
-    base: u32,
-    data: HashMap<usize, [u8; 4096]>,
-    allocated_pages: BTreeSet<usize>,
-    free_pages: BTreeSet<usize>,
-    heap_start: u32,
-    heap_size: u32,
-    // allocation_start: u32,
-    allocation_previous: u32,
-    l1_pt: u32,
-    satp: u32,
-    connections: HashMap<u32, Box<dyn services::Service + Send + Sync>>,
-    memory_cmd: Sender<MemoryCommand>,
-    turbo: bool,
+    JoinThread(u32, Sender<ResponseData>),
 }
 
 struct Worker {
     cpu: riscv_cpu::Cpu,
     cmd: Sender<MemoryCommand>,
     tid: i64,
-    memory: Arc<RwLock<Memory>>,
+    memory: Arc<Mutex<Memory>>,
 }
 
 impl Worker {
@@ -90,7 +81,7 @@ impl Worker {
         cpu: riscv_cpu::Cpu,
         cmd: Sender<MemoryCommand>,
         tid: i64,
-        memory: Arc<RwLock<Memory>>,
+        memory: Arc<Mutex<Memory>>,
     ) -> Self {
         Self {
             cpu,
@@ -126,7 +117,7 @@ impl Worker {
                     return;
                 }
                 TickResult::CpuTrap(trap) => {
-                    self.memory.read().unwrap().print_mmu();
+                    self.memory.lock().unwrap().print_mmu();
                     // called `Result::unwrap()` on an `Err` value: "Valid bit is 0, or read is 0 and write is 1 at 40002fec: 000802e6"
                     println!(
                         "CPU trap at PC {:08x}, exiting thread {}: {:x?}",
@@ -149,18 +140,39 @@ struct WorkerHandle {
     joiner: std::thread::JoinHandle<()>,
 }
 
+struct Memory {
+    base: u32,
+    data: HashMap<usize, [u8; 4096]>,
+    allocated_pages: BTreeSet<usize>,
+    free_pages: BTreeSet<usize>,
+    heap_start: u32,
+    heap_size: u32,
+    // allocation_start: u32,
+    allocation_previous: u32,
+    l1_pt: u32,
+    satp: u32,
+    connections: HashMap<u32, Box<dyn services::Service + Send + Sync>>,
+    memory_cmd: Sender<MemoryCommand>,
+    translation_cache: HashMap<u32, u32>,
+    allocated_bytes: u32,
+    reservations: HashSet<u32>,
+}
+
 impl Memory {
     pub fn new(base: u32, size: usize) -> (Self, Receiver<MemoryCommand>) {
         let mut backing = HashMap::new();
         let mut free_pages = BTreeSet::new();
         let mut allocated_pages = BTreeSet::new();
+
+        // Populate the backing table as well as the list of free pages
         for phys in (base..(base + size as u32)).step_by(4096) {
             backing.insert(phys as usize, [0; 4096]);
             free_pages.insert(phys as usize);
         }
-        // Remove the l0 page table
+        // Allocate the l0 page table
         assert!(free_pages.remove(&(MEMORY_BASE as usize + 4096)));
         assert!(allocated_pages.insert(MEMORY_BASE as usize + 4096));
+
         let (memory_cmd, memory_cmd_rx) = std::sync::mpsc::channel();
         (
             Self {
@@ -170,79 +182,81 @@ impl Memory {
                 free_pages,
                 l1_pt: MEMORY_BASE + 4096,
                 satp: ((4096 + MEMORY_BASE) >> 12) | 0x8000_0000,
-                heap_start: 0x6000_0000,
+                heap_start: HEAP_START,
                 heap_size: 0,
-                allocation_previous: 0x4000_0000,
+                allocation_previous: ALLOCATION_START,
                 connections: HashMap::new(),
                 memory_cmd,
-                turbo: false,
+                translation_cache: HashMap::new(),
+                allocated_bytes: 4096,
+                reservations: HashSet::new(),
             },
             memory_cmd_rx,
         )
     }
 
-    pub fn turbo(&mut self) {
-        self.turbo = true;
-    }
+    // fn memory_ck(&self) {
+    //     if self.turbo {
+    //         return;
+    //     }
+    //     let mut seen_pages = HashMap::new();
+    //     seen_pages.insert(self.l1_pt, 0);
+    //     for vpn1 in 0..1024 {
+    //         let l1_entry = self.read_u32(self.l1_pt as u64 + vpn1 * 4);
+    //         if l1_entry & MMUFLAG_VALID == 0 {
+    //             continue;
+    //         }
 
-    pub fn normal(&mut self) {
-        self.turbo = false;
-        self.memory_ck();
-    }
+    //         let superpage_addr = vpn1 as u32 * (1 << 22);
 
-    fn memory_ck(&self) {
-        // if self.turbo {
-        //     return;
-        // }
-        // let mut seen_pages = HashMap::new();
-        // seen_pages.insert(self.l1_pt, 0);
-        // for vpn1 in 0..1024 {
-        //     let l1_entry = self.read_u32(self.l1_pt as u64 + vpn1 * 4);
-        //     if l1_entry & MMUFLAG_VALID == 0 {
-        //         continue;
-        //     }
+    //         for vpn0 in 0..1024 {
+    //             let l0_entry = self.read_u32((((l1_entry >> 10) << 12) as u64) + vpn0 as u64 * 4);
+    //             if l0_entry & 0x1 == 0 {
+    //                 continue;
+    //             }
+    //             let phys = (l0_entry >> 10) << 12;
+    //             let current = superpage_addr + vpn0 as u32 * (1 << 12);
+    //             if let Some(existing) = seen_pages.get(&phys) {
+    //                 self.print_mmu();
+    //                 panic!(
+    //                     "Error! Page {:08x} is mapped twice! Once at {:08x} and once at {:08x}",
+    //                     phys, existing, current,
+    //                 );
+    //             }
+    //             seen_pages.insert(phys, current);
+    //         }
+    //     }
+    // }
 
-        //     let superpage_addr = vpn1 as u32 * (1 << 22);
-
-        //     for vpn0 in 0..1024 {
-        //         let l0_entry = self.read_u32((((l1_entry >> 10) << 12) as u64) + vpn0 as u64 * 4);
-        //         if l0_entry & 0x1 == 0 {
-        //             continue;
-        //         }
-        //         let phys = (l0_entry >> 10) << 12;
-        //         let current = superpage_addr + vpn0 as u32 * (1 << 12);
-        //         if let Some(existing) = seen_pages.get(&phys) {
-        //             self.print_mmu();
-        //             panic!(
-        //                 "Error! Page {:08x} is mapped twice! Once at {:08x} and once at {:08x}",
-        //                 phys, existing, current,
-        //             );
-        //         }
-        //         seen_pages.insert(phys, current);
-        //     }
-        // }
-    }
-
-    fn allocate_page(&mut self) -> u32 {
-        self.memory_ck();
-        let phys = self.free_pages.pop_first().expect("out of memory");
+    /// Allocate a physical page from RAM.
+    fn allocate_phys_page(&mut self) -> Option<u32> {
+        let Some(phys) = self.free_pages.pop_first() else {
+            // panic!(
+            //     "out of memory when attempting to allocate a page. There are {} bytes allocated.",
+            //     self.allocated_bytes
+            // );
+            return None;
+        };
         assert!(self.allocated_pages.insert(phys));
+        self.allocated_bytes += 4096;
 
         // The root (l1) pagetable is defined to be mapped into our virtual
         // address space at this address.
         if phys == 0 {
             panic!("Attempt to allocate zero page");
         }
-        self.memory_ck();
-        phys as u32
+        Some(phys as u32)
     }
 
-    fn free_page(&mut self, virt: u32) -> Result<(), ()> {
-        self.memory_ck();
-        let phys = self.virt_to_phys(virt).ok_or(())?;
+    fn free_virt_page(&mut self, virt: u32) -> Result<(), ()> {
+        let phys = self
+            .virt_to_phys(virt)
+            .ok_or(())
+            .expect("tried to free a page that was allocated");
 
         let vpn1 = ((virt >> 22) & ((1 << 10) - 1)) as usize * 4;
         let vpn0 = ((virt >> 12) & ((1 << 10) - 1)) as usize * 4;
+        self.allocated_bytes -= 4096;
 
         // The root (l1) pagetable is defined to be mapped into our virtual
         // address space at this address.
@@ -250,68 +264,123 @@ impl Memory {
         // If the level 1 pagetable doesn't exist, then this address is invalid
         let l1_pt_entry = self.read_u32(self.l1_pt as u64 + vpn1 as u64);
         if l1_pt_entry & MMUFLAG_VALID == 0 {
-            return Ok(());
+            panic!("Tried to free a page where the level 1 pagetable didn't exist");
         }
 
-        // println!("Deallocating page {:08x} @ {:08x}", virt, phys);
-        if !self.allocated_pages.remove(&(phys as usize)) {
-            // self.print_mmu();
-            panic!(
-                "Page {:08x} @ {:08x} wasn't in the list of allocated pages!",
-                phys, virt
-            );
-        }
+        assert!(self.allocated_pages.remove(&(phys as usize)));
         assert!(self.free_pages.insert(phys as usize));
+        assert!(self.translation_cache.remove(&virt).is_some());
 
         let l0_pt_phys = ((l1_pt_entry >> 10) << 12) + vpn0 as u32;
+        assert!(self.read_u32(l0_pt_phys as u64) & MMUFLAG_VALID != 0);
         self.write_u32(l0_pt_phys as u64, 0);
-        self.memory_ck();
 
         Ok(())
     }
 
     fn allocate_virt_region(&mut self, size: usize) -> Option<u32> {
-        self.memory_ck();
-        let mut start = self.allocation_previous;
-        // Find a free region that will fit this page.
-        'outer: loop {
-            for page in (start..(start + size as u32)).step_by(4096) {
-                if self.virt_to_phys(page).is_some() {
-                    start = page + 4096;
-                    continue 'outer;
+        let size = size as u32;
+        // Look for a sequence of `size` pages that are free.
+        let mut address = None;
+        for potential_start in (self.allocation_previous..ALLOCATION_END - size)
+            .step_by(4096)
+            .chain((ALLOCATION_START..self.allocation_previous - size).step_by(4096))
+        {
+            let mut all_free = true;
+            for check_page in (potential_start..potential_start + size).step_by(4096) {
+                if self.virt_to_phys(check_page).is_some() {
+                    all_free = false;
+                    break;
                 }
             }
-            break;
+            if all_free {
+                self.allocation_previous = potential_start + size;
+                address = Some(potential_start);
+                break;
+            }
         }
-        // Allocate the region
-        for page in (start..(start + size as u32)).step_by(4096) {
-            self.ensure_page(page);
-            // println!(
-            //     "Allocated {:08x} @ {:08x}",
-            //     page,
-            //     self.virt_to_phys(page).unwrap()
-            // );
+        if let Some(address) = address {
+            let mut error_mark = None;
+            for page in (address..(address + size)).step_by(4096) {
+                if self.ensure_page(page).is_none() {
+                    error_mark = Some(page);
+                    break;
+                }
+            }
+            if let Some(error_mark) = error_mark {
+                for page in (address..error_mark).step_by(4096) {
+                    self.free_virt_page(page).unwrap();
+                }
+                return None;
+            }
         }
-        self.allocation_previous = start + size as u32 + 4096;
-        self.memory_ck();
-        Some(start)
+        address
+        // for potential_start in (start..initial).step_by(PAGE_SIZE) {
+        //     let mut all_free = true;
+        //     for check_page in (potential_start..potential_start + size).step_by(PAGE_SIZE) {
+        //         if !crate::arch::mem::address_available(check_page) {
+        //             all_free = false;
+        //             break;
+        //         }
+        //     }
+        //     if all_free {
+        //         match kind {
+        //             xous_kernel::MemoryType::Default => {
+        //                 process_inner.mem_default_last = potential_start
+        //             }
+        //             xous_kernel::MemoryType::Messages => {
+        //                 process_inner.mem_message_last = potential_start
+        //             }
+        //             other => panic!("invalid kind: {:?}", other),
+        //         }
+        //         return Ok(potential_start as *mut u8);
+        //     }
+        // }
+        // Err(xous_kernel::Error::BadAddress)
+
+        // let mut start = self.allocation_previous;
+        // // Find a free region that will fit this page.
+        // 'outer: loop {
+        //     for page in (start..(start + size as u32)).step_by(4096) {
+        //         // If this page is allocated, skip it
+        //         if self.virt_to_phys(page).is_some() {
+        //             start = page + 4096;
+        //             continue 'outer;
+        //         }
+        //     }
+        //     break;
+        // }
+        // // Allocate the region
+        // for page in (start..(start + size as u32)).step_by(4096) {
+        //     self.ensure_page(page);
+        //     // println!(
+        //     //     "Allocated {:08x} @ {:08x}",
+        //     //     page,
+        //     //     self.virt_to_phys(page).unwrap()
+        //     // );
+        // }
+        // self.allocation_previous = start + size as u32 + 4096;
+        // Some(start)
     }
 
-    fn ensure_page(&mut self, address: u32) {
-        self.memory_ck();
-        let vpn1 = ((address >> 22) & ((1 << 10) - 1)) as usize * 4;
-        let vpn0 = ((address >> 12) & ((1 << 10) - 1)) as usize * 4;
+    fn ensure_page(&mut self, virt: u32) -> Option<bool> {
+        let mut allocated = false;
+        let vpn1 = ((virt >> 22) & ((1 << 10) - 1)) as usize * 4;
+        let vpn0 = ((virt >> 12) & ((1 << 10) - 1)) as usize * 4;
 
         // If the level 1 pagetable doesn't exist, then this address is invalid
         let mut l1_pt_entry = self.read_u32(self.l1_pt as u64 + vpn1 as u64);
         if l1_pt_entry & MMUFLAG_VALID == 0 {
             // Allocate a new page for the level 1 pagetable
-            let l0_pt_phys = self.allocate_page();
+            let Some(l0_pt_phys) = self.allocate_phys_page() else {
+                return None;
+            };
             // println!("Allocating level 0 pagetable at {:08x}", l0_pt_phys);
             l1_pt_entry =
                 ((l0_pt_phys >> 12) << 10) | MMUFLAG_VALID | MMUFLAG_DIRTY | MMUFLAG_ACCESSED;
             // Map the level 1 pagetable into the root pagetable
             self.write_u32(self.l1_pt as u64 + vpn1 as u64, l1_pt_entry);
+            allocated = true;
         }
 
         let l0_pt_phys = ((l1_pt_entry >> 10) << 12) + vpn0 as u32;
@@ -319,8 +388,10 @@ impl Memory {
 
         // Ensure the entry hasn't already been mapped.
         if l0_pt_entry & MMUFLAG_VALID == 0 {
-            let page_phys = self.allocate_page();
-            l0_pt_entry = ((page_phys >> 12) << 10)
+            let Some(phys) = self.allocate_phys_page() else {
+                return None;
+            };
+            l0_pt_entry = ((phys >> 12) << 10)
                 | MMUFLAG_VALID
                 | MMUFLAG_WRITABLE
                 | MMUFLAG_READABLE
@@ -330,6 +401,8 @@ impl Memory {
                 | MMUFLAG_ACCESSED;
             // Map the level 0 pagetable into the level 1 pagetable
             self.write_u32(l0_pt_phys as u64, l0_pt_entry);
+            assert!(self.translation_cache.insert(virt, phys).is_none());
+            allocated = true;
         }
         assert!(self
             .allocated_pages
@@ -337,11 +410,10 @@ impl Memory {
         assert!(!self
             .free_pages
             .contains(&(((l0_pt_entry >> 10) << 12) as usize)));
-        self.memory_ck();
+        Some(allocated)
     }
 
     fn remove_memory_flags(&mut self, virt: u32, new_flags: u32) {
-        self.memory_ck();
         // Ensure they're only adjusting legal flags
         assert!(new_flags & !(MMUFLAG_READABLE | MMUFLAG_WRITABLE | MMUFLAG_EXECUTABLE) == 0);
 
@@ -376,7 +448,6 @@ impl Memory {
             (((l1_pt_entry >> 10) << 12) + vpn0 as u32) as u64,
             l0_pt_entry,
         );
-        self.memory_ck();
     }
 
     fn write_bytes(&mut self, data: &[u8], start: u32) {
@@ -444,11 +515,12 @@ impl Memory {
 
         let l0_pt_entry = self.read_u32((((l1_pt_entry >> 10) << 12) + vpn0 as u32) as u64);
 
-        // Ensure the entry hasn't already been mapped.
+        // Check if the mapping is valid
         if l0_pt_entry & MMUFLAG_VALID == 0 {
-            return None;
+            None
+        } else {
+            Some(((l0_pt_entry >> 10) << 12) | offset)
         }
-        Some(((l0_pt_entry >> 10) << 12) | offset)
     }
 }
 
@@ -565,33 +637,38 @@ impl riscv_cpu::cpu::Memory for Memory {
         match syscall {
             Syscall::IncreaseHeap(bytes, _flags) => {
                 // println!("IncreaseHeap({} bytes, flags: {:02x})", bytes, _flags);
+                let increase_bytes = bytes as u32;
                 let heap_address = self.heap_start + self.heap_size;
-                match bytes {
-                    bytes if bytes < 0 => {
-                        self.heap_size -= bytes.unsigned_abs() as u32;
-                        panic!("Reducing size not supported!");
+                if self.heap_size.wrapping_add(increase_bytes) > HEAP_END {
+                    [
+                        SyscallResultNumber::Error as i64,
+                        SyscallErrorNumber::OutOfMemory as i64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into()
+                } else {
+                    for new_address in (heap_address..(heap_address + increase_bytes)).step_by(4096)
+                    {
+                        self.ensure_page(new_address);
                     }
-                    bytes if bytes > 0 => {
-                        for new_address in
-                            (heap_address..(heap_address + bytes as u32)).step_by(4096)
-                        {
-                            self.ensure_page(new_address);
-                        }
-                        self.heap_size += bytes as u32;
-                    }
-                    _ => {}
+                    self.heap_size += increase_bytes;
+                    [
+                        SyscallResultNumber::MemoryRange as i64,
+                        heap_address as i64,
+                        bytes,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into()
                 }
-                [
-                    SyscallResultNumber::MemoryRange as i64,
-                    heap_address as i64,
-                    bytes,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]
-                .into()
             }
 
             Syscall::MapMemory(phys, virt, size, _flags) => {
@@ -605,21 +682,36 @@ impl riscv_cpu::cpu::Memory for Memory {
                 if phys != 0 {
                     unimplemented!("Non-zero phys address");
                 }
-                let region = self
-                    .allocate_virt_region(size as usize)
-                    .expect("out of memory");
-                // println!(" -> {:08x}", region);
-                [
-                    SyscallResultNumber::MemoryRange as i64,
-                    region as i64,
-                    size,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]
-                .into()
+                if let Some(region) = self.allocate_virt_region(size as usize) {
+                    [
+                        SyscallResultNumber::MemoryRange as i64,
+                        region as i64,
+                        size,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into()
+                } else {
+                    // self.print_mmu();
+                    println!(
+                        "Couldn't find a free spot to allocate {} bytes of virtual memory, or out of memory",
+                        size as usize
+                    );
+                    [
+                        SyscallResultNumber::Error as i64,
+                        SyscallErrorNumber::OutOfMemory as i64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into()
+                }
             }
             Syscall::Connect(id) => {
                 // println!(
@@ -832,7 +924,7 @@ impl riscv_cpu::cpu::Memory for Memory {
             Syscall::UnmapMemory(address, size) => {
                 // println!("UnmapMemory({:08x}, {})", address, size);
                 for offset in (address..address + size).step_by(4096) {
-                    self.free_page(offset as u32).unwrap();
+                    self.free_virt_page(offset as u32).unwrap();
                 }
                 [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
             }
@@ -855,10 +947,27 @@ impl riscv_cpu::cpu::Memory for Memory {
             }
         }
     }
+
+    fn translate(&self, v_address: u64) -> Option<u64> {
+        let v_address = v_address as u32;
+        let ppn = v_address & !0xfff;
+        let offset = v_address & 0xfff;
+        self.translation_cache
+            .get(&ppn)
+            .map(|x| (*x + offset) as u64)
+    }
+
+    fn reserve(&mut self, p_address: u64) -> bool {
+        self.reservations.insert(p_address as u32)
+    }
+
+    fn clear_reservation(&mut self, p_address: u64) {
+        self.reservations.remove(&(p_address as u32));
+    }
 }
 
 pub struct Machine {
-    memory: Arc<RwLock<Memory>>,
+    memory: Arc<Mutex<Memory>>,
     workers: Vec<WorkerHandle>,
     satp: u64,
     memory_cmd_sender: Sender<MemoryCommand>,
@@ -870,7 +979,7 @@ impl Machine {
     pub fn new(program: &[u8]) -> Result<Self, LoadError> {
         let (memory, memory_cmd) = Memory::new(MEMORY_BASE, 16 * 1024 * 1024);
         let memory_cmd_sender = memory.memory_cmd.clone();
-        let memory = Arc::new(RwLock::new(memory));
+        let memory = Arc::new(Mutex::new(memory));
 
         let mut machine = Self {
             memory,
@@ -900,8 +1009,7 @@ impl Machine {
             return Err(LoadError::BitSizeError);
         }
 
-        let mut memory_writer = self.memory.write().unwrap();
-        memory_writer.turbo();
+        let mut memory_writer = self.memory.lock().unwrap();
         for sh in elf.section_headers {
             if sh.sh_flags as u32 & goblin::elf::section_header::SHF_ALLOC == 0 {
                 // println!(
@@ -918,7 +1026,9 @@ impl Machine {
 
             if sh.sh_type & goblin::elf::section_header::SHT_NOBITS != 0 {
                 for addr in sh.sh_addr..(sh.sh_addr + sh.sh_size) {
-                    memory_writer.ensure_page(addr.try_into().unwrap());
+                    memory_writer
+                        .ensure_page(addr.try_into().unwrap())
+                        .expect("out of memory");
                 }
             } else {
                 memory_writer.write_bytes(
@@ -928,16 +1038,13 @@ impl Machine {
             }
         }
 
-        memory_writer.normal();
-
-        // TODO: Get memory permissions correct
-
         let satp = memory_writer.satp.into();
 
         // Ensure stack is allocated
         for page in (0xc000_0000..0xc002_0000).step_by(4096) {
-            memory_writer.ensure_page(page);
+            memory_writer.ensure_page(page).expect("out of memory");
         }
+        drop(memory_writer);
 
         cpu.write_csr(riscv_cpu::cpu::CSR_SATP_ADDRESS, satp)
             .map_err(|_| LoadError::SatpWriteError)?;

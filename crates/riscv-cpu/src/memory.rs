@@ -1,6 +1,5 @@
 /// Emulates main memory.
-pub struct Memory {
-    /// Memory content
+pub struct Memory {    /// Memory content
     data: Vec<u64>,
 }
 

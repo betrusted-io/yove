@@ -14,6 +14,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jurubas"
+version = "0.1.0"
+dependencies = [
+ "goblin",
+ "riscv-cpu",
+]
+
+[[package]]
 name = "log"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -46,14 +54,6 @@ dependencies = [
 [[package]]
 name = "riscv-cpu"
 version = "0.1.0"
-
-[[package]]
-name = "rouns"
-version = "0.1.0"
-dependencies = [
- "goblin",
- "riscv-cpu",
-]
 
 [[package]]
 name = "scroll"

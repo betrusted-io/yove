@@ -26,6 +26,38 @@ pub enum SyscallResultNumber {
     Scalar5 = 20,
 }
 
+#[derive(Debug, Copy, Clone)]
+pub enum SyscallErrorNumber {
+    NoError = 0,
+    BadAlignment = 1,
+    BadAddress = 2,
+    OutOfMemory = 3,
+    MemoryInUse = 4,
+    InterruptNotFound = 5,
+    InterruptInUse = 6,
+    InvalidString = 7,
+    ServerExists = 8,
+    ServerNotFound = 9,
+    ProcessNotFound = 10,
+    ProcessNotChild = 11,
+    ProcessTerminated = 12,
+    Timeout = 13,
+    InternalError = 14,
+    ServerQueueFull = 15,
+    ThreadNotAvailable = 16,
+    UnhandledSyscall = 17,
+    InvalidSyscall = 18,
+    ShareViolation = 19,
+    InvalidThread = 20,
+    InvalidPID = 21,
+    UnknownError = 22,
+    AccessDenied = 23,
+    UseBeforeInit = 24,
+    DoubleFree = 25,
+    DebugInProgress = 26,
+    InvalidLimit = 27,
+}
+
 #[derive(Debug)]
 pub enum Syscall {
     Unknown([i64; 8]),

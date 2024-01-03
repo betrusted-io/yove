@@ -1,4 +1,4 @@
-use std::sync::{mpsc::Receiver, Arc, RwLock};
+use std::sync::{mpsc::Receiver, Arc, Mutex};
 
 pub use super::mmu::Memory;
 use super::mmu::{AddressingMode, Mmu};
@@ -54,10 +54,12 @@ pub const MIP_SEIP: u64 = 0x200;
 const MIP_STIP: u64 = 0x020;
 const MIP_SSIP: u64 = 0x002;
 
+pub type ResponseData = ([i64; 8], Option<(Vec<u8>, u64)>);
+
 pub enum TickResult {
     Ok,
     ExitThread(u64),
-    PauseEmulation(Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+    PauseEmulation(Receiver<ResponseData>),
     CpuTrap(Trap),
 }
 
@@ -74,9 +76,8 @@ pub struct Cpu {
     pc: u64,
     csr: [u64; CSR_CAPACITY],
     mmu: Mmu,
-    memory: Arc<RwLock<dyn Memory + Send + Sync>>,
-    reservation: u64, // @TODO: Should support multiple address reservations
-    is_reservation_set: bool,
+    memory: Arc<Mutex<dyn Memory + Send + Sync>>,
+    reservation: Option<u64>, // @TODO: Should support multiple address reservations
     _dump_flag: bool,
     // decode_cache: DecodeCache,
     unsigned_data_mask: u64,
@@ -127,7 +128,7 @@ pub enum TrapType {
     UserExternalInterrupt,
     SupervisorExternalInterrupt,
     MachineExternalInterrupt,
-    PauseEmulation(std::sync::mpsc::Receiver<([i64; 8], Option<(Vec<u8>, u64)>)>),
+    PauseEmulation(Receiver<ResponseData>),
 }
 
 fn _get_privilege_mode_name(mode: &PrivilegeMode) -> &'static str {
@@ -225,11 +226,11 @@ pub struct CpuBuilder {
     xlen: Xlen,
     pc: u64,
     sp: u64,
-    memory: Arc<RwLock<dyn Memory + Send + Sync>>,
+    memory: Arc<Mutex<dyn Memory + Send + Sync>>,
 }
 
 impl CpuBuilder {
-    pub fn new(memory: Arc<RwLock<dyn Memory + Send + Sync>>) -> Self {
+    pub fn new(memory: Arc<Mutex<dyn Memory + Send + Sync>>) -> Self {
         CpuBuilder {
             xlen: Xlen::Bit64,
             memory,
@@ -266,7 +267,7 @@ impl Cpu {
     ///
     /// # Arguments
     /// * `Terminal`
-    pub fn new(memory: Arc<RwLock<dyn Memory + Send + Sync>>) -> Self {
+    pub fn new(memory: Arc<Mutex<dyn Memory + Send + Sync>>) -> Self {
         Cpu {
             clock: 0,
             xlen: Xlen::Bit64,
@@ -277,8 +278,7 @@ impl Cpu {
             pc: 0,
             csr: [0; CSR_CAPACITY],
             mmu: Mmu::new(Xlen::Bit64, memory.clone()),
-            reservation: 0,
-            is_reservation_set: false,
+            reservation: None,
             _dump_flag: false,
             // decode_cache: DecodeCache::new(),
             unsigned_data_mask: 0xffffffffffffffff,
@@ -561,11 +561,6 @@ impl Cpu {
             );
             self.wfi = false;
         }
-    }
-
-    fn handle_exception(&mut self, exception: Trap, instruction_address: u64) {
-        println!("!!! Exception Trap !!!: {:x?}", exception);
-        self.handle_trap(exception, instruction_address, false);
     }
 
     fn handle_trap(&mut self, trap: Trap, instruction_address: u64, is_interrupt: bool) -> bool {
@@ -2448,7 +2443,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             for (src, dest) in cpu.x[10..].iter().zip(args.iter_mut()) {
                 *dest = *src;
             }
-            match cpu.memory.write().unwrap().syscall(args) {
+            match cpu.memory.lock().unwrap().syscall(args) {
                 super::mmu::SyscallResult::Ok(result) => {
                     for (src, dest) in result.iter().zip(cpu.x[10..].iter_mut()) {
                         *dest = *src;
@@ -2938,14 +2933,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         operation: |cpu, word, _address| {
             let f = parse_format_r(word);
             // @TODO: Implement properly
-            cpu.x[f.rd] = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
-                Ok(data) => {
-                    cpu.is_reservation_set = true;
-                    cpu.reservation = cpu.x[f.rs1] as u64; // Is virtual address ok?
-                    data as i64
-                }
-                Err(e) => return Err(e),
-            };
+            let address = cpu.x[f.rs1] as u64;
+            cpu.x[f.rd] = cpu.mmu.load_doubleword(address)? as i64;
+            if cpu.mmu.reserve(address) {
+                cpu.reservation = Some(address);
+            }
             Ok(())
         },
         disassemble: dump_format_r,
@@ -2957,14 +2949,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         operation: |cpu, word, _address| {
             let f = parse_format_r(word);
             // @TODO: Implement properly
-            cpu.x[f.rd] = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
-                Ok(data) => {
-                    cpu.is_reservation_set = true;
-                    cpu.reservation = cpu.x[f.rs1] as u64; // Is virtual address ok?
-                    data as i32 as i64
-                }
-                Err(e) => return Err(e),
-            };
+            let address = cpu.x[f.rs1] as u64;
+            cpu.x[f.rd] = cpu.mmu.load_word(address)? as i64;
+            if cpu.mmu.reserve(address) {
+                cpu.reservation = Some(address);
+            }
             Ok(())
         },
         disassemble: dump_format_r,
@@ -3223,19 +3212,14 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         operation: |cpu, word, _address| {
             let f = parse_format_r(word);
             // @TODO: Implement properly
-            cpu.x[f.rd] = match cpu.is_reservation_set && cpu.reservation == (cpu.x[f.rs1] as u64) {
-                true => match cpu
-                    .mmu
-                    .store_doubleword(cpu.x[f.rs1] as u64, cpu.x[f.rs2] as u64)
-                {
-                    Ok(()) => {
-                        cpu.is_reservation_set = false;
-                        0
-                    }
-                    Err(e) => return Err(e),
-                },
-                false => 1,
-            };
+            let address = cpu.x[f.rs1] as u64;
+            if Some(address) == cpu.reservation.take() {
+                cpu.mmu.store_doubleword(address, cpu.x[f.rs2] as u64)?;
+                cpu.mmu.clear_reservation(address);
+                cpu.x[f.rd] = 0;
+                return Ok(());
+            }
+            cpu.x[f.rd] = 1;
             Ok(())
         },
         disassemble: dump_format_r,
@@ -3247,16 +3231,14 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         operation: |cpu, word, _address| {
             let f = parse_format_r(word);
             // @TODO: Implement properly
-            cpu.x[f.rd] = match cpu.is_reservation_set && cpu.reservation == (cpu.x[f.rs1] as u64) {
-                true => match cpu.mmu.store_word(cpu.x[f.rs1] as u64, cpu.x[f.rs2] as u32) {
-                    Ok(()) => {
-                        cpu.is_reservation_set = false;
-                        0
-                    }
-                    Err(e) => return Err(e),
-                },
-                false => 1,
-            };
+            let address = cpu.x[f.rs1] as u64;
+            if Some(address) == cpu.reservation.take() {
+                cpu.mmu.clear_reservation(address);
+                cpu.mmu.store_word(address, cpu.x[f.rs2] as u32)?;
+                cpu.x[f.rd] = 0;
+                return Ok(());
+            }
+            cpu.x[f.rd] = 1;
             Ok(())
         },
         disassemble: dump_format_r,
@@ -4142,79 +4124,5 @@ mod test_cpu {
 
         // No effect to PC
         assert_eq!(memory_base, cpu.read_pc());
-    }
-}
-
-#[cfg(test)]
-
-mod test_decode_cache {
-    use super::*;
-
-    #[test]
-    fn initialize() {
-        let _cache = DecodeCache::new();
-    }
-
-    #[test]
-    fn insert() {
-        let mut cache = DecodeCache::new();
-        cache.insert(0, 0);
-    }
-
-    #[test]
-    fn get() {
-        let mut cache = DecodeCache::new();
-        cache.insert(1, 2);
-
-        // Cache hit test
-        match cache.get(1) {
-            Some(index) => assert_eq!(2, index),
-            None => panic!("Unexpected cache miss"),
-        };
-
-        // Cache miss test
-        match cache.get(2) {
-            Some(_index) => panic!("Unexpected cache hit"),
-            None => {}
-        };
-    }
-
-    #[test]
-    fn lru() {
-        let mut cache = DecodeCache::new();
-        cache.insert(0, 1);
-
-        match cache.get(0) {
-            Some(index) => assert_eq!(1, index),
-            None => panic!("Unexpected cache miss"),
-        };
-
-        for i in 1..DECODE_CACHE_ENTRY_NUM + 1 {
-            cache.insert(i as u32, i + 1);
-        }
-
-        // The oldest entry should have been removed because of the overflow
-        match cache.get(0) {
-            Some(_index) => panic!("Unexpected cache hit"),
-            None => {}
-        };
-
-        // With this .get(), the entry with the word "1" moves to the tail of the list
-        // and the entry with the word "2" becomes the oldest entry.
-        match cache.get(1) {
-            Some(index) => assert_eq!(2, index),
-            None => {}
-        };
-
-        // The oldest entry with the word "2" will be removed due to the overflow
-        cache.insert(
-            DECODE_CACHE_ENTRY_NUM as u32 + 1,
-            DECODE_CACHE_ENTRY_NUM + 2,
-        );
-
-        match cache.get(2) {
-            Some(_index) => panic!("Unexpected cache hit"),
-            None => {}
-        };
     }
 }

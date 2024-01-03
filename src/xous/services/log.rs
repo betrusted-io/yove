@@ -39,10 +39,12 @@ impl Service for Log {
             let print_buffer = &buf[0..extra[1] as usize];
             // println!("Log stdout:");
             std::io::stdout().write_all(print_buffer).unwrap();
+            std::io::stdout().flush().unwrap();
         } else if opcode == LogLendOpcode::StandardError as u32 {
             let print_buffer = &buf[0..extra[1] as usize];
             // println!("Log stderr:");
             std::io::stderr().write_all(print_buffer).unwrap();
+            std::io::stderr().flush().unwrap();
         } else {
             panic!("Log lend {}: {} {:x?}", sender, opcode, buf);
         }

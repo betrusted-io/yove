@@ -73,7 +73,14 @@ pub enum Syscall {
         i64, /* name */
     ),
     Connect([u32; 4] /* Server ID */),
+    TryConnect([u32; 4] /* Server ID */),
     SendMessage(
+        u32,      /* Connection ID */
+        u32,      /* message kind */
+        u32,      /* opcode */
+        [u32; 4], /* descriptor */
+    ),
+    TrySendMessage(
         u32,      /* Connection ID */
         u32,      /* message kind */
         u32,      /* opcode */
@@ -131,7 +138,24 @@ impl From<[i64; 8]> for Syscall {
                 value[3] as u32,
                 value[4] as u32,
             ]),
+            SyscallNumber::TryConnect => Syscall::TryConnect([
+                value[1] as u32,
+                value[2] as u32,
+                value[3] as u32,
+                value[4] as u32,
+            ]),
             SyscallNumber::SendMessage => Syscall::SendMessage(
+                value[1] as u32,
+                value[2] as u32,
+                value[3] as u32,
+                [
+                    value[4] as u32,
+                    value[5] as u32,
+                    value[6] as u32,
+                    value[7] as u32,
+                ],
+            ),
+            SyscallNumber::TrySendMessage => Syscall::TrySendMessage(
                 value[1] as u32,
                 value[2] as u32,
                 value[3] as u32,

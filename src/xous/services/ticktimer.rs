@@ -5,6 +5,7 @@ use std::{
 };
 
 use super::LendResult;
+use crate::xous::Memory;
 
 pub struct Ticktimer {
     start: std::time::SystemTime,
@@ -35,16 +36,24 @@ impl Default for Ticktimer {
 }
 
 impl super::Service for Ticktimer {
-    fn scalar(&mut self, _sender: u32, opcode: u32, args: [u32; 4]) {
+    fn scalar(&mut self, _memory: &mut Memory, _sender: u32, opcode: u32, args: [u32; 4]) {
         if opcode == ScalarOpcode::FreeCondition as u32 {
             let condition_index = args[0] as usize;
             if let Some(condvar) = self.condvars.remove(&condition_index) {
                 assert!(condvar.1.load(std::sync::atomic::Ordering::Relaxed) == 0);
             }
+        } else {
+            println!("Unhandled scalar: {}", opcode);
         }
     }
 
-    fn blocking_scalar(&mut self, sender: u32, opcode: u32, args: [u32; 4]) -> super::ScalarResult {
+    fn blocking_scalar(
+        &mut self,
+        _memory: &mut Memory,
+        sender: u32,
+        opcode: u32,
+        args: [u32; 4],
+    ) -> super::ScalarResult {
         if opcode == ScalarOpcode::ElapsedMs as u32 {
             let elapsed_ms = std::time::SystemTime::now()
                 .duration_since(self.start)
@@ -118,19 +127,27 @@ impl super::Service for Ticktimer {
             super::ScalarResult::Scalar1(notify_count as u32)
         } else {
             panic!(
-                "Ticktimer blocking_scalar {}: {} {:x?}",
+                "Ticktimer unhandled blocking_scalar {}: {} {:x?}",
                 sender, opcode, args
             );
         }
     }
 
-    fn lend(&mut self, sender: u32, opcode: u32, _buf: &[u8], extra: [u32; 2]) -> LendResult {
+    fn lend(
+        &mut self,
+        _memory: &mut Memory,
+        sender: u32,
+        opcode: u32,
+        _buf: &[u8],
+        extra: [u32; 2],
+    ) -> LendResult {
         println!("Ticktimer lend {}: {} {:x?}", sender, opcode, extra);
         LendResult::MemoryReturned([0, 0])
     }
 
     fn lend_mut(
         &mut self,
+        _memory: &mut Memory,
         sender: u32,
         opcode: u32,
         _buf: &mut [u8],
@@ -140,7 +157,14 @@ impl super::Service for Ticktimer {
         LendResult::MemoryReturned([0, 0])
     }
 
-    fn send(&mut self, sender: u32, opcode: u32, _buf: &[u8], extra: [u32; 2]) {
+    fn send(
+        &mut self,
+        _memory: &mut Memory,
+        sender: u32,
+        opcode: u32,
+        _buf: &[u8],
+        extra: [u32; 2],
+    ) {
         println!("Ticktimer send {}: {} {:x?}", sender, opcode, extra);
     }
 }

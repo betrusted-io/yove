@@ -1,3 +1,6 @@
+use std::sync::mpsc::channel;
+
+use super::super::xous::services::get_service;
 use super::definitions::{SyscallErrorNumber, SyscallResultNumber};
 use super::services;
 use super::Memory;
@@ -58,7 +61,7 @@ pub fn connect(memory: &mut Memory, id: [u32; 4]) -> SyscallResult {
     //     "Connect([0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}])",
     //     id[0], id[1], id[2], id[3]
     // );
-    if let Some(service) = super::super::xous::services::get_service(&id) {
+    if let Some(service) = get_service(&id) {
         let connection_id = memory.connections.len() as u32 + 1;
         memory.connections.insert(connection_id, service);
         [
@@ -91,7 +94,6 @@ pub fn try_connect(memory: &mut Memory, id: [u32; 4]) -> SyscallResult {
     connect(memory, id)
 }
 
-
 pub fn send_message(
     memory: &mut Memory,
     connection_id: u32,
@@ -116,11 +118,13 @@ pub fn send_message(
     } else {
         None
     };
-    let Some(service) = memory.connections.get_mut(&connection_id) else {
+    // Pull the service out of the connections table so that we can send
+    // a mutable copy of the memory object to the service.
+    let Some(mut service) = memory.connections.remove(&connection_id) else {
         println!("Unhandled connection ID {}", connection_id);
         return [
             SyscallResultNumber::Error as i64,
-            9, /* ServerNotFound */
+            SyscallErrorNumber::ServerNotFound as i64,
             0,
             0,
             0,
@@ -130,12 +134,12 @@ pub fn send_message(
         ]
         .into();
     };
-    match kind {
+    let response = match kind {
         1..=3 => {
             let mut memory_region = memory_region.unwrap();
             let extra = [args[2], args[3]];
             match kind {
-                1 => match service.lend_mut(0, opcode, &mut memory_region, extra) {
+                1 => match service.lend_mut(memory, 0, opcode, &mut memory_region, extra) {
                     services::LendResult::WaitForResponse(msg) => msg.into(),
                     services::LendResult::MemoryReturned(result) => {
                         for (offset, value) in memory_region.into_iter().enumerate() {
@@ -154,7 +158,7 @@ pub fn send_message(
                         .into()
                     }
                 },
-                2 => match service.lend(0, opcode, &memory_region, extra) {
+                2 => match service.lend(memory, 0, opcode, &memory_region, extra) {
                     services::LendResult::WaitForResponse(msg) => msg.into(),
                     services::LendResult::MemoryReturned(result) => [
                         SyscallResultNumber::MemoryReturned as i64,
@@ -169,17 +173,17 @@ pub fn send_message(
                     .into(),
                 },
                 3 => {
-                    service.send(0, opcode, &memory_region, extra);
+                    service.send(memory, 0, opcode, &memory_region, extra);
                     [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
                 }
                 _ => unreachable!(),
             }
         }
         4 => {
-            service.scalar(0, opcode, args);
+            service.scalar(memory, 0, opcode, args);
             [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
         }
-        5 => match service.blocking_scalar(0, opcode, args) {
+        5 => match service.blocking_scalar(memory, 0, opcode, args) {
             services::ScalarResult::Scalar1(result) => [
                 SyscallResultNumber::Scalar1 as i64,
                 result as i64,
@@ -216,20 +220,22 @@ pub fn send_message(
             services::ScalarResult::WaitForResponse(msg) => msg.into(),
         },
         _ => {
-            println!("Unknown message kind {}", kind);
-            [
-                SyscallResultNumber::Error as i64,
-                9, /* ServerNotFound */
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ]
-            .into()
+            panic!("Unknown message kind {}", kind);
+            // [
+            //     SyscallResultNumber::Error as i64,
+            //     9, /* ServerNotFound */
+            //     0,
+            //     0,
+            //     0,
+            //     0,
+            //     0,
+            //     0,
+            // ]
+            // .into()
         }
-    }
+    };
+    memory.connections.insert(connection_id, service);
+    response
 }
 
 pub fn try_send_message(
@@ -293,4 +299,39 @@ pub fn increase_heap(memory: &mut Memory, delta: i64, _flags: i64) -> SyscallRes
         ]
         .into()
     }
+}
+
+pub fn create_thread(
+    memory: &mut Memory,
+    entry_point: i64,
+    stack_pointer: i64,
+    stack_length: i64,
+    arguments: [i64; 4],
+) -> SyscallResult {
+    let (tx, rx) = channel();
+    memory
+        .memory_cmd
+        .send(super::MemoryCommand::CreateThread(
+            entry_point as _,
+            stack_pointer as _,
+            stack_length as _,
+            arguments[0] as _,
+            arguments[1] as _,
+            arguments[2] as _,
+            arguments[3] as _,
+            tx,
+        ))
+        .unwrap();
+    let thread_id = rx.recv().unwrap();
+    [
+        SyscallResultNumber::ThreadId as i64,
+        thread_id,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+    .into()
 }

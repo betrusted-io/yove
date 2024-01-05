@@ -147,7 +147,6 @@ struct Memory {
     free_pages: BTreeSet<usize>,
     heap_start: u32,
     heap_size: u32,
-    // allocation_start: u32,
     allocation_previous: u32,
     l1_pt: u32,
     satp: u32,
@@ -664,33 +663,13 @@ impl riscv_cpu::cpu::Memory for Memory {
                 argument_2,
                 argument_3,
                 argument_4,
-            ) => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.memory_cmd
-                    .send(MemoryCommand::CreateThread(
-                        entry_point as _,
-                        stack_pointer as _,
-                        stack_length as _,
-                        argument_1 as _,
-                        argument_2 as _,
-                        argument_3 as _,
-                        argument_4 as _,
-                        tx,
-                    ))
-                    .unwrap();
-                let thread_id = rx.recv().unwrap();
-                [
-                    SyscallResultNumber::ThreadId as i64,
-                    thread_id,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]
-                .into()
-            }
+            ) => syscalls::create_thread(
+                self,
+                entry_point,
+                stack_pointer,
+                stack_length,
+                [argument_1, argument_2, argument_3, argument_4],
+            ),
             Syscall::UnmapMemory(address, size) => {
                 // println!("UnmapMemory({:08x}, {})", address, size);
                 for offset in (address..address + size).step_by(4096) {

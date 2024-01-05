@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::mpsc::Receiver,
     sync::{Arc, Mutex},
 };
@@ -51,11 +52,12 @@ pub struct Mmu {
     privilege_mode: PrivilegeMode,
     memory: Arc<Mutex<dyn Memory + Send + Sync>>,
 
-    // /// The size of main memory (if initialized)
-    // memory_length: Option<NonZeroU64>,
     /// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
     /// then `Mmu` has copy of it.
     mstatus: u64,
+
+    /// A cache of instructions. We assume that instruction memory does not change.
+    instruction_cache: Arc<Mutex<HashMap<u64, u32>>>,
 }
 
 #[derive(Debug)]
@@ -96,6 +98,7 @@ impl Mmu {
             privilege_mode: PrivilegeMode::Machine,
             memory,
             mstatus: 0,
+            instruction_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -170,13 +173,23 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     pub fn fetch_word(&self, v_address: u64) -> Result<u32, Trap> {
+        // if let Some(data) = self.instruction_cache.lock().unwrap().get(&v_address) {
+        //     return Ok(*data);
+        // }
         let width = 4;
         if (v_address & 0xfff) <= (0x1000 - width) {
             // Fast path. All bytes fetched are in the same page so
             // translating an address only once.
             let effective_address = self.trim_to_xlen(v_address);
             self.translate_address(effective_address, &MemoryAccessType::Execute)
-                .map(|p_address| self.load_word_raw(p_address))
+                .map(|p_address| {
+                    let data = self.load_word_raw(p_address);
+                    self.instruction_cache
+                        .lock()
+                        .unwrap()
+                        .insert(v_address, data);
+                    data
+                })
                 .map_err(|()| Trap {
                     trap_type: TrapType::InstructionPageFault,
                     value: effective_address,
@@ -189,6 +202,10 @@ impl Mmu {
                     Err(e) => return Err(e),
                 };
             }
+            self.instruction_cache
+                .lock()
+                .unwrap()
+                .insert(v_address, data);
             Ok(data)
         }
     }

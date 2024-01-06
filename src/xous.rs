@@ -103,7 +103,6 @@ impl Worker {
     }
     fn run(&mut self) {
         use riscv_cpu::cpu::TickResult;
-        // println!("Running CPU thread {}", self.tid);
         loop {
             match self.cpu.tick() {
                 TickResult::PauseEmulation(e) => {

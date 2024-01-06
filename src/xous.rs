@@ -19,6 +19,17 @@ const ALLOCATION_START: u32 = 0x4000_0000;
 const ALLOCATION_END: u32 = ALLOCATION_START + 5 * 1024 * 1024;
 const HEAP_START: u32 = 0xa000_0000;
 const HEAP_END: u32 = HEAP_START + 5 * 1024 * 1024;
+const STACK_START: u32 = 0xc000_0000;
+const STACK_END: u32 = 0xc002_0000;
+
+/// Magic number indicating we have an environment block
+const ENV_MAGIC: [u8; 4] = *b"EnvB";
+
+/// Command line arguments list
+const ARGS_MAGIC: [u8; 4] = *b"ArgL";
+
+/// Magic number indicating the loader has passed application parameters
+const PARAMS_MAGIC: [u8; 4] = *b"AppP";
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -744,6 +755,87 @@ impl Machine {
         Ok(machine)
     }
 
+    pub fn create_params() -> std::io::Result<Vec<u8>> {
+        use std::io::Write;
+
+        // Copy the host's environment variables into the target's environment
+        let mut env_map = HashMap::new();
+        for (key, value) in std::env::vars() {
+            env_map.insert(key, value);
+        }
+
+        let mut env_data = vec![];
+        // Number of environment variables
+        env_data.write_all(&(env_map.len() as u16).to_le_bytes())?;
+        for (key, value) in env_map.iter() {
+            env_data.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            env_data.extend_from_slice(key.as_bytes());
+            env_data.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            env_data.extend_from_slice(value.as_bytes());
+        }
+        let mut env_tag = vec![];
+
+        // Magic number
+        env_tag.write_all(&ENV_MAGIC)?;
+        // Size of the EnvB block
+        env_tag.write_all(&(env_data.len() as u32).to_le_bytes())?;
+
+        // Environment variables
+        env_tag.write_all(&env_data)?;
+
+        let mut arg_tag = vec![];
+        let mut arg_data = vec![];
+        // Copy arguments, making sure to skip the program name and target name
+        let our_args = std::env::args().skip(1).collect::<Vec<_>>();
+        if our_args.contains(&"--".to_owned()) {
+            let mut found = false;
+            let mut first = false;
+            for arg in our_args.iter() {
+                // Always push the first argument, since it's the program name
+                if first {
+                    arg_data.push(arg);
+                    first = false;
+                } else if found {
+                    arg_data.push(arg);
+                } else if arg == "--" {
+                    found = true;
+                }
+            }
+        } else {
+            for arg in our_args.iter() {
+                arg_data.push(arg);
+            }
+        }
+        arg_tag.write_all(&ARGS_MAGIC)?;
+        let mut args_size = 0;
+        for entry in arg_data.iter() {
+            args_size += entry.len() + 2;
+        }
+        arg_tag.write_all(&(args_size as u32 + 2).to_le_bytes())?;
+        arg_tag.write_all(&(arg_data.len() as u16).to_le_bytes())?;
+        for entry in arg_data {
+            arg_tag.write_all(&(entry.len() as u16).to_le_bytes())?;
+            arg_tag.write_all(entry.as_bytes())?;
+        }
+
+        // Magic number
+        let mut params_tag = vec![];
+        params_tag.write_all(&PARAMS_MAGIC)?;
+        // Size of the AppP block
+        params_tag.write_all(&8u32.to_le_bytes())?;
+        // Size of the entire array
+        params_tag.write_all(&((env_tag.len() + arg_tag.len()) as u32 + 16).to_le_bytes())?;
+        // Number of blocks
+        params_tag.write_all(&3u32.to_le_bytes())?;
+
+        let mut sample_data = vec![];
+        sample_data.write_all(&params_tag)?;
+        sample_data.write_all(&env_tag)?;
+        sample_data.write_all(&arg_tag)?;
+
+        Ok(sample_data)
+    }
+
     pub fn load_program(&mut self, program: &[u8]) -> Result<(), LoadError> {
         let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone())
             .xlen(riscv_cpu::Xlen::Bit32)
@@ -789,8 +881,15 @@ impl Machine {
 
         let satp = memory_writer.satp.into();
 
+        // Create the argument block and shove it at the top of stack.
+        let param_block = Self::create_params().expect("failed to create argument block");
+        let param_block_start = STACK_END - param_block.len() as u32;
+        memory_writer.write_bytes(&param_block, param_block_start);
+        // Place the argument block into $a1
+        cpu.write_register(11, param_block_start as i64);
+
         // Ensure stack is allocated
-        for page in (0xc000_0000..0xc002_0000).step_by(4096) {
+        for page in (STACK_START..STACK_END).step_by(4096) {
             memory_writer.ensure_page(page).expect("out of memory");
         }
         drop(memory_writer);
@@ -810,7 +909,7 @@ impl Machine {
         cpu.execute_opcode(0x10200073).map_err(LoadError::CpuTrap)?;
 
         // Update the stack pointer
-        cpu.write_register(2, 0xc002_0000 - 16);
+        cpu.write_register(2, (STACK_END as i64 - 16 - param_block.len() as i64) & !0xf);
 
         let cmd = self.memory_cmd_sender.clone();
         let memory = self.memory.clone();

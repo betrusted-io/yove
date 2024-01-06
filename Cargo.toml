@@ -1,7 +1,7 @@
 workspace = { members = ["crates/riscv-cpu"] }
 
 [package]
-name = "jurubas"
+name = "kritos"
 version = "0.1.0"
 edition = "2021"
 

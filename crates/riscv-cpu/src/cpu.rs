@@ -772,10 +772,8 @@ impl Cpu {
     }
 
     fn fetch(&mut self) -> Result<u32, Trap> {
-        // println!("Fetching word from {:08x}...", self.pc);
         self.mmu.fetch_word(self.pc).map_err(|e| {
             self.pc = self.pc.wrapping_add(4); // @TODO: What if instruction is compressed?
-                                               // println!("Fetch error: {:x?}", e);
             e
         })
     }

@@ -1517,7 +1517,7 @@ impl Cpu {
 
 impl Default for Cpu {
     fn default() -> Self {
-        let memory = Arc::new(Mutex::new(memory::Memory::new(16384)));
+        let memory = Arc::new(Mutex::new(memory::Memory::new(16384, 0x08000000)));
         Self::new(memory)
     }
 }
@@ -3607,9 +3607,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 #[cfg(test)]
 mod test_cpu {
     use super::*;
+    const MEMORY_BASE: u64 = 0x8000_0000;
 
     fn create_cpu(memory_capacity: usize) -> Cpu {
-        let memory = memory::Memory::new(memory_capacity);
+        let memory = memory::Memory::new(memory_capacity, MEMORY_BASE as usize);
         Cpu::new(Arc::new(Mutex::new(memory)))
     }
 
@@ -3683,7 +3684,7 @@ mod test_cpu {
     #[test]
     fn tick() {
         let mut cpu = create_cpu(4);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         cpu.update_pc(memory_base);
 
         // Write non-compressed "addi x1, x1, 1" instruction
@@ -3711,7 +3712,7 @@ mod test_cpu {
     #[test]
     fn tick_operate() {
         let mut cpu = create_cpu(4);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         cpu.update_pc(memory_base);
         // write non-compressed "addi a0, a0, 12" instruction
         match cpu.get_mut_mmu().store_word(memory_base, 0xc50513) {
@@ -3739,7 +3740,7 @@ mod test_cpu {
         // .fetch() doesn't increment the program counter.
         // .tick_operate() does.
         let mut cpu = create_cpu(4);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         cpu.update_pc(memory_base);
         match cpu.get_mut_mmu().store_word(memory_base, 0xaaaaaaaa) {
             Ok(()) => {}
@@ -3792,7 +3793,7 @@ mod test_cpu {
     fn wfi() {
         let wfi_instruction = 0x10500073;
         let mut cpu = create_cpu(4);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         // Just in case
         match cpu.decode_raw(wfi_instruction) {
             Ok(inst) => assert_eq!(inst.name, "WFI"),
@@ -3826,7 +3827,7 @@ mod test_cpu {
     fn interrupt() {
         let handler_vector = 0x10000000;
         let mut cpu = create_cpu(4);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         // Write non-compressed "addi x0, x0, 1" instruction
         match cpu.get_mut_mmu().store_word(memory_base, 0x00100013) {
             Ok(()) => {}
@@ -3867,7 +3868,7 @@ mod test_cpu {
     fn syscall() {
         let handler_vector = 0x10000000;
         let mut cpu = create_cpu(4);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         // Write ECALL instruction
         match cpu.get_mut_mmu().store_word(memory_base, 0x00000073) {
             Ok(()) => {}
@@ -3893,7 +3894,7 @@ mod test_cpu {
     #[test]
     fn hardocded_zero() {
         let mut cpu = create_cpu(8);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         cpu.update_pc(memory_base);
 
         // Write non-compressed "addi x0, x0, 1" instruction
@@ -3923,7 +3924,7 @@ mod test_cpu {
     #[test]
     fn disassemble_next_instruction() {
         let mut cpu = create_cpu(4);
-        let memory_base = memory::Memory::memory_base();
+        let memory_base = MEMORY_BASE;
         cpu.update_pc(memory_base);
 
         // Write non-compressed "addi x0, x0, 1" instruction

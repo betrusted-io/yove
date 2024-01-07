@@ -4,21 +4,25 @@ const MEMORY_BASE: usize = 0x8000_0000;
 
 /// Emulates main memory.
 pub struct Memory {
-    /// Memory content
+    /// Memory contents
     data: Vec<u64>,
+
+    /// Offset where RAM lives
+    base: usize,
 }
 
 impl Memory {
     /// Creates a new `Memory`
-    pub fn new(memory_size: usize) -> Self {
+    pub fn new(memory_size: usize, base: usize) -> Self {
         Memory {
             data: vec![0u64; memory_size / 4],
+            base,
         }
     }
 
     #[allow(dead_code)]
-    pub fn memory_base() -> u64 {
-        MEMORY_BASE as u64
+    pub fn memory_base(&self) -> u64 {
+        self.base as u64
     }
 
     /// Reads multiple bytes from memory.
@@ -195,6 +199,6 @@ impl super::Memory for Memory {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self::new(16384)
+        Self::new(16384, 0x0000_0000)
     }
 }

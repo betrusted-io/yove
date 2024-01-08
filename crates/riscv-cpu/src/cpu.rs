@@ -365,7 +365,7 @@ impl Cpu {
 
         let Ok(inst) = self.decode_raw(word) else {
             panic!(
-                "Unknown instruction PC:{:x} WORD:{:x}",
+                "Unknown instruction PC:0x{:x} WORD:0x{:x}",
                 instruction_address, original_word
             );
         };
@@ -1440,7 +1440,7 @@ impl Cpu {
 
         let Ok(inst) = self.decode_raw(word) else {
             return format!(
-                "Unknown instruction PC:{:x} WORD:{:x}",
+                "Unknown instruction PC:0x{:x} WORD:0x{:x}",
                 self.pc, original_word
             );
         };

@@ -39,8 +39,8 @@ pub trait Memory {
     fn validate_address(&self, address: u32) -> bool;
     fn syscall(&mut self, args: [i32; 8]) -> SyscallResult;
     fn translate(&self, v_address: u32) -> Option<u32>;
-    fn reserve(&mut self, p_address: u32) -> bool;
-    fn clear_reservation(&mut self, p_address: u32);
+    fn reserve(&mut self, core: u32, p_address: u32);
+    fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool;
 }
 
 /// Emulates Memory Management Unit. It holds the Main memory and peripheral
@@ -140,10 +140,6 @@ impl Mmu {
         self.ppn = ppn;
     }
 
-    fn trim_to_xlen(&self, address: u32) -> u32 {
-        address
-    }
-
     /// Fetches an instruction byte. This method takes virtual address
     /// and translates into physical address inside.
     ///
@@ -171,7 +167,7 @@ impl Mmu {
         if (v_address & 0xfff) <= (0x1000 - width) {
             // Fast path. All bytes fetched are in the same page so
             // translating an address only once.
-            let effective_address = self.trim_to_xlen(v_address);
+            let effective_address = v_address;
             self.translate_address(effective_address, &MemoryAccessType::Execute)
                 .map(|p_address| {
                     let data = self.load_word_raw(p_address);
@@ -207,7 +203,7 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     pub fn load(&self, v_address: u32) -> Result<u8, Trap> {
-        let effective_address = self.trim_to_xlen(v_address);
+        let effective_address = v_address;
         match self.translate_address(effective_address, &MemoryAccessType::Read) {
             Ok(p_address) => Ok(self.load_raw(p_address)),
             Err(()) => Err(Trap {
@@ -364,7 +360,7 @@ impl Mmu {
         self.memory
             .lock() // .read()
             .unwrap()
-            .read_u8(self.trim_to_xlen(p_address))
+            .read_u8(p_address)
     }
 
     /// Loads two bytes from main memory or peripheral devices depending on
@@ -376,7 +372,7 @@ impl Mmu {
         self.memory
             .lock() // .read()
             .unwrap()
-            .read_u16(self.trim_to_xlen(p_address))
+            .read_u16(p_address)
     }
 
     /// Loads four bytes from main memory or peripheral devices depending on
@@ -388,20 +384,8 @@ impl Mmu {
         self.memory
             .lock() // .read()
             .unwrap()
-            .read_u32(self.trim_to_xlen(p_address))
+            .read_u32(p_address)
     }
-
-    // /// Loads eight bytes from main memory or peripheral devices depending on
-    // /// physical address.
-    // ///
-    // /// # Arguments
-    // /// * `p_address` Physical address
-    // fn load_doubleword_raw(&self, p_address: u64) -> u64 {
-    //     self.memory
-    //         .lock() // .read()
-    //         .unwrap()
-    //         .read_u64(self.trim_to_xlen(p_address))
-    // }
 
     /// Stores a byte to main memory or peripheral devices depending on
     /// physical address.
@@ -413,7 +397,7 @@ impl Mmu {
         self.memory
             .lock() // .write()
             .unwrap()
-            .write_u8(self.trim_to_xlen(p_address), value)
+            .write_u8(p_address, value)
     }
 
     /// Stores two bytes to main memory or peripheral devices depending on
@@ -426,7 +410,7 @@ impl Mmu {
         self.memory
             .lock() // .write()
             .unwrap()
-            .write_u16(self.trim_to_xlen(p_address), value)
+            .write_u16(p_address, value)
     }
 
     /// Stores four bytes to main memory or peripheral devices depending on
@@ -439,7 +423,7 @@ impl Mmu {
         self.memory
             .lock() // .write()
             .unwrap()
-            .write_u32(self.trim_to_xlen(p_address), value)
+            .write_u32(p_address, value)
     }
 
     // /// Stores eight bytes to main memory or peripheral devices depending on
@@ -467,22 +451,22 @@ impl Mmu {
                 self.memory
                     .lock() // .read()
                     .unwrap()
-                    .validate_address(self.trim_to_xlen(p_address))
+                    .validate_address(p_address)
             })
     }
 
-    pub fn reserve(&mut self, p_address: u32) -> bool {
+    pub fn reserve(&mut self, core: u32, p_address: u32) {
         self.memory
             .lock() // .write()
             .unwrap()
-            .reserve(self.trim_to_xlen(p_address))
+            .reserve(core, p_address)
     }
 
-    pub fn clear_reservation(&mut self, p_address: u32) {
+    pub fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool {
         self.memory
             .lock() // .write()
             .unwrap()
-            .clear_reservation(self.trim_to_xlen(p_address))
+            .clear_reservation(core, p_address)
     }
 
     fn translate_address(&self, v_address: u32, access_type: &MemoryAccessType) -> Result<u32, ()> {
@@ -505,7 +489,7 @@ impl Mmu {
         access_type: &MemoryAccessType,
         privilege_mode: PrivilegeMode,
     ) -> Result<u32, ()> {
-        let address = self.trim_to_xlen(v_address);
+        let address = v_address;
 
         match self.addressing_mode {
             AddressingMode::None => Ok(address),

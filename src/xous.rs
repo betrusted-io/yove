@@ -164,7 +164,7 @@ struct Memory {
     memory_cmd: Sender<MemoryCommand>,
     translation_cache: HashMap<u32, u32>,
     allocated_bytes: u32,
-    reservations: HashSet<u32>,
+    reservations: HashMap<u32, u32>,
 }
 
 impl Memory {
@@ -198,7 +198,7 @@ impl Memory {
                 memory_cmd,
                 translation_cache: HashMap::new(),
                 allocated_bytes: 4096,
-                reservations: HashSet::new(),
+                reservations: HashMap::new(),
             },
             memory_cmd_rx,
         )
@@ -628,12 +628,12 @@ impl riscv_cpu::cpu::Memory for Memory {
         self.translation_cache.get(&ppn).map(|x| (*x + offset))
     }
 
-    fn reserve(&mut self, p_address: u32) -> bool {
-        self.reservations.insert(p_address)
+    fn reserve(&mut self, core: u32, p_address: u32) {
+        self.reservations.insert(core, p_address);
     }
 
-    fn clear_reservation(&mut self, p_address: u32) {
-        self.reservations.remove(&{ p_address });
+    fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool {
+        self.reservations.remove(&{ p_address }) == Some(core)
     }
 }
 
@@ -917,6 +917,7 @@ impl Machine {
 
                     let cmd = self.memory_cmd_sender.clone();
                     let tid = self.thread_id_counter.fetch_add(1, Ordering::SeqCst);
+                    cpu.write_csr(riscv_cpu::cpu::CSR_MHARTID_ADDRESS, tid as u32).unwrap();
                     let memory = self.memory.clone();
                     join_tx
                         .send(std::thread::spawn(move || {

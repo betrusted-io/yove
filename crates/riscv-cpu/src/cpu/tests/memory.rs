@@ -1,4 +1,5 @@
 use super::Memory as CpuMemory;
+use std::collections::HashMap;
 
 const MEMORY_BASE: usize = 0x8000_0000;
 
@@ -15,6 +16,9 @@ pub struct Memory {
 
     /// Address of the `tohost` offset
     tohost: u32,
+
+    /// Which addresses are reserved
+    reservations: HashMap<u32, u32>,
 }
 
 impl Memory {
@@ -25,6 +29,7 @@ impl Memory {
             base,
             vm_result: None,
             tohost,
+            reservations: HashMap::new(),
         }
     }
 
@@ -179,12 +184,12 @@ impl super::Memory for Memory {
         todo!()
     }
 
-    fn reserve(&mut self, _p_address: u32) -> bool {
-        todo!()
+    fn reserve(&mut self, core: u32, p_address: u32) {
+        self.reservations.insert(core, p_address);
     }
 
-    fn clear_reservation(&mut self, _p_address: u32) {
-        todo!()
+    fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool {
+        self.reservations.remove(&core) == Some(p_address)
     }
 }
 

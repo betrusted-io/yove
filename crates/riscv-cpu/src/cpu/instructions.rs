@@ -1,6 +1,6 @@
 use super::{
     decode_privilege_mode, Cpu, PrivilegeMode, Trap, TrapType, CSR_MEPC_ADDRESS,
-    CSR_MSTATUS_ADDRESS, CSR_SEPC_ADDRESS, CSR_SSTATUS_ADDRESS,
+    CSR_MHARTID_ADDRESS, CSR_MSTATUS_ADDRESS, CSR_SEPC_ADDRESS, CSR_SSTATUS_ADDRESS,
 };
 
 pub struct Instruction {
@@ -1115,10 +1115,9 @@ pub const fn get_instructions() -> [Instruction; INSTRUCTION_NUM] {
                 let f = parse_format_r(word);
                 // @TODO: Implement properly
                 let address = cpu.x[f.rs1] as u32;
+                let core = cpu.read_csr_raw(CSR_MHARTID_ADDRESS);
                 cpu.x[f.rd] = cpu.mmu.load_word(address)? as i32;
-                if cpu.mmu.reserve(address) {
-                    cpu.reservation = Some(address);
-                }
+                cpu.mmu.reserve(core, address);
                 Ok(())
             },
             disassemble: dump_format_r,
@@ -1357,55 +1356,24 @@ pub const fn get_instructions() -> [Instruction; INSTRUCTION_NUM] {
             },
             disassemble: dump_format_s,
         },
-        // Instruction {
-        //     mask: 0xf800707f,
-        //     data: 0x1800302f,
-        //     name: "SC.D",
-        //     operation: |cpu, word, _address| {
-        //         let f = parse_format_r(word);
-        //         // @TODO: Implement properly
-        //         let address = cpu.x[f.rs1] as u32;
-        //         if Some(address) == cpu.reservation.take() {
-        //             cpu.mmu.store_doubleword(address, cpu.x[f.rs2] as u32)?;
-        //             cpu.mmu.clear_reservation(address);
-        //             cpu.x[f.rd] = 0;
-        //             return Ok(());
-        //         }
-        //         cpu.x[f.rd] = 1;
-        //         Ok(())
-        //     },
-        //     disassemble: dump_format_r,
-        // },
         Instruction {
             mask: 0xf800707f,
             data: 0x1800202f,
             name: "SC.W",
             operation: |cpu, word, _address| {
                 let f = parse_format_r(word);
-                // @TODO: Implement properly
                 let address = cpu.x[f.rs1] as u32;
-                if Some(address) == cpu.reservation.take() {
-                    cpu.mmu.clear_reservation(address);
+                let core = cpu.read_csr_raw(CSR_MHARTID_ADDRESS);
+                if cpu.mmu.clear_reservation(core, address) {
                     cpu.mmu.store_word(address, cpu.x[f.rs2] as u32)?;
                     cpu.x[f.rd] = 0;
-                    return Ok(());
+                } else {
+                    cpu.x[f.rd] = 1;
                 }
-                cpu.x[f.rd] = 1;
                 Ok(())
             },
             disassemble: dump_format_r,
         },
-        // Instruction {
-        //     mask: 0x0000707f,
-        //     data: 0x00003023,
-        //     name: "SD",
-        //     operation: |cpu, word, _address| {
-        //         let f = parse_format_s(word);
-        //         cpu.mmu
-        //             .store_doubleword(cpu.x[f.rs1].wrapping_add(f.imm) as u64, cpu.x[f.rs2] as u64)
-        //     },
-        //     disassemble: dump_format_s,
-        // },
         Instruction {
             mask: 0xfe007fff,
             data: 0x12000073,

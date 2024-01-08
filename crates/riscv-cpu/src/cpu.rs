@@ -52,7 +52,7 @@ const _CSR_MCYCLE_ADDRESS: u16 = 0xb00;
 const CSR_CYCLE_ADDRESS: u16 = 0xc00;
 // const CSR_TIME_ADDRESS: u16 = 0xc01;
 const _CSR_INSERT_ADDRESS: u16 = 0xc02;
-const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
+pub const CSR_MHARTID_ADDRESS: u16 = 0xf14;
 
 const MIP_MEIP: u32 = 0x800;
 pub const MIP_MTIP: u32 = 0x080;
@@ -82,7 +82,6 @@ pub struct Cpu {
     csr: [u32; CSR_CAPACITY],
     mmu: Mmu,
     memory: Arc<Mutex<dyn Memory + Send + Sync>>,
-    reservation: Option<u32>, // @TODO: Should support multiple address reservations
     _dump_flag: bool,
     unsigned_data_mask: u32,
     instructions: [instructions::Instruction; instructions::INSTRUCTION_NUM],
@@ -264,7 +263,6 @@ impl Cpu {
             pc: 0,
             csr: [0; CSR_CAPACITY],
             mmu: Mmu::new(memory.clone()),
-            reservation: None,
             _dump_flag: false,
             unsigned_data_mask: !0,
             memory,
@@ -771,25 +769,24 @@ impl Cpu {
     }
 
     pub fn write_csr(&mut self, address: u16, value: u32) -> Result<(), Trap> {
-        match self.has_csr_access_privilege(address) {
-            true => {
-                /*
-                // Checking writability fails some tests so disabling so far
-                let read_only = ((address >> 10) & 0x3) == 0x3;
-                if read_only {
-                    return Err(Exception::IllegalInstruction);
-                }
-                */
-                self.write_csr_raw(address, value);
-                if address == CSR_SATP_ADDRESS {
-                    self.update_addressing_mode(value);
-                }
-                Ok(())
+        if self.has_csr_access_privilege(address) {
+            /*
+            // Checking writability fails some tests so disabling so far
+            let read_only = ((address >> 10) & 0x3) == 0x3;
+            if read_only {
+                return Err(Exception::IllegalInstruction);
             }
-            false => Err(Trap {
+            */
+            self.write_csr_raw(address, value);
+            if address == CSR_SATP_ADDRESS {
+                self.update_addressing_mode(value);
+            }
+            Ok(())
+        } else {
+            Err(Trap {
                 trap_type: TrapType::IllegalInstruction,
                 value: self.pc.wrapping_sub(4), // @TODO: Is this always correct?
-            }),
+            })
         }
     }
 

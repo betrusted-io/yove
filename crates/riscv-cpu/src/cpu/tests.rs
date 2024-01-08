@@ -1,3 +1,4 @@
+mod memory;
 use super::*;
 const MEMORY_BASE: u64 = 0x8000_0000;
 

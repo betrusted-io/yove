@@ -1,7 +1,6 @@
 use std::sync::{mpsc::Receiver, Arc, Mutex};
 
 mod instructions;
-mod memory;
 
 #[cfg(test)]
 mod tests;
@@ -1519,16 +1518,5 @@ impl Cpu {
 
     pub fn phys_write_u8(&mut self, address: u64, value: u8) {
         self.mmu.store_raw(address, value)
-    }
-}
-
-impl Default for Cpu {
-    fn default() -> Self {
-        let memory = Arc::new(Mutex::new(memory::Memory::new(
-            16384,
-            0x08000000,
-            0x8000_1000,
-        )));
-        Self::new(memory)
     }
 }

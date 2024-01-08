@@ -61,11 +61,11 @@ pub const MIP_SEIP: u32 = 0x200;
 const MIP_STIP: u32 = 0x020;
 const MIP_SSIP: u32 = 0x002;
 
-pub type ResponseData = ([i64; 8], Option<(Vec<u8>, u64)>);
+pub type ResponseData = ([i32; 8], Option<(Vec<u8>, u32)>);
 
 pub enum TickResult {
     Ok,
-    ExitThread(u64),
+    ExitThread(u32),
     PauseEmulation(Receiver<ResponseData>),
     CpuTrap(Trap),
 }
@@ -324,7 +324,7 @@ impl Cpu {
                 trap_type: TrapType::InstructionPageFault,
                 value: 0xff803000,
             }) => {
-                return TickResult::ExitThread(self.read_register(10) as u64);
+                return TickResult::ExitThread(self.read_register(10) as u32);
             }
             Err(e) => return TickResult::CpuTrap(e),
         }
@@ -852,26 +852,6 @@ impl Cpu {
                 self.csr[address as usize] = value;
             }
         };
-    }
-
-    fn _set_fcsr_nv(&mut self) {
-        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x10;
-    }
-
-    fn set_fcsr_dz(&mut self) {
-        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x8;
-    }
-
-    fn _set_fcsr_of(&mut self) {
-        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x4;
-    }
-
-    fn _set_fcsr_uf(&mut self) {
-        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x2;
-    }
-
-    fn _set_fcsr_nx(&mut self) {
-        self.csr[CSR_FCSR_ADDRESS as usize] |= 0x1;
     }
 
     fn update_addressing_mode(&mut self, value: u32) {

@@ -237,8 +237,7 @@ impl Mmu {
                     match width {
                         1 => Ok(self.load_raw(p_address) as u32),
                         2 => Ok(self.load_halfword_raw(p_address) as u32),
-                        4 => Ok(self.load_word_raw(p_address) as u32),
-                        // 8 => Ok(self.load_doubleword_raw(p_address)),
+                        4 => Ok(self.load_word_raw(p_address)),
                         _ => panic!("Width must be 1, 2, or 4. {:X}", width),
                     }
                 }
@@ -275,17 +274,8 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     pub fn load_word(&self, v_address: u32) -> Result<u32, Trap> {
-        self.load_bytes(v_address, 4).map(|data| data as u32)
+        self.load_bytes(v_address, 4)
     }
-
-    // /// Loads eight bytes. This method takes virtual address and translates
-    // /// into physical address inside.
-    // ///
-    // /// # Arguments
-    // /// * `v_address` Virtual address
-    // pub fn load_doubleword(&self, v_address: u32) -> Result<u64, Trap> {
-    //     self.load_bytes(v_address, 8)
-    // }
 
     /// Store an byte. This method takes virtual address and translates
     /// into physical address inside.
@@ -323,8 +313,7 @@ impl Mmu {
                     match width {
                         1 => self.store_raw(p_address, value as u8),
                         2 => self.store_halfword_raw(p_address, value as u16),
-                        4 => self.store_word_raw(p_address, value as u32),
-                        // 8 => self.store_doubleword_raw(p_address, value),
+                        4 => self.store_word_raw(p_address, value),
                         _ => panic!("Width must be 1, 2, 4, or 8. {:X}", width),
                     }
                     Ok(())
@@ -363,18 +352,8 @@ impl Mmu {
     /// * `v_address` Virtual address
     /// * `value` data written
     pub fn store_word(&self, v_address: u32, value: u32) -> Result<(), Trap> {
-        self.store_bytes(v_address, value as u32, 4)
+        self.store_bytes(v_address, value, 4)
     }
-
-    // /// Stores eight bytes. This method takes virtual address and translates
-    // /// into physical address inside.
-    // ///
-    // /// # Arguments
-    // /// * `v_address` Virtual address
-    // /// * `value` data written
-    // pub fn store_doubleword(&self, v_address: u64, value: u64) -> Result<(), Trap> {
-    //     self.store_bytes(v_address, value, 8)
-    // }
 
     /// Loads a byte from main memory or peripheral devices depending on
     /// physical address.
@@ -593,8 +572,6 @@ impl Mmu {
         let r = (pte >> 1) & 1;
         let v = pte & 1;
 
-        // println!("VA:{:X} Level:{:X} PTE_AD:{:X} PTE:{:X} PPPN:{:X} PPN:{:X} PPN1:{:X} PPN0:{:X}", v_address, level, pte_address, pte, parent_ppn, ppn, ppns[1], ppns[0]);
-
         if v == 0 || (r == 0 && w == 1) {
             return Err(());
         }
@@ -676,7 +653,6 @@ impl Mmu {
             },
         };
 
-        // println!("PA:{:X}", p_address);
         Ok(p_address)
     }
 }

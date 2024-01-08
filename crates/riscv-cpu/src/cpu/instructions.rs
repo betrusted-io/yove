@@ -1978,18 +1978,18 @@ struct FormatS {
 }
 
 fn parse_format_s(word: u32) -> FormatS {
-    println!(
-        "parse_format_s(0x{:08x}): rs1:{} rs2:{} imm:{}",
-        word,
-        ((word >> 15) & 0x1f) as usize,
-        ((word >> 20) & 0x1f) as usize,
-        (match word & 0x80000000 {
-                0x80000000 => 0xfffff000,
-                _ => 0,
-            } | // imm[31:12] = [31]
-            ((word >> 20) & 0xfe0) | // imm[11:5] = [31:25]
-            ((word >> 7) & 0x1f)) as i32
-    );
+    // println!(
+    //     "parse_format_s(0x{:08x}): rs1:{} rs2:{} imm:{}",
+    //     word,
+    //     ((word >> 15) & 0x1f) as usize,
+    //     ((word >> 20) & 0x1f) as usize,
+    //     (match word & 0x80000000 {
+    //             0x80000000 => 0xfffff000,
+    //             _ => 0,
+    //         } | // imm[31:12] = [31]
+    //         ((word >> 20) & 0xfe0) | // imm[11:5] = [31:25]
+    //         ((word >> 7) & 0x1f)) as i32
+    // );
     FormatS {
         rs1: ((word >> 15) & 0x1f) as usize, // [19:15]
         rs2: ((word >> 20) & 0x1f) as usize, // [24:20]

@@ -8,7 +8,7 @@ pub use riscv_cpu::mmu::SyscallResult;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI32, Ordering},
         mpsc::{Receiver, Sender},
         Arc, Mutex,
     },
@@ -62,7 +62,7 @@ const MMUFLAG_ACCESSED: u32 = 0x40;
 const MMUFLAG_DIRTY: u32 = 0x80;
 
 impl std::error::Error for LoadError {}
-pub type ResponseData = ([i64; 8], Option<(Vec<u8>, u64)>);
+pub type ResponseData = ([i32; 8], Option<(Vec<u8>, u32)>);
 
 enum MemoryCommand {
     Exit,
@@ -75,7 +75,7 @@ enum MemoryCommand {
         u32,         /* argument 2 */
         u32,         /* argument 3 */
         u32,         /* argument 4 */
-        Sender<i64>, /* Thread ID */
+        Sender<i32>, /* Thread ID */
     ),
     JoinThread(u32, Sender<ResponseData>),
 }
@@ -83,7 +83,7 @@ enum MemoryCommand {
 struct Worker {
     cpu: riscv_cpu::Cpu,
     cmd: Sender<MemoryCommand>,
-    tid: i64,
+    tid: i32,
     memory: Arc<Mutex<Memory>>,
 }
 
@@ -91,7 +91,7 @@ impl Worker {
     fn new(
         cpu: riscv_cpu::Cpu,
         cmd: Sender<MemoryCommand>,
-        tid: i64,
+        tid: i32,
         memory: Arc<Mutex<Memory>>,
     ) -> Self {
         Self {
@@ -112,7 +112,7 @@ impl Worker {
                         let data = data.0;
                         let mmu = self.cpu.get_mut_mmu();
                         for (offset, byte) in data.into_iter().enumerate() {
-                            mmu.store(offset as u64 + start, byte).unwrap();
+                            mmu.store(offset as u32 + start, byte).unwrap();
                         }
                     }
                     for (index, value) in result.iter().enumerate() {
@@ -121,7 +121,7 @@ impl Worker {
                 }
                 TickResult::ExitThread(val) => {
                     self.cmd
-                        .send(MemoryCommand::ExitThread(self.tid as u32, val as u32))
+                        .send(MemoryCommand::ExitThread(self.tid as u32, val))
                         .unwrap();
                     // println!("Thread {} exited", self.tid);
                     return;
@@ -271,7 +271,7 @@ impl Memory {
         // address space at this address.
 
         // If the level 1 pagetable doesn't exist, then this address is invalid
-        let l1_pt_entry = self.read_u32(self.l1_pt as u64 + vpn1 as u64);
+        let l1_pt_entry = self.read_u32(self.l1_pt + vpn1 as u32);
         if l1_pt_entry & MMUFLAG_VALID == 0 {
             panic!("Tried to free a page where the level 1 pagetable didn't exist");
         }
@@ -281,8 +281,8 @@ impl Memory {
         assert!(self.translation_cache.remove(&virt).is_some());
 
         let l0_pt_phys = ((l1_pt_entry >> 10) << 12) + vpn0 as u32;
-        assert!(self.read_u32(l0_pt_phys as u64) & MMUFLAG_VALID != 0);
-        self.write_u32(l0_pt_phys as u64, 0);
+        assert!(self.read_u32(l0_pt_phys) & MMUFLAG_VALID != 0);
+        self.write_u32(l0_pt_phys, 0);
 
         Ok(())
     }
@@ -324,52 +324,6 @@ impl Memory {
             }
         }
         address
-        // for potential_start in (start..initial).step_by(PAGE_SIZE) {
-        //     let mut all_free = true;
-        //     for check_page in (potential_start..potential_start + size).step_by(PAGE_SIZE) {
-        //         if !crate::arch::mem::address_available(check_page) {
-        //             all_free = false;
-        //             break;
-        //         }
-        //     }
-        //     if all_free {
-        //         match kind {
-        //             xous_kernel::MemoryType::Default => {
-        //                 process_inner.mem_default_last = potential_start
-        //             }
-        //             xous_kernel::MemoryType::Messages => {
-        //                 process_inner.mem_message_last = potential_start
-        //             }
-        //             other => panic!("invalid kind: {:?}", other),
-        //         }
-        //         return Ok(potential_start as *mut u8);
-        //     }
-        // }
-        // Err(xous_kernel::Error::BadAddress)
-
-        // let mut start = self.allocation_previous;
-        // // Find a free region that will fit this page.
-        // 'outer: loop {
-        //     for page in (start..(start + size as u32)).step_by(4096) {
-        //         // If this page is allocated, skip it
-        //         if self.virt_to_phys(page).is_some() {
-        //             start = page + 4096;
-        //             continue 'outer;
-        //         }
-        //     }
-        //     break;
-        // }
-        // // Allocate the region
-        // for page in (start..(start + size as u32)).step_by(4096) {
-        //     self.ensure_page(page);
-        //     // println!(
-        //     //     "Allocated {:08x} @ {:08x}",
-        //     //     page,
-        //     //     self.virt_to_phys(page).unwrap()
-        //     // );
-        // }
-        // self.allocation_previous = start + size as u32 + 4096;
-        // Some(start)
     }
 
     fn ensure_page(&mut self, virt: u32) -> Option<bool> {
@@ -379,7 +333,7 @@ impl Memory {
         let vpn0 = ((virt >> 12) & ((1 << 10) - 1)) as usize * 4;
 
         // If the level 1 pagetable doesn't exist, then this address is invalid
-        let mut l1_pt_entry = self.read_u32(self.l1_pt as u64 + vpn1 as u64);
+        let mut l1_pt_entry = self.read_u32(self.l1_pt + vpn1 as u32);
         if l1_pt_entry & MMUFLAG_VALID == 0 {
             // Allocate a new page for the level 1 pagetable
             let Some(l0_pt_phys) = self.allocate_phys_page() else {
@@ -389,12 +343,12 @@ impl Memory {
             l1_pt_entry =
                 ((l0_pt_phys >> 12) << 10) | MMUFLAG_VALID | MMUFLAG_DIRTY | MMUFLAG_ACCESSED;
             // Map the level 1 pagetable into the root pagetable
-            self.write_u32(self.l1_pt as u64 + vpn1 as u64, l1_pt_entry);
+            self.write_u32(self.l1_pt + vpn1 as u32, l1_pt_entry);
             allocated = true;
         }
 
         let l0_pt_phys = ((l1_pt_entry >> 10) << 12) + vpn0 as u32;
-        let mut l0_pt_entry = self.read_u32(l0_pt_phys as u64);
+        let mut l0_pt_entry = self.read_u32(l0_pt_phys);
 
         // Ensure the entry hasn't already been mapped.
         if l0_pt_entry & MMUFLAG_VALID == 0 {
@@ -410,7 +364,7 @@ impl Memory {
                 | MMUFLAG_DIRTY
                 | MMUFLAG_ACCESSED;
             // Map the level 0 pagetable into the level 1 pagetable
-            self.write_u32(l0_pt_phys as u64, l0_pt_entry);
+            self.write_u32(l0_pt_phys, l0_pt_entry);
             assert!(self.translation_cache.insert(virt, phys).is_none());
             allocated = true;
         }
@@ -432,14 +386,14 @@ impl Memory {
 
         // The root (l1) pagetable is defined to be mapped into our virtual
         // address space at this address.
-        let l1_pt_entry = self.read_u32(self.l1_pt as u64 + vpn1 as u64);
+        let l1_pt_entry = self.read_u32(self.l1_pt + vpn1 as u32);
 
         // If the level 1 pagetable doesn't exist, then this address is invalid
         if l1_pt_entry & MMUFLAG_VALID == 0 {
             return;
         }
 
-        let l0_pt_entry = self.read_u32((((l1_pt_entry >> 10) << 12) + vpn0 as u32) as u64);
+        let l0_pt_entry = self.read_u32(((l1_pt_entry >> 10) << 12) + vpn0 as u32);
 
         // Ensure the entry hasn't already been mapped.
         if l0_pt_entry & MMUFLAG_VALID == 0 {
@@ -454,10 +408,7 @@ impl Memory {
         let l0_pt_entry =
             (l0_pt_entry & !(MMUFLAG_READABLE | MMUFLAG_WRITABLE | MMUFLAG_EXECUTABLE)) | new_flags;
 
-        self.write_u32(
-            (((l1_pt_entry >> 10) << 12) + vpn0 as u32) as u64,
-            l0_pt_entry,
-        );
+        self.write_u32(((l1_pt_entry >> 10) << 12) + vpn0 as u32, l0_pt_entry);
     }
 
     fn write_bytes(&mut self, data: &[u8], start: u32) {
@@ -466,7 +417,7 @@ impl Memory {
             self.ensure_page(start + i);
             let phys = self.virt_to_phys(start + i).unwrap();
 
-            self.write_u8(phys as u64, *byte);
+            self.write_u8(phys, *byte);
         }
     }
 
@@ -476,11 +427,11 @@ impl Memory {
         println!();
         println!("Memory Map:");
         for vpn1 in 0..1024 {
-            let l1_entry = self.read_u32(self.l1_pt as u64 + vpn1 * 4);
+            let l1_entry = self.read_u32(self.l1_pt + vpn1 * 4);
             if l1_entry & MMUFLAG_VALID == 0 {
                 continue;
             }
-            let superpage_addr = vpn1 as u32 * (1 << 22);
+            let superpage_addr = vpn1 * (1 << 22);
             println!(
                 "    {:4} Superpage for {:08x} @ {:08x} (flags: {})",
                 vpn1,
@@ -490,7 +441,7 @@ impl Memory {
             );
 
             for vpn0 in 0..1024 {
-                let l0_entry = self.read_u32((((l1_entry >> 10) << 12) as u64) + vpn0 as u64 * 4);
+                let l0_entry = self.read_u32(((l1_entry >> 10) << 12) + vpn0 as u32 * 4);
                 if l0_entry & 0x1 == 0 {
                     continue;
                 }
@@ -513,7 +464,7 @@ impl Memory {
 
         // The root (l1) pagetable is defined to be mapped into our virtual
         // address space at this address.
-        let l1_pt_entry = self.read_u32(self.l1_pt as u64 + vpn1 as u64);
+        let l1_pt_entry = self.read_u32(self.l1_pt + vpn1 as u32);
 
         // If the level 1 pagetable doesn't exist, then this address is invalid
         if l1_pt_entry & MMUFLAG_VALID == 0 {
@@ -523,7 +474,7 @@ impl Memory {
             return None;
         }
 
-        let l0_pt_entry = self.read_u32((((l1_pt_entry >> 10) << 12) + vpn0 as u32) as u64);
+        let l0_pt_entry = self.read_u32(((l1_pt_entry >> 10) << 12) + vpn0 as u32);
 
         // Check if the mapping is valid
         if l0_pt_entry & MMUFLAG_VALID == 0 {
@@ -535,13 +486,13 @@ impl Memory {
 }
 
 impl riscv_cpu::cpu::Memory for Memory {
-    fn read_u8(&self, address: u64) -> u8 {
+    fn read_u8(&self, address: u32) -> u8 {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data.get(&page).map(|page| page[offset]).unwrap_or(0)
     }
 
-    fn read_u16(&self, address: u64) -> u16 {
+    fn read_u16(&self, address: u32) -> u16 {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data
@@ -550,7 +501,7 @@ impl riscv_cpu::cpu::Memory for Memory {
             .unwrap_or(0)
     }
 
-    fn read_u32(&self, address: u64) -> u32 {
+    fn read_u32(&self, address: u32) -> u32 {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data
@@ -566,27 +517,7 @@ impl riscv_cpu::cpu::Memory for Memory {
             .unwrap_or(0)
     }
 
-    fn read_u64(&self, address: u64) -> u64 {
-        let page = address as usize & !0xfff;
-        let offset = address as usize & 0xfff;
-        self.data
-            .get(&page)
-            .map(|page| {
-                u64::from_le_bytes([
-                    page[offset],
-                    page[offset + 1],
-                    page[offset + 2],
-                    page[offset + 3],
-                    page[offset + 4],
-                    page[offset + 5],
-                    page[offset + 6],
-                    page[offset + 7],
-                ])
-            })
-            .unwrap_or(0)
-    }
-
-    fn write_u8(&mut self, address: u64, value: u8) {
+    fn write_u8(&mut self, address: u32, value: u8) {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         if let Some(page) = self.data.get_mut(&page) {
@@ -594,7 +525,7 @@ impl riscv_cpu::cpu::Memory for Memory {
         }
     }
 
-    fn write_u16(&mut self, address: u64, value: u16) {
+    fn write_u16(&mut self, address: u32, value: u16) {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         if let Some(page) = self.data.get_mut(&page) {
@@ -604,19 +535,7 @@ impl riscv_cpu::cpu::Memory for Memory {
         }
     }
 
-    fn write_u32(&mut self, address: u64, value: u32) {
-        let page = address as usize & !0xfff;
-        let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.get_mut(&page) {
-            let bytes = value.to_le_bytes();
-            page[offset] = bytes[0];
-            page[offset + 1] = bytes[1];
-            page[offset + 2] = bytes[2];
-            page[offset + 3] = bytes[3];
-        }
-    }
-
-    fn write_u64(&mut self, address: u64, value: u64) {
+    fn write_u32(&mut self, address: u32, value: u32) {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         if let Some(page) = self.data.get_mut(&page) {
@@ -625,22 +544,18 @@ impl riscv_cpu::cpu::Memory for Memory {
             page[offset + 1] = bytes[1];
             page[offset + 2] = bytes[2];
             page[offset + 3] = bytes[3];
-            page[offset + 4] = bytes[4];
-            page[offset + 5] = bytes[5];
-            page[offset + 6] = bytes[6];
-            page[offset + 7] = bytes[7];
         }
     }
 
-    fn validate_address(&self, address: u64) -> bool {
-        if address < self.base as u64 {
+    fn validate_address(&self, address: u32) -> bool {
+        if address < self.base {
             return false;
         }
         let address = address as usize - self.base as usize;
         address < self.data.len()
     }
 
-    fn syscall(&mut self, args: [i64; 8]) -> SyscallResult {
+    fn syscall(&mut self, args: [i32; 8]) -> SyscallResult {
         let syscall: Syscall = args.into();
 
         // println!("Syscall {:?}", SyscallNumber::from(args[0]));
@@ -662,9 +577,9 @@ impl riscv_cpu::cpu::Memory for Memory {
                 for addr in address..(address + range) {
                     self.remove_memory_flags(addr as u32, value as u32);
                 }
-                [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
+                [SyscallResultNumber::Ok as i32, 0, 0, 0, 0, 0, 0, 0].into()
             }
-            Syscall::Yield => [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into(),
+            Syscall::Yield => [SyscallResultNumber::Ok as i32, 0, 0, 0, 0, 0, 0, 0].into(),
             Syscall::CreateThread(
                 entry_point,
                 stack_pointer,
@@ -685,7 +600,7 @@ impl riscv_cpu::cpu::Memory for Memory {
                 for offset in (address..address + size).step_by(4096) {
                     self.free_virt_page(offset as u32).unwrap();
                 }
-                [SyscallResultNumber::Ok as i64, 0, 0, 0, 0, 0, 0, 0].into()
+                [SyscallResultNumber::Ok as i32, 0, 0, 0, 0, 0, 0, 0].into()
             }
             Syscall::JoinThread(thread_id) => {
                 // println!("JoinThread({})", thread_id);
@@ -707,31 +622,28 @@ impl riscv_cpu::cpu::Memory for Memory {
         }
     }
 
-    fn translate(&self, v_address: u64) -> Option<u64> {
-        let v_address = v_address as u32;
+    fn translate(&self, v_address: u32) -> Option<u32> {
         let ppn = v_address & !0xfff;
         let offset = v_address & 0xfff;
-        self.translation_cache
-            .get(&ppn)
-            .map(|x| (*x + offset) as u64)
+        self.translation_cache.get(&ppn).map(|x| (*x + offset))
     }
 
-    fn reserve(&mut self, p_address: u64) -> bool {
-        self.reservations.insert(p_address as u32)
+    fn reserve(&mut self, p_address: u32) -> bool {
+        self.reservations.insert(p_address)
     }
 
-    fn clear_reservation(&mut self, p_address: u64) {
-        self.reservations.remove(&(p_address as u32));
+    fn clear_reservation(&mut self, p_address: u32) {
+        self.reservations.remove(&{ p_address });
     }
 }
 
 pub struct Machine {
     memory: Arc<Mutex<Memory>>,
     workers: Vec<WorkerHandle>,
-    satp: u64,
+    satp: u32,
     memory_cmd_sender: Sender<MemoryCommand>,
     memory_cmd: Receiver<MemoryCommand>,
-    thread_id_counter: AtomicI64,
+    thread_id_counter: AtomicI32,
 }
 
 impl Machine {
@@ -746,7 +658,7 @@ impl Machine {
             satp: 0,
             memory_cmd,
             memory_cmd_sender,
-            thread_id_counter: AtomicI64::new(1),
+            thread_id_counter: AtomicI32::new(1),
         };
 
         machine.load_program(program)?;
@@ -836,9 +748,7 @@ impl Machine {
     }
 
     pub fn load_program(&mut self, program: &[u8]) -> Result<(), LoadError> {
-        let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone())
-            .xlen(riscv_cpu::Xlen::Bit32)
-            .build();
+        let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone()).build();
 
         let goblin::Object::Elf(elf) =
             goblin::Object::parse(program).map_err(|_| LoadError::IncorrectFormat)?
@@ -878,14 +788,14 @@ impl Machine {
             }
         }
 
-        let satp = memory_writer.satp.into();
+        let satp = memory_writer.satp;
 
         // Create the argument block and shove it at the top of stack.
         let param_block = Self::create_params().expect("failed to create argument block");
         let param_block_start = STACK_END - param_block.len() as u32;
         memory_writer.write_bytes(&param_block, param_block_start);
         // Place the argument block into $a1
-        cpu.write_register(11, param_block_start as i64);
+        cpu.write_register(11, param_block_start as i32);
 
         // Ensure stack is allocated
         for page in (STACK_START..STACK_END).step_by(4096) {
@@ -895,20 +805,20 @@ impl Machine {
 
         cpu.write_csr(riscv_cpu::cpu::CSR_SATP_ADDRESS, satp)
             .map_err(|_| LoadError::SatpWriteError)?;
-        cpu.update_pc(elf.entry);
+        cpu.update_pc(elf.entry as u32);
 
         // Return to User Mode (0 << 11) with interrupts disabled (1 << 5)
         cpu.write_csr(riscv_cpu::cpu::CSR_MSTATUS_ADDRESS, 1 << 5)
             .map_err(|_| LoadError::MstatusWriteError)?;
 
-        cpu.write_csr(riscv_cpu::cpu::CSR_SEPC_ADDRESS, elf.entry)
+        cpu.write_csr(riscv_cpu::cpu::CSR_SEPC_ADDRESS, elf.entry as u32)
             .unwrap();
 
         // SRET to return to user mode
         cpu.execute_opcode(0x10200073).map_err(LoadError::CpuTrap)?;
 
         // Update the stack pointer
-        cpu.write_register(2, (STACK_END as i64 - 16 - param_block.len() as i64) & !0xf);
+        cpu.write_register(2, (STACK_END as i32 - 16 - param_block.len() as i32) & !0xf);
 
         let cmd = self.memory_cmd_sender.clone();
         let memory = self.memory.clone();
@@ -939,7 +849,7 @@ impl Machine {
                     if exited_threads.contains(&tid) {
                         sender
                             .send((
-                                [SyscallResultNumber::Scalar1 as i64, 0, 0, 0, 0, 0, 0, 0],
+                                [SyscallResultNumber::Scalar1 as i32, 0, 0, 0, 0, 0, 0, 0],
                                 None,
                             ))
                             .unwrap();
@@ -957,8 +867,8 @@ impl Machine {
                             joiner
                                 .send((
                                     [
-                                        SyscallResultNumber::Scalar1 as i64,
-                                        result.into(),
+                                        SyscallResultNumber::Scalar1 as i32,
+                                        result as _,
                                         0,
                                         0,
                                         0,
@@ -982,30 +892,28 @@ impl Machine {
                     argument_4,
                     tx,
                 ) => {
-                    let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone())
-                        .xlen(riscv_cpu::Xlen::Bit32)
-                        .build();
+                    let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone()).build();
 
                     cpu.write_csr(riscv_cpu::cpu::CSR_SATP_ADDRESS, self.satp)
                         .map_err(|_| LoadError::SatpWriteError)?;
-                    cpu.update_pc(entry_point as u64);
+                    cpu.update_pc(entry_point);
 
                     // Return to User Mode (0 << 11) with interrupts disabled (1 << 5)
                     cpu.write_csr(riscv_cpu::cpu::CSR_MSTATUS_ADDRESS, 1 << 5)
                         .map_err(|_| LoadError::MstatusWriteError)?;
 
-                    cpu.write_csr(riscv_cpu::cpu::CSR_SEPC_ADDRESS, entry_point as u64)
+                    cpu.write_csr(riscv_cpu::cpu::CSR_SEPC_ADDRESS, entry_point)
                         .unwrap();
 
                     // SRET to return to user mode
                     cpu.execute_opcode(0x10200073).map_err(LoadError::CpuTrap)?;
 
                     // Update the stack pointer
-                    cpu.write_register(2, (stack_pointer + stack_length) as i64 - 16);
-                    cpu.write_register(10, argument_1 as i64);
-                    cpu.write_register(11, argument_2 as i64);
-                    cpu.write_register(12, argument_3 as i64);
-                    cpu.write_register(13, argument_4 as i64);
+                    cpu.write_register(2, (stack_pointer + stack_length) as i32 - 16);
+                    cpu.write_register(10, argument_1 as i32);
+                    cpu.write_register(11, argument_2 as i32);
+                    cpu.write_register(12, argument_3 as i32);
+                    cpu.write_register(13, argument_4 as i32);
 
                     let cmd = self.memory_cmd_sender.clone();
                     let tid = self.thread_id_counter.fetch_add(1, Ordering::SeqCst);

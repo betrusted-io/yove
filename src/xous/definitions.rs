@@ -60,17 +60,17 @@ pub enum SyscallErrorNumber {
 
 #[derive(Debug)]
 pub enum Syscall {
-    Unknown([i64; 8]),
+    Unknown([i32; 8]),
     Yield,
     IncreaseHeap(
-        i64, /* number of bytes to add */
-        i64, /* memory flags */
+        i32, /* number of bytes to add */
+        i32, /* memory flags */
     ),
     MapMemory(
-        i64, /* address */
-        i64, /* size */
-        i64, /* flags */
-        i64, /* name */
+        i32, /* address */
+        i32, /* size */
+        i32, /* flags */
+        i32, /* name */
     ),
     Connect([u32; 4] /* Server ID */),
     TryConnect([u32; 4] /* Server ID */),
@@ -87,21 +87,21 @@ pub enum Syscall {
         [u32; 4], /* descriptor */
     ),
     UpdateMemoryFlags(
-        i64, /* address */
-        i64, /* range */
-        i64, /* flags */
+        i32, /* address */
+        i32, /* range */
+        i32, /* flags */
     ),
     CreateThread(
-        i64, /* entry point */
-        i64, /* stack pointer */
-        i64, /* stack length */
-        i64, /* argument 1 */
-        i64, /* argument 2 */
-        i64, /* argument 3 */
-        i64, /* argument 4 */
+        i32, /* entry point */
+        i32, /* stack pointer */
+        i32, /* stack length */
+        i32, /* argument 1 */
+        i32, /* argument 2 */
+        i32, /* argument 3 */
+        i32, /* argument 4 */
     ),
-    JoinThread(i64 /* thread ID */),
-    UnmapMemory(i64, /* address */ i64 /* size */),
+    JoinThread(i32 /* thread ID */),
+    UnmapMemory(i32, /* address */ i32 /* size */),
 }
 
 #[derive(Debug)]
@@ -126,8 +126,8 @@ pub enum SyscallNumber {
     Unknown = 0,
 }
 
-impl From<[i64; 8]> for Syscall {
-    fn from(value: [i64; 8]) -> Self {
+impl From<[i32; 8]> for Syscall {
+    fn from(value: [i32; 8]) -> Self {
         match value[0].into() {
             SyscallNumber::IncreaseHeap => Syscall::IncreaseHeap(value[1], value[2]),
             SyscallNumber::MapMemory => Syscall::MapMemory(value[1], value[2], value[3], value[4]),
@@ -179,8 +179,8 @@ impl From<[i64; 8]> for Syscall {
     }
 }
 
-impl From<i64> for SyscallNumber {
-    fn from(value: i64) -> Self {
+impl From<i32> for SyscallNumber {
+    fn from(value: i32) -> Self {
         match value {
             2 => SyscallNumber::MapMemory,
             3 => SyscallNumber::Yield,

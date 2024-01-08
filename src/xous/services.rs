@@ -5,7 +5,7 @@ pub mod panic_to_screen;
 pub mod ticktimer;
 use super::Memory;
 
-pub type ResponseData = ([i64; 8], Option<(Vec<u8>, u64)>);
+pub type ResponseData = ([i32; 8], Option<(Vec<u8>, u32)>);
 
 #[allow(dead_code)]
 pub enum ScalarResult {

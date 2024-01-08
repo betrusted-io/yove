@@ -92,7 +92,7 @@ impl super::Service for Ticktimer {
                 condvar.1.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 tx.send((
                     [
-                        super::super::definitions::SyscallResultNumber::Scalar1 as i64,
+                        super::super::definitions::SyscallResultNumber::Scalar1 as i32,
                         timeout_value,
                         0,
                         0,

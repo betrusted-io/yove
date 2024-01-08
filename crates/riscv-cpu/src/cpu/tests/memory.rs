@@ -5,7 +5,7 @@ const MEMORY_BASE: usize = 0x8000_0000;
 /// Emulates main memory.
 pub struct Memory {
     /// Memory contents
-    data: Vec<u64>,
+    data: Vec<u32>,
 
     /// Offset where RAM lives
     base: usize,
@@ -14,14 +14,14 @@ pub struct Memory {
     vm_result: Option<u32>,
 
     /// Address of the `tohost` offset
-    tohost: u64,
+    tohost: u32,
 }
 
 impl Memory {
     /// Creates a new `Memory`
-    pub fn new(memory_size: usize, base: usize, tohost: u64) -> Self {
+    pub fn new(memory_size: usize, base: usize, tohost: u32) -> Self {
         Memory {
-            data: vec![0u64; memory_size / 4],
+            data: vec![0u32; memory_size / 2],
             base,
             vm_result: None,
             tohost,
@@ -29,8 +29,8 @@ impl Memory {
     }
 
     #[allow(dead_code)]
-    pub fn memory_base(&self) -> u64 {
-        self.base as u64
+    pub fn memory_base(&self) -> u32 {
+        self.base as u32
     }
 
     #[allow(dead_code)]
@@ -43,10 +43,10 @@ impl Memory {
     /// # Arguments
     /// * `address`
     /// * `width` up to eight
-    pub fn read_bytes(&self, address: u64, width: u64) -> u64 {
+    pub fn read_bytes(&self, address: u32, width: u32) -> u32 {
         let mut data = 0;
         for i in 0..width {
-            data |= (self.read_u8(address.wrapping_add(i)) as u64) << (i * 8);
+            data |= (self.read_u8(address.wrapping_add(i)) as u32) << (i * 8);
         }
         data
     }
@@ -57,7 +57,7 @@ impl Memory {
     /// * `address`
     /// * `value`
     /// * `width` up to eight
-    pub fn write_bytes(&mut self, address: u64, value: u64, width: u64) {
+    pub fn write_bytes(&mut self, address: u32, value: u32, width: u32) {
         for i in 0..width {
             self.write_u8(address.wrapping_add(i), (value >> (i * 8)) as u8);
         }
@@ -70,14 +70,15 @@ impl super::Memory for Memory {
     /// # Arguments
     /// * `address`
     /// * `value`
-    fn write_u8(&mut self, address: u64, value: u8) {
-        let address = address - MEMORY_BASE as u64;
-        let index = (address >> 3) as usize;
-        let pos = (address % 8) * 8;
-        if address == self.tohost {
+    fn write_u8(&mut self, address: u32, value: u8) {
+        let address = address as usize - MEMORY_BASE;
+        let index = (address >> 2) as usize;
+        let pos = (address % 4) * 8;
+        if address == self.tohost as usize {
             panic!("tohost write_u8: {:04x}", value);
         }
-        self.data[index] = (self.data[index] & !(0xff << pos)) | ((value as u64) << pos);
+        // println!("Writing {:02x} to {:08x}", value, address);
+        self.data[index] = (self.data[index] & !(0xff << pos)) | ((value as u32) << pos);
     }
 
     /// Writes two bytes to memory.
@@ -85,17 +86,17 @@ impl super::Memory for Memory {
     /// # Arguments
     /// * `address`
     /// * `value`
-    fn write_u16(&mut self, address: u64, value: u16) {
+    fn write_u16(&mut self, address: u32, value: u16) {
         if (address % 2) == 0 {
             if address == self.tohost {
                 panic!("tohost write_u16: {:04x}", value);
             }
-            let address = address - MEMORY_BASE as u64;
-            let index = (address >> 3) as usize;
-            let pos = (address % 8) * 8;
-            self.data[index] = (self.data[index] & !(0xffff << pos)) | ((value as u64) << pos);
+            let address = address - MEMORY_BASE as u32;
+            let index = (address >> 2) as usize;
+            let pos = (address % 4) * 8;
+            self.data[index] = (self.data[index] & !(0xffff << pos)) | ((value as u32) << pos);
         } else {
-            self.write_bytes(address, value as u64, 2);
+            self.write_bytes(address, value as u32, 2);
         }
     }
 
@@ -104,39 +105,18 @@ impl super::Memory for Memory {
     /// # Arguments
     /// * `address`
     /// * `value`
-    fn write_u32(&mut self, address: u64, value: u32) {
+    fn write_u32(&mut self, address: u32, value: u32) {
         if (address % 4) == 0 {
             if address == self.tohost {
                 println!("tohost write_u32: {:08x}", value);
                 self.vm_result = Some(value);
             }
-            let address = address - MEMORY_BASE as u64;
-            let index = (address >> 3) as usize;
-            let pos = (address % 8) * 8;
-            self.data[index] = (self.data[index] & !(0xffffffff << pos)) | ((value as u64) << pos);
-        } else {
-            self.write_bytes(address, value as u64, 4);
-        }
-    }
-
-    /// Writes eight bytes to memory.
-    ///
-    /// # Arguments
-    /// * `address`
-    /// * `value`
-    fn write_u64(&mut self, address: u64, value: u64) {
-        if (address % 8) == 0 {
-            if address == self.tohost {
-                panic!("tohost write_u64: {:016x}", value);
-            }
-            let address = address - MEMORY_BASE as u64;
-            let index = (address >> 3) as usize;
+            println!("Write to {:08x}", address);
+            let address = address - MEMORY_BASE as u32;
+            let index = (address >> 2) as usize;
             self.data[index] = value;
-        } else if (address % 4) == 0 {
-            self.write_u32(address, (value & 0xffffffff) as u32);
-            self.write_u32(address.wrapping_add(4), (value >> 32) as u32);
         } else {
-            self.write_bytes(address, value, 8);
+            self.write_bytes(address, value as u32, 4);
         }
     }
 
@@ -144,10 +124,10 @@ impl super::Memory for Memory {
     ///
     /// # Arguments
     /// * `address`
-    fn read_u8(&self, address: u64) -> u8 {
-        let address = address - MEMORY_BASE as u64;
-        let index = (address >> 3) as usize;
-        let pos = (address % 8) * 8;
+    fn read_u8(&self, address: u32) -> u8 {
+        let address = address - MEMORY_BASE as u32;
+        let index = (address >> 2) as usize;
+        let pos = (address % 4) * 8;
         (self.data[index] >> pos) as u8
     }
 
@@ -155,11 +135,11 @@ impl super::Memory for Memory {
     ///
     /// # Arguments
     /// * `address`
-    fn read_u16(&self, address: u64) -> u16 {
+    fn read_u16(&self, address: u32) -> u16 {
         if (address % 2) == 0 {
-            let address = address - MEMORY_BASE as u64;
-            let index = (address >> 3) as usize;
-            let pos = (address % 8) * 8;
+            let address = address - MEMORY_BASE as u32;
+            let index = (address / 4) as usize;
+            let pos = (address % 4) * 8;
             (self.data[index] >> pos) as u16
         } else {
             self.read_bytes(address, 2) as u16
@@ -170,55 +150,40 @@ impl super::Memory for Memory {
     ///
     /// # Arguments
     /// * `address`
-    fn read_u32(&self, address: u64) -> u32 {
-        if (address % 4) == 0 {
-            let address = address - MEMORY_BASE as u64;
-            let index = (address >> 3) as usize;
-            let pos = (address % 8) * 8;
-            (self.data[index] >> pos) as u32
+    fn read_u32(&self, address: u32) -> u32 {
+        let val = if (address % 4) == 0 {
+            let address = address - MEMORY_BASE as u32;
+            let index = (address / 4) as usize;
+            self.data[index]
         } else {
             self.read_bytes(address, 4) as u32
-        }
-    }
-
-    /// Reads eight bytes from memory.
-    ///
-    /// # Arguments
-    /// * `address`
-    fn read_u64(&self, address: u64) -> u64 {
-        if (address % 8) == 0 {
-            let address = address - MEMORY_BASE as u64;
-            let index = (address >> 3) as usize;
-            self.data[index]
-        } else if (address % 4) == 0 {
-            (self.read_u32(address) as u64) | ((self.read_u32(address.wrapping_add(4)) as u64) << 4)
-        } else {
-            self.read_bytes(address, 8)
-        }
+        };
+        // println!("Val at {:08x} is {:08x}", address, val);
+        val
     }
 
     /// Check if the address is valid memory address
     ///
     /// # Arguments
     /// * `address`
-    fn validate_address(&self, address: u64) -> bool {
-        let address = address - MEMORY_BASE as u64;
+    fn validate_address(&self, address: u32) -> bool {
+        let address = address - MEMORY_BASE as u32;
         (address as usize) < self.data.len()
     }
 
-    fn syscall(&mut self, _args: [i64; 8]) -> crate::mmu::SyscallResult {
+    fn syscall(&mut self, _args: [i32; 8]) -> crate::mmu::SyscallResult {
         crate::mmu::SyscallResult::Continue
     }
 
-    fn translate(&self, _v_address: u64) -> Option<u64> {
+    fn translate(&self, _v_address: u32) -> Option<u32> {
         todo!()
     }
 
-    fn reserve(&mut self, _p_address: u64) -> bool {
+    fn reserve(&mut self, _p_address: u32) -> bool {
         todo!()
     }
 
-    fn clear_reservation(&mut self, _p_address: u64) {
+    fn clear_reservation(&mut self, _p_address: u32) {
         todo!()
     }
 }

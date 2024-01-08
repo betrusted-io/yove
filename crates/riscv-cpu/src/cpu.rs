@@ -54,12 +54,12 @@ const CSR_CYCLE_ADDRESS: u16 = 0xc00;
 const _CSR_INSERT_ADDRESS: u16 = 0xc02;
 const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
 
-const MIP_MEIP: u64 = 0x800;
-pub const MIP_MTIP: u64 = 0x080;
-pub const MIP_MSIP: u64 = 0x008;
-pub const MIP_SEIP: u64 = 0x200;
-const MIP_STIP: u64 = 0x020;
-const MIP_SSIP: u64 = 0x002;
+const MIP_MEIP: u32 = 0x800;
+pub const MIP_MTIP: u32 = 0x080;
+pub const MIP_MSIP: u32 = 0x008;
+pub const MIP_SEIP: u32 = 0x200;
+const MIP_STIP: u32 = 0x020;
+const MIP_SSIP: u32 = 0x002;
 
 pub type ResponseData = ([i64; 8], Option<(Vec<u8>, u64)>);
 
@@ -72,28 +72,20 @@ pub enum TickResult {
 
 /// Emulates a RISC-V CPU core
 pub struct Cpu {
-    clock: u64,
-    xlen: Xlen,
+    clock: u32,
     privilege_mode: PrivilegeMode,
     wfi: bool,
     // using only lower 32bits of x, pc, and csr registers
     // for 32-bit mode
-    x: [i64; 32],
-    f: [f64; 32],
-    pc: u64,
-    csr: [u64; CSR_CAPACITY],
+    x: [i32; 32],
+    pc: u32,
+    csr: [u32; CSR_CAPACITY],
     mmu: Mmu,
     memory: Arc<Mutex<dyn Memory + Send + Sync>>,
-    reservation: Option<u64>, // @TODO: Should support multiple address reservations
+    reservation: Option<u32>, // @TODO: Should support multiple address reservations
     _dump_flag: bool,
-    unsigned_data_mask: u64,
+    unsigned_data_mask: u32,
     instructions: [instructions::Instruction; instructions::INSTRUCTION_NUM],
-}
-
-#[derive(Clone)]
-pub enum Xlen {
-    Bit32,
-    Bit64, // @TODO: Support Bit128
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,7 +99,7 @@ pub enum PrivilegeMode {
 #[derive(Debug)]
 pub struct Trap {
     pub trap_type: TrapType,
-    pub value: u64, // Trap type specific value
+    pub value: u32, // Trap type specific value
 }
 
 #[derive(Debug)]
@@ -158,7 +150,7 @@ fn get_privilege_encoding(mode: &PrivilegeMode) -> u8 {
 }
 
 /// Returns `PrivilegeMode` from encoded privilege mode bits
-pub fn decode_privilege_mode(encoding: u64) -> PrivilegeMode {
+pub fn decode_privilege_mode(encoding: u32) -> PrivilegeMode {
     match encoding {
         0 => PrivilegeMode::User,
         1 => PrivilegeMode::Supervisor,
@@ -196,11 +188,8 @@ fn _get_trap_type_name(trap_type: &TrapType) -> &'static str {
     }
 }
 
-fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
-    let interrupt_bit = match xlen {
-        Xlen::Bit32 => 0x80000000_u64,
-        Xlen::Bit64 => 0x8000000000000000_u64,
-    };
+fn get_trap_cause(trap: &Trap) -> u32 {
+    let interrupt_bit = 0x80000000_u32;
     match trap.trap_type {
         TrapType::InstructionAddressMisaligned => 0,
         TrapType::InstructionAccessFault => 1,
@@ -230,41 +219,33 @@ fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
 }
 
 pub struct CpuBuilder {
-    xlen: Xlen,
-    pc: u64,
-    sp: u64,
+    pc: u32,
+    sp: u32,
     memory: Arc<Mutex<dyn Memory + Send + Sync>>,
 }
 
 impl CpuBuilder {
     pub fn new(memory: Arc<Mutex<dyn Memory + Send + Sync>>) -> Self {
         CpuBuilder {
-            xlen: Xlen::Bit64,
             memory,
             pc: 0,
             sp: 0,
         }
     }
 
-    pub fn xlen(mut self, xlen: Xlen) -> Self {
-        self.xlen = xlen;
-        self
-    }
-
-    pub fn pc(mut self, pc: u64) -> Self {
+    pub fn pc(mut self, pc: u32) -> Self {
         self.pc = pc;
         self
     }
 
-    pub fn sp(mut self, sp: u64) -> Self {
+    pub fn sp(mut self, sp: u32) -> Self {
         self.sp = sp;
         self
     }
     pub fn build(self) -> Cpu {
         let mut cpu = Cpu::new(self.memory);
-        cpu.update_xlen(self.xlen.clone());
         cpu.update_pc(self.pc);
-        cpu.write_register(2, self.sp as i64);
+        cpu.write_register(2, self.sp as i32);
         cpu
     }
 }
@@ -277,17 +258,15 @@ impl Cpu {
     pub fn new(memory: Arc<Mutex<dyn Memory + Send + Sync>>) -> Self {
         Cpu {
             clock: 0,
-            xlen: Xlen::Bit64,
             privilege_mode: PrivilegeMode::Machine,
             wfi: false,
             x: [0; 32],
-            f: [0.0; 32],
             pc: 0,
             csr: [0; CSR_CAPACITY],
-            mmu: Mmu::new(Xlen::Bit64, memory.clone()),
+            mmu: Mmu::new(memory.clone()),
             reservation: None,
             _dump_flag: false,
-            unsigned_data_mask: 0xffffffffffffffff,
+            unsigned_data_mask: !0,
             memory,
             instructions: instructions::get_instructions(),
         }
@@ -297,28 +276,15 @@ impl Cpu {
     ///
     /// # Arguments
     /// * `value`
-    pub fn update_pc(&mut self, value: u64) {
+    pub fn update_pc(&mut self, value: u32) {
         self.pc = value;
-    }
-
-    /// Updates XLEN, 32-bit or 64-bit
-    ///
-    /// # Arguments
-    /// * `xlen`
-    pub fn update_xlen(&mut self, xlen: Xlen) {
-        self.xlen = xlen.clone();
-        self.unsigned_data_mask = match xlen {
-            Xlen::Bit32 => 0xffffffff,
-            Xlen::Bit64 => 0xffffffffffffffff,
-        };
-        self.mmu.update_xlen(xlen.clone());
     }
 
     /// Reads integer register content
     ///
     /// # Arguments
     /// * `reg` Register number. Must be 0-31
-    pub fn read_register(&self, reg: u8) -> i64 {
+    pub fn read_register(&self, reg: u8) -> i32 {
         debug_assert!(reg <= 31, "reg must be 0-31. {}", reg);
         match reg {
             0 => 0, // 0th register is hardwired zero
@@ -331,7 +297,7 @@ impl Cpu {
     /// # Arguments
     /// * `reg` Register number. Must be 0-31
     /// * `val` 64-bit value
-    pub fn write_register(&mut self, reg: u8, val: i64) {
+    pub fn write_register(&mut self, reg: u8, val: i32) {
         debug_assert!(reg <= 31, "reg must be 0-31. {}", reg);
         if reg == 0 {
             return;
@@ -340,7 +306,7 @@ impl Cpu {
     }
 
     /// Reads Program counter content
-    pub fn read_pc(&self) -> u64 {
+    pub fn read_pc(&self) -> u32 {
         self.pc
     }
 
@@ -401,13 +367,15 @@ impl Cpu {
         };
 
         // println!(
-        //     "pc @ 0x{:08x}: {:08x} {} {}",
+        //     "pc @ 0x{:08x}: 0x{:08x} (0x{:08x}) {} {}",
         //     instruction_address,
         //     original_word,
+        //     word,
         //     inst.name,
-        //     (inst.disassemble)(self, original_word, self.pc, true)
+        //     (inst.disassemble)(self, word, self.pc, true)
         // );
         let result = (inst.operation)(self, word, instruction_address);
+        // println!();
         self.x[0] = 0; // hardwired zero
         result
     }
@@ -458,7 +426,7 @@ impl Cpu {
         Err(())
     }
 
-    fn handle_interrupt(&mut self, instruction_address: u64) {
+    fn handle_interrupt(&mut self, instruction_address: u32) {
         // @TODO: Optimize
         let minterrupt = self.read_csr_raw(CSR_MIP_ADDRESS) & self.read_csr_raw(CSR_MIE_ADDRESS);
 
@@ -569,11 +537,11 @@ impl Cpu {
     pub fn handle_trap(
         &mut self,
         trap: Trap,
-        instruction_address: u64,
+        instruction_address: u32,
         is_interrupt: bool,
     ) -> bool {
-        let current_privilege_encoding = get_privilege_encoding(&self.privilege_mode) as u64;
-        let cause = get_trap_cause(&trap, &self.xlen);
+        let current_privilege_encoding = get_privilege_encoding(&self.privilege_mode);
+        let cause = get_trap_cause(&trap);
 
         // First, determine which privilege mode should handle the trap.
         // @TODO: Check if this logic is correct
@@ -585,6 +553,7 @@ impl Cpu {
             true => self.read_csr_raw(CSR_SIDELEG_ADDRESS),
             false => self.read_csr_raw(CSR_SEDELEG_ADDRESS),
         };
+
         let pos = cause & 0xffff;
 
         let new_privilege_mode = match ((mdeleg >> pos) & 1) == 0 {
@@ -594,7 +563,7 @@ impl Cpu {
                 false => PrivilegeMode::User,
             },
         };
-        let new_privilege_encoding = get_privilege_encoding(&new_privilege_mode) as u64;
+        let new_privilege_encoding = get_privilege_encoding(&new_privilege_mode);
 
         let current_status = match self.privilege_mode {
             PrivilegeMode::Machine => self.read_csr_raw(CSR_MSTATUS_ADDRESS),
@@ -759,7 +728,7 @@ impl Cpu {
                 let mie = (status >> 3) & 1;
                 // clear MIE[3], override MPIE[7] with MIE[3], override MPP[12:11] with current privilege encoding
                 let new_status =
-                    (status & !0x1888) | (mie << 7) | (current_privilege_encoding << 11);
+                    (status & !0x1888) | (mie << 7) | ((current_privilege_encoding as u32) << 11);
                 self.write_csr_raw(CSR_MSTATUS_ADDRESS, new_status);
             }
             PrivilegeMode::Supervisor => {
@@ -767,7 +736,7 @@ impl Cpu {
                 let sie = (status >> 1) & 1;
                 // clear SIE[1], override SPIE[5] with SIE[1], override SPP[8] with current privilege encoding
                 let new_status =
-                    (status & !0x122) | (sie << 5) | ((current_privilege_encoding & 1) << 8);
+                    (status & !0x122) | (sie << 5) | ((current_privilege_encoding as u32 & 1) << 8);
                 self.write_csr_raw(CSR_SSTATUS_ADDRESS, new_status);
             }
             PrivilegeMode::User => {
@@ -791,7 +760,7 @@ impl Cpu {
         privilege as u8 <= get_privilege_encoding(&self.privilege_mode)
     }
 
-    fn read_csr(&mut self, address: u16) -> Result<u64, Trap> {
+    fn read_csr(&mut self, address: u16) -> Result<u32, Trap> {
         match self.has_csr_access_privilege(address) {
             true => Ok(self.read_csr_raw(address)),
             false => Err(Trap {
@@ -801,7 +770,7 @@ impl Cpu {
         }
     }
 
-    pub fn write_csr(&mut self, address: u16, value: u64) -> Result<(), Trap> {
+    pub fn write_csr(&mut self, address: u16, value: u32) -> Result<(), Trap> {
         match self.has_csr_access_privilege(address) {
             true => {
                 /*
@@ -825,12 +794,12 @@ impl Cpu {
     }
 
     // SSTATUS, SIE, and SIP are subsets of MSTATUS, MIE, and MIP
-    fn read_csr_raw(&self, address: u16) -> u64 {
+    fn read_csr_raw(&self, address: u16) -> u32 {
         match address {
             // @TODO: Mask shuld consider of 32-bit mode
             CSR_FFLAGS_ADDRESS => self.csr[CSR_FCSR_ADDRESS as usize] & 0x1f,
             CSR_FRM_ADDRESS => (self.csr[CSR_FCSR_ADDRESS as usize] >> 5) & 0x7,
-            CSR_SSTATUS_ADDRESS => self.csr[CSR_MSTATUS_ADDRESS as usize] & 0x80000003000de162,
+            CSR_SSTATUS_ADDRESS => self.csr[CSR_MSTATUS_ADDRESS as usize] & 0x800d_e162,
             CSR_SIE_ADDRESS => self.csr[CSR_MIE_ADDRESS as usize] & 0x222,
             CSR_SIP_ADDRESS => self.csr[CSR_MIP_ADDRESS as usize] & 0x222,
             // CSR_TIME_ADDRESS => self.mmu.get_clint().read_mtime(),
@@ -838,7 +807,7 @@ impl Cpu {
         }
     }
 
-    fn write_csr_raw(&mut self, address: u16, value: u64) {
+    fn write_csr_raw(&mut self, address: u16, value: u32) {
         match address {
             CSR_FFLAGS_ADDRESS => {
                 self.csr[CSR_FCSR_ADDRESS as usize] &= !0x1f;
@@ -849,8 +818,8 @@ impl Cpu {
                 self.csr[CSR_FCSR_ADDRESS as usize] |= (value << 5) & 0xe0;
             }
             CSR_SSTATUS_ADDRESS => {
-                self.csr[CSR_MSTATUS_ADDRESS as usize] &= !0x80000003000de162;
-                self.csr[CSR_MSTATUS_ADDRESS as usize] |= value & 0x80000003000de162;
+                self.csr[CSR_MSTATUS_ADDRESS as usize] &= !0x800de162;
+                self.csr[CSR_MSTATUS_ADDRESS as usize] |= value & 0x800de162;
                 self.mmu
                     .update_mstatus(self.read_csr_raw(CSR_MSTATUS_ADDRESS));
             }
@@ -864,6 +833,12 @@ impl Cpu {
             }
             CSR_MIDELEG_ADDRESS => {
                 self.csr[address as usize] = value & 0x666; // from qemu
+            }
+            CSR_MEDELEG_ADDRESS => {
+                self.csr[address as usize] = value;
+            }
+            CSR_MTVEC_ADDRESS => {
+                self.csr[address as usize] = value;
             }
             CSR_MSTATUS_ADDRESS => {
                 self.csr[address as usize] = value;
@@ -899,49 +874,29 @@ impl Cpu {
         self.csr[CSR_FCSR_ADDRESS as usize] |= 0x1;
     }
 
-    fn update_addressing_mode(&mut self, value: u64) {
-        let addressing_mode = match self.xlen {
-            Xlen::Bit32 => match value & 0x80000000 {
-                0 => AddressingMode::None,
-                _ => AddressingMode::SV32,
-            },
-            Xlen::Bit64 => match value >> 60 {
-                0 => AddressingMode::None,
-                8 => AddressingMode::SV39,
-                9 => AddressingMode::SV48,
-                _ => {
-                    println!("Unknown addressing_mode {:x}", value >> 60);
-                    panic!();
-                }
-            },
+    fn update_addressing_mode(&mut self, value: u32) {
+        let addressing_mode = match value & 0x80000000 {
+            0 => AddressingMode::None,
+            _ => AddressingMode::SV32,
         };
-        let ppn = match self.xlen {
-            Xlen::Bit32 => value & 0x3fffff,
-            Xlen::Bit64 => value & 0xfffffffffff,
-        };
+        let ppn = value & 0x3fffff;
         self.mmu.update_addressing_mode(addressing_mode);
         self.mmu.update_ppn(ppn);
     }
 
-    // @TODO: Rename to better name?
-    fn sign_extend(&self, value: i64) -> i64 {
-        match self.xlen {
-            Xlen::Bit32 => value as i32 as i64,
-            Xlen::Bit64 => value,
-        }
+    // // @TODO: Rename to better name?
+    fn sign_extend(&self, value: i32) -> i32 {
+        value
     }
 
     // @TODO: Rename to better name?
-    fn unsigned_data(&self, value: i64) -> u64 {
-        (value as u64) & self.unsigned_data_mask
+    fn unsigned_data(&self, value: i32) -> u32 {
+        (value as u32) & self.unsigned_data_mask
     }
 
     // @TODO: Rename to better name?
-    fn most_negative(&self) -> i64 {
-        match self.xlen {
-            Xlen::Bit32 => std::i32::MIN as i64,
-            Xlen::Bit64 => std::i64::MIN,
-        }
+    fn most_negative(&self) -> i32 {
+        std::i32::MIN
     }
 
     // @TODO: Optimize
@@ -1492,7 +1447,7 @@ impl Cpu {
             );
         };
 
-        let mut s = format!("PC:{:016x} ", self.unsigned_data(self.pc as i64));
+        let mut s = format!("PC:{:08x} ", self.pc);
         s += &format!("{:08x} ", original_word);
         s += &format!("{} ", inst.name);
         s += &(inst.disassemble)(self, word, self.pc, true).to_string();
@@ -1504,19 +1459,19 @@ impl Cpu {
         &mut self.mmu
     }
 
-    pub fn phys_read_u32(&self, address: u64) -> u32 {
+    pub fn phys_read_u32(&self, address: u32) -> u32 {
         self.mmu.load_word_raw(address)
     }
 
-    pub fn phys_write_u32(&mut self, address: u64, value: u32) {
+    pub fn phys_write_u32(&mut self, address: u32, value: u32) {
         self.mmu.store_word_raw(address, value)
     }
 
-    pub fn phys_read_u8(&self, address: u64) -> u8 {
+    pub fn phys_read_u8(&self, address: u32) -> u8 {
         self.mmu.load_raw(address)
     }
 
-    pub fn phys_write_u8(&mut self, address: u64, value: u8) {
+    pub fn phys_write_u8(&mut self, address: u32, value: u8) {
         self.mmu.store_raw(address, value)
     }
 }

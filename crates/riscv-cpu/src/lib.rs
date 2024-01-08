@@ -1,4 +1,4 @@
 pub mod cpu;
 pub mod mmu;
 
-pub use cpu::{Cpu, CpuBuilder, Xlen};
+pub use cpu::{Cpu, CpuBuilder};

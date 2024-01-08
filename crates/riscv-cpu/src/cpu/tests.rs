@@ -1,6 +1,6 @@
 mod memory;
 use super::*;
-const MEMORY_BASE: u64 = 0x8000_0000;
+const MEMORY_BASE: u32 = 0x8000_0000;
 
 fn create_cpu(memory_capacity: usize) -> (Cpu, Arc<Mutex<memory::Memory>>) {
     let memory = Arc::new(Mutex::new(memory::Memory::new(
@@ -22,20 +22,8 @@ fn update_pc() {
     assert_eq!(0, cpu.read_pc());
     cpu.update_pc(1);
     assert_eq!(1, cpu.read_pc());
-    cpu.update_pc(0xffffffffffffffff);
-    assert_eq!(0xffffffffffffffff, cpu.read_pc());
-}
-
-#[test]
-fn update_xlen() {
-    let mut cpu = create_cpu(0).0;
-    assert!(matches!(cpu.xlen, Xlen::Bit64));
-    cpu.update_xlen(Xlen::Bit32);
-    assert!(matches!(cpu.xlen, Xlen::Bit32));
-    cpu.update_xlen(Xlen::Bit64);
-    assert!(matches!(cpu.xlen, Xlen::Bit64));
-    // Note: cpu.update_xlen() updates cpu.mmu.xlen, too.
-    // The test for mmu.xlen should be in Mmu?
+    cpu.update_pc(0xffffffff);
+    assert_eq!(0xffffffff, cpu.read_pc());
 }
 
 #[test]
@@ -51,26 +39,26 @@ fn read_register() {
     }
 
     for i in 0..31 {
-        cpu.x[i] = i as i64 + 1;
+        cpu.x[i] = i as i32 + 1;
     }
 
     for i in 0..31 {
         match i {
             // 0th register is hardwired zero
             0 => assert_eq!(0, cpu.read_register(i)),
-            _ => assert_eq!(i as i64 + 1, cpu.read_register(i)),
+            _ => assert_eq!(i as i32 + 1, cpu.read_register(i)),
         }
     }
 
     for i in 0..31 {
-        cpu.x[i] = (0xffffffffffffffff - i) as i64;
+        cpu.x[i] = (0xffffffff - i) as i32;
     }
 
     for i in 0..31 {
         match i {
             // 0th register is hardwired zero
             0 => assert_eq!(0, cpu.read_register(i)),
-            _ => assert_eq!(-(i as i64 + 1), cpu.read_register(i)),
+            _ => assert_eq!(-(i as i32 + 1), cpu.read_register(i)),
         }
     }
 
@@ -252,7 +240,7 @@ fn interrupt() {
     assert_eq!(handler_vector, cpu.read_pc());
 
     // CSR Cause register holds the reason what caused the interrupt
-    assert_eq!(0x8000000000000007, cpu.read_csr_raw(CSR_MCAUSE_ADDRESS));
+    assert_eq!(0x80000007, cpu.read_csr_raw(CSR_MCAUSE_ADDRESS));
 
     // @TODO: Test post CSR status register
     // @TODO: Test xIE bit in CSR status register
@@ -331,7 +319,7 @@ fn disassemble_next_instruction() {
     };
 
     assert_eq!(
-        "PC:0000000080000000 00100013 ADDI zero:0,zero:0,1",
+        "PC:80000000 00100013 ADDI zero:0,zero:0,1",
         cpu.disassemble_next_instruction()
     );
 
@@ -357,7 +345,7 @@ fn load_elf(cpu: &mut Cpu, program: &[u8]) {
 
         if sh.sh_type & goblin::elf::section_header::SHT_NOBITS != 0 {
             for addr in sh.sh_addr..(sh.sh_addr + sh.sh_size) {
-                mmu.store_doubleword(addr, 0).unwrap();
+                mmu.store(addr as _, 0).unwrap();
             }
         } else {
             for (offset, byte) in program
@@ -365,17 +353,16 @@ fn load_elf(cpu: &mut Cpu, program: &[u8]) {
                 .iter()
                 .enumerate()
             {
-                mmu.store(sh.sh_addr + offset as u64, *byte).unwrap();
+                mmu.store(sh.sh_addr as u32 + offset as u32, *byte).unwrap();
             }
         }
     }
 
-    cpu.update_pc(elf.entry as u64);
+    cpu.update_pc(elf.entry as u32);
 }
 
 fn test_program(program: &[u8]) {
     let (mut cpu, memory) = create_cpu(65536);
-    cpu.update_xlen(Xlen::Bit32);
     load_elf(&mut cpu, program);
 
     while memory.lock().unwrap().vm_result().is_none() {

@@ -917,7 +917,8 @@ impl Machine {
 
                     let cmd = self.memory_cmd_sender.clone();
                     let tid = self.thread_id_counter.fetch_add(1, Ordering::SeqCst);
-                    cpu.write_csr(riscv_cpu::cpu::CSR_MHARTID_ADDRESS, tid as u32).unwrap();
+                    cpu.write_csr(riscv_cpu::cpu::CSR_MHARTID_ADDRESS, tid as u32)
+                        .unwrap();
                     let memory = self.memory.clone();
                     join_tx
                         .send(std::thread::spawn(move || {

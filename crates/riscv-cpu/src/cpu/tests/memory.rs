@@ -43,6 +43,10 @@ impl Memory {
         self.vm_result
     }
 
+    pub fn set_tohost(&mut self, tohost: u32) {
+        self.tohost = tohost;
+    }
+
     /// Reads multiple bytes from memory.
     ///
     /// # Arguments
@@ -116,7 +120,6 @@ impl super::Memory for Memory {
                 println!("tohost write_u32: {:08x}", value);
                 self.vm_result = Some(value);
             }
-            println!("Write to {:08x}", address);
             let address = address - MEMORY_BASE as u32;
             let index = (address >> 2) as usize;
             self.data[index] = value;

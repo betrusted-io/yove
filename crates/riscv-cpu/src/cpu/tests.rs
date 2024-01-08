@@ -327,7 +327,7 @@ fn disassemble_next_instruction() {
     assert_eq!(memory_base, cpu.read_pc());
 }
 
-fn load_elf(cpu: &mut Cpu, program: &[u8]) {
+fn load_elf(cpu: &mut Cpu, memory: &Arc<Mutex<memory::Memory>>, program: &[u8]) {
     let goblin::Object::Elf(elf) =
         goblin::Object::parse(program).expect("Failed to parse ELF file")
     else {
@@ -358,12 +358,20 @@ fn load_elf(cpu: &mut Cpu, program: &[u8]) {
         }
     }
 
+    for sym in &elf.syms {
+        if let Some("tohost") = elf.strtab.get_at(sym.st_name) {
+            println!("tohost @ {:08x}", sym.st_value);
+            (*memory.lock().unwrap()).set_tohost(sym.st_value as u32);
+            break;
+        }
+    }
+
     cpu.update_pc(elf.entry as u32);
 }
 
 fn test_program(program: &[u8]) {
     let (mut cpu, memory) = create_cpu(65536);
-    load_elf(&mut cpu, program);
+    load_elf(&mut cpu, &memory, program);
 
     while memory.lock().unwrap().vm_result().is_none() {
         let pc = cpu.read_pc();

@@ -356,6 +356,12 @@ impl Cpu {
             self.pc = self.pc.wrapping_add(2); // 16-bit length compressed instruction
             self.uncompress(original_word & 0xffff)
         };
+        // println!(
+        //     "PC @ {:08x}  Original word: 0x{:04x}  Uncompressed: 0x{:08x}",
+        //     instruction_address,
+        //     original_word & 0xffff,
+        //     word
+        // );
 
         let Ok(inst) = self.decode_raw(word) else {
             panic!(
@@ -1004,20 +1010,35 @@ impl Cpu {
                         // r == 0 and imm != 0 is HINTs
                     }
                     1 => {
-                        // @TODO: Support C.JAL in 32-bit mode
-                        // C.ADDIW
-                        // addiw r, r, imm
-                        let r = (halfword >> 7) & 0x1f;
-                        let imm = match halfword & 0x1000 {
-							0x1000 => 0xffffffc0,
-							_ => 0
-						} | // imm[31:6] <= [12]
-						((halfword >> 7) & 0x20) | // imm[5] <= [12]
-						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
-                        if r != 0 {
-                            return (imm << 20) | (r << 15) | (r << 7) | 0x1b;
-                        }
-                        // r == 0 is reserved instruction
+                        // C.JAL
+                        // jal x1, offset
+                        // Bits:
+                        let imm = halfword >> 2;
+                        // Encoded:    11  4  9   8 10  6  7   3  2  1  5
+                        // Decoded: 11 10  9  8   7  6  5  4   3  2  1  0
+                        let r = 1;
+                        let imm =
+                            // imm[10]
+                            ((imm & 0b000_0100_0000)  << 4) |
+                            // imm[9:8,6]
+                            ((imm & 0b001_1010_0000) << 1) |
+                            // imm[7]
+                            ((imm & 0b000_0001_0000) << 3) |
+                            // imm[5]
+                            ((imm & 0b000_0000_0001) << 5) |
+                            // imm[4]
+                            ((imm & 0b010_0000_0000) >> 5) |
+                            // imm[3:1]
+                            (imm & 0b000_0000_1110);
+
+                        // imm[31:11]
+                        let imm = if halfword & 0x1000 == 0 {
+                            imm << 20
+                        } else {
+                            (imm << 20) | 0x801ff000
+                        };
+
+                        return imm | (r << 7) | 0x6f;
                     }
                     2 => {
                         // C.LI

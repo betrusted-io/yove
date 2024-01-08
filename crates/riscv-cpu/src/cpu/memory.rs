@@ -9,20 +9,33 @@ pub struct Memory {
 
     /// Offset where RAM lives
     base: usize,
+
+    /// Set to `true` if the program finishes
+    vm_result: Option<u32>,
+
+    /// Address of the `tohost` offset
+    tohost: u64,
 }
 
 impl Memory {
     /// Creates a new `Memory`
-    pub fn new(memory_size: usize, base: usize) -> Self {
+    pub fn new(memory_size: usize, base: usize, tohost: u64) -> Self {
         Memory {
             data: vec![0u64; memory_size / 4],
             base,
+            vm_result: None,
+            tohost,
         }
     }
 
     #[allow(dead_code)]
     pub fn memory_base(&self) -> u64 {
         self.base as u64
+    }
+
+    #[allow(dead_code)]
+    pub fn vm_result(&self) -> Option<u32> {
+        self.vm_result
     }
 
     /// Reads multiple bytes from memory.
@@ -61,6 +74,9 @@ impl super::Memory for Memory {
         let address = address - MEMORY_BASE as u64;
         let index = (address >> 3) as usize;
         let pos = (address % 8) * 8;
+        if address == self.tohost {
+            panic!("tohost write_u8: {:04x}", value);
+        }
         self.data[index] = (self.data[index] & !(0xff << pos)) | ((value as u64) << pos);
     }
 
@@ -71,6 +87,9 @@ impl super::Memory for Memory {
     /// * `value`
     fn write_u16(&mut self, address: u64, value: u16) {
         if (address % 2) == 0 {
+            if address == self.tohost {
+                panic!("tohost write_u16: {:04x}", value);
+            }
             let address = address - MEMORY_BASE as u64;
             let index = (address >> 3) as usize;
             let pos = (address % 8) * 8;
@@ -87,6 +106,10 @@ impl super::Memory for Memory {
     /// * `value`
     fn write_u32(&mut self, address: u64, value: u32) {
         if (address % 4) == 0 {
+            if address == self.tohost {
+                println!("tohost write_u32: {:08x}", value);
+                self.vm_result = Some(value);
+            }
             let address = address - MEMORY_BASE as u64;
             let index = (address >> 3) as usize;
             let pos = (address % 8) * 8;
@@ -103,6 +126,9 @@ impl super::Memory for Memory {
     /// * `value`
     fn write_u64(&mut self, address: u64, value: u64) {
         if (address % 8) == 0 {
+            if address == self.tohost {
+                panic!("tohost write_u64: {:016x}", value);
+            }
             let address = address - MEMORY_BASE as u64;
             let index = (address >> 3) as usize;
             self.data[index] = value;
@@ -181,7 +207,7 @@ impl super::Memory for Memory {
     }
 
     fn syscall(&mut self, _args: [i64; 8]) -> crate::mmu::SyscallResult {
-        crate::mmu::SyscallResult::Ok([0i64; 8])
+        crate::mmu::SyscallResult::Continue
     }
 
     fn translate(&self, _v_address: u64) -> Option<u64> {
@@ -199,6 +225,6 @@ impl super::Memory for Memory {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self::new(16384, 0x0000_0000)
+        Self::new(16384, 0x0000_0000, 0x8000_1000)
     }
 }

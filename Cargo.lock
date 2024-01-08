@@ -54,6 +54,9 @@ dependencies = [
 [[package]]
 name = "riscv-cpu"
 version = "0.1.0"
+dependencies = [
+ "goblin",
+]
 
 [[package]]
 name = "scroll"

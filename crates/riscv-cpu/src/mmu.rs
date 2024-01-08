@@ -9,6 +9,10 @@ use crate::cpu::{decode_privilege_mode, PrivilegeMode, ResponseData, Trap, TrapT
 pub enum SyscallResult {
     Ok([i64; 8]),
     Defer(Receiver<ResponseData>),
+    Terminate(usize /* Result */),
+
+    /// Pass the exception to the CPU
+    Continue,
 }
 
 impl From<[i64; 8]> for SyscallResult {

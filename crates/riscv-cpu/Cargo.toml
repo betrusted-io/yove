@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dev-dependencies]
-goblin = { version = "0.7.1", features = [ "std", "elf32", "alloc" ]}
+goblin = { version = "0.7.1", features = [ "elf32" ]}
 
 [dependencies]

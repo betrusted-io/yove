@@ -169,7 +169,7 @@ impl Worker {
 #[derive(Clone)]
 struct Memory {
     base: u32,
-    data: Arc<Vec<RwLock<Vec<u8>>>>,
+    data: Arc<Vec<RwLock<Vec<u32>>>>,
     allocated_pages: Arc<Mutex<BTreeSet<usize>>>,
     free_pages: Arc<Mutex<BTreeSet<usize>>>,
     heap_start: Arc<AtomicU32>,
@@ -193,7 +193,7 @@ impl Memory {
 
         // Populate the backing table as well as the list of free pages
         for phys in (0..(size as u32)).step_by(4096) {
-            backing.push(RwLock::new(vec![0; 4096]));
+            backing.push(RwLock::new(vec![0; 1024]));
             free_pages.insert((phys + base) as usize);
         }
         // Allocate the l0 page table
@@ -520,75 +520,97 @@ impl riscv_cpu::cpu::Memory for Memory {
         let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
+        let index = offset >> 2;
+        let pos = (offset % 4) * 8;
+
         self.data
             .get(page >> 12)
-            .map(|page| page.read().unwrap()[offset])
-            .unwrap_or(0)
+            .map(|page| page.read().unwrap()[index] >> pos)
+            .unwrap_or(0) as u8
     }
 
     fn read_u16(&self, address: u32) -> u16 {
-        let address = address - self.base;
-        let page = address as usize & !0xfff;
-        let offset = address as usize & 0xfff;
-        self.data
-            .get(page >> 12)
-            .map(|page| {
-                let page = page.read().unwrap();
-                u16::from_le_bytes([page[offset], page[offset + 1]])
-            })
-            .unwrap_or(0)
+        if address & 1 == 0 {
+            let address = address - self.base;
+            let page = address as usize & !0xfff;
+            let offset = address as usize & 0xfff;
+            let index = offset / 4;
+            let pos = (offset % 4) * 8;
+            self.data
+                .get(page >> 12)
+                .map(|page| page.read().unwrap()[index] >> pos)
+                .unwrap_or(0) as u16
+        } else {
+            let data = [self.read_u8(address), self.read_u8(address + 1)];
+            u16::from_le_bytes(data)
+        }
     }
 
     fn read_u32(&self, address: u32) -> u32 {
-        let address = address - self.base;
-        let page = address as usize & !0xfff;
-        let offset = address as usize & 0xfff;
-        self.data
-            .get(page >> 12)
-            .map(|page| {
-                let page = page.read().unwrap();
-                u32::from_le_bytes([
-                    page[offset],
-                    page[offset + 1],
-                    page[offset + 2],
-                    page[offset + 3],
-                ])
-            })
-            .unwrap_or(0)
+        if address & 3 == 0 {
+            let address = address - self.base;
+            let page = address as usize & !0xfff;
+            let offset = address as usize & 0xfff;
+            let index = offset / 4;
+            self.data
+                .get(page >> 12)
+                .map(|page| page.read().unwrap()[index])
+                .unwrap_or(0)
+        } else {
+            let data = [
+                self.read_u8(address),
+                self.read_u8(address + 1),
+                self.read_u8(address + 2),
+                self.read_u8(address + 3),
+            ];
+            u32::from_le_bytes(data)
+        }
     }
 
     fn write_u8(&self, address: u32, value: u8) {
         let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
+        let index = offset / 4;
+        let pos = (offset % 4) * 8;
         if let Some(page) = self.data.get(page >> 12) {
-            page.write().unwrap()[offset] = value;
+            let mut data = page.write().unwrap();
+            data[index] = (data[index] & !(0xff << pos)) | ((value as u32) << pos);
         }
     }
 
     fn write_u16(&self, address: u32, value: u16) {
-        let address = address - self.base;
-        let page = address as usize & !0xfff;
-        let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.get(page >> 12) {
-            let bytes = value.to_le_bytes();
-            let mut page = page.write().unwrap();
-            page[offset] = bytes[0];
-            page[offset + 1] = bytes[1];
+        if address & 1 == 0 {
+            let address = address - self.base;
+            let page = address as usize & !0xfff;
+            let offset = address as usize & 0xfff;
+            let index = offset >> 2;
+            let pos = (offset % 4) * 8;
+            if let Some(page) = self.data.get(page >> 12) {
+                let mut data = page.write().unwrap();
+                data[index] = (data[index] & !(0xffff << pos)) | ((value as u32) << pos);
+            }
+        } else {
+            for (offset, byte) in value.to_le_bytes().iter().enumerate() {
+                self.write_u8(address + offset as u32, *byte);
+            }
         }
     }
 
     fn write_u32(&self, address: u32, value: u32) {
-        let address = address - self.base;
-        let page = address as usize & !0xfff;
-        let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.get(page >> 12) {
-            let bytes = value.to_le_bytes();
-            let mut page = page.write().unwrap();
-            page[offset] = bytes[0];
-            page[offset + 1] = bytes[1];
-            page[offset + 2] = bytes[2];
-            page[offset + 3] = bytes[3];
+        if address & 3 == 0 {
+            let address = address - self.base;
+            let page = address as usize & !0xfff;
+            let offset = address as usize & 0xfff;
+            let index = offset >> 2;
+            if let Some(page) = self.data.get(page >> 12) {
+                let mut page = page.write().unwrap();
+                page[index] = value;
+            }
+        } else {
+            for (offset, byte) in value.to_le_bytes().iter().enumerate() {
+                self.write_u8(address + offset as u32, *byte);
+            }
         }
     }
 

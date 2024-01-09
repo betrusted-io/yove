@@ -58,7 +58,7 @@ pub struct Mmu {
     mstatus: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum AddressingMode {
     None,
     SV32,
@@ -75,8 +75,6 @@ fn _get_addressing_mode_name(mode: &AddressingMode) -> &'static str {
     match mode {
         AddressingMode::None => "None",
         AddressingMode::SV32 => "SV32",
-        // AddressingMode::SV39 => "SV39",
-        // AddressingMode::SV48 => "SV48",
     }
 }
 
@@ -158,14 +156,7 @@ impl Mmu {
             // translating an address only once.
             let effective_address = v_address;
             self.translate_address(effective_address, &MemoryAccessType::Execute)
-                .map(|p_address| {
-                    let data = self.load_word_raw(p_address);
-                    // self.instruction_cache
-                    //     .lock()
-                    //     .unwrap()
-                    //     .insert(v_address, data);
-                    data
-                })
+                .map(|p_address| self.load_word_raw(p_address))
                 .map_err(|()| Trap {
                     trap_type: TrapType::InstructionPageFault,
                     value: effective_address,
@@ -173,15 +164,8 @@ impl Mmu {
         } else {
             let mut data = 0;
             for i in 0..width {
-                match self.fetch(v_address.wrapping_add(i)) {
-                    Ok(byte) => data |= (byte as u32) << (i * 8),
-                    Err(e) => return Err(e),
-                };
+                data |= (self.fetch(v_address.wrapping_add(i))? as u32) << (i * 8);
             }
-            // self.instruction_cache
-            //     .lock()
-            //     .unwrap()
-            //     .insert(v_address, data);
             Ok(data)
         }
     }
@@ -346,10 +330,7 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     pub(crate) fn load_raw(&self, p_address: u32) -> u8 {
-        self.memory
-            // .lock() // .read()
-            // .unwrap()
-            .read_u8(p_address)
+        self.memory.read_u8(p_address)
     }
 
     /// Loads two bytes from main memory or peripheral devices depending on
@@ -358,10 +339,7 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     fn load_halfword_raw(&self, p_address: u32) -> u16 {
-        self.memory
-            // .lock() // .read()
-            // .unwrap()
-            .read_u16(p_address)
+        self.memory.read_u16(p_address)
     }
 
     /// Loads four bytes from main memory or peripheral devices depending on
@@ -370,10 +348,7 @@ impl Mmu {
     /// # Arguments
     /// * `p_address` Physical address
     pub fn load_word_raw(&self, p_address: u32) -> u32 {
-        self.memory
-            // .lock() // .read()
-            // .unwrap()
-            .read_u32(p_address)
+        self.memory.read_u32(p_address)
     }
 
     /// Stores a byte to main memory or peripheral devices depending on
@@ -383,10 +358,7 @@ impl Mmu {
     /// * `p_address` Physical address
     /// * `value` data written
     pub(crate) fn store_raw(&self, p_address: u32, value: u8) {
-        self.memory
-            // .lock() // .write()
-            // .unwrap()
-            .write_u8(p_address, value)
+        self.memory.write_u8(p_address, value)
     }
 
     /// Stores two bytes to main memory or peripheral devices depending on
@@ -396,10 +368,7 @@ impl Mmu {
     /// * `p_address` Physical address
     /// * `value` data written
     pub(crate) fn store_halfword_raw(&self, p_address: u32, value: u16) {
-        self.memory
-            // .lock() // .write()
-            // .unwrap()
-            .write_u16(p_address, value)
+        self.memory.write_u16(p_address, value)
     }
 
     /// Stores four bytes to main memory or peripheral devices depending on
@@ -409,24 +378,8 @@ impl Mmu {
     /// * `p_address` Physical address
     /// * `value` data written
     pub(crate) fn store_word_raw(&self, p_address: u32, value: u32) {
-        self.memory
-            // .lock() // .write()
-            // .unwrap()
-            .write_u32(p_address, value)
+        self.memory.write_u32(p_address, value)
     }
-
-    // /// Stores eight bytes to main memory or peripheral devices depending on
-    // /// physical address.
-    // ///
-    // /// # Arguments
-    // /// * `p_address` Physical address
-    // /// * `value` data written
-    // fn store_doubleword_raw(&self, p_address: u64, value: u64) {
-    //     self.memory
-    //         .lock() // .write()
-    //         .unwrap()
-    //         .write_u64(self.trim_to_xlen(p_address), value)
-    // }
 
     /// Checks if passed virtual address is valid (pointing a certain device) or not.
     /// This method can return page fault trap.
@@ -436,26 +389,15 @@ impl Mmu {
     pub fn validate_address(&self, v_address: u32) -> Option<bool> {
         self.translate_address(v_address, &MemoryAccessType::DontCare)
             .ok()
-            .map(|p_address| {
-                self.memory
-                    // .lock() // .read()
-                    // .unwrap()
-                    .validate_address(p_address)
-            })
+            .map(|p_address| self.memory.validate_address(p_address))
     }
 
     pub fn reserve(&mut self, core: u32, p_address: u32) {
-        self.memory
-            // .lock() // .write()
-            // .unwrap()
-            .reserve(core, p_address)
+        self.memory.reserve(core, p_address)
     }
 
     pub fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool {
-        self.memory
-            // .lock() // .write()
-            // .unwrap()
-            .clear_reservation(core, p_address)
+        self.memory.clear_reservation(core, p_address)
     }
 
     fn translate_address(&self, v_address: u32, access_type: &MemoryAccessType) -> Result<u32, ()> {
@@ -465,12 +407,7 @@ impl Mmu {
         if let AddressingMode::None = self.addressing_mode {
             Ok(v_address)
         } else {
-            let phys = self.translate_address_with_privilege_mode(
-                v_address,
-                access_type,
-                self.privilege_mode,
-            )?;
-            Ok(phys)
+            self.translate_address_with_privilege_mode(v_address, access_type, self.privilege_mode)
         }
     }
 
@@ -504,7 +441,7 @@ impl Mmu {
                 }
                 PrivilegeMode::User | PrivilegeMode::Supervisor => {
                     let vpns = [(address >> 12) & 0x3ff, (address >> 22) & 0x3ff];
-                    self.traverse_page(address, 2 - 1, self.ppn, &vpns, access_type)
+                    self.traverse_page(address, 1, self.ppn, &vpns, access_type)
                 }
                 _ => Ok(address),
             },
@@ -519,24 +456,13 @@ impl Mmu {
         vpns: &[u32],
         access_type: &MemoryAccessType,
     ) -> Result<u32, ()> {
+        assert!(self.addressing_mode == AddressingMode::SV32);
         let pagesize = 4096;
-        let ptesize = match self.addressing_mode {
-            AddressingMode::SV32 => 4,
-            _ => unreachable!(),
-        };
+        let ptesize = 4;
         let pte_address = parent_ppn * pagesize + vpns[level as usize] * ptesize;
-        let pte = match self.addressing_mode {
-            AddressingMode::SV32 => self.load_word_raw(pte_address),
-            _ => unreachable!(),
-        };
-        let ppn = match self.addressing_mode {
-            AddressingMode::SV32 => (pte >> 10) & 0x3fffff,
-            _ => unreachable!(),
-        };
-        let ppns = match self.addressing_mode {
-            AddressingMode::SV32 => [(pte >> 10) & 0x3ff, (pte >> 20) & 0xfff, 0 /*dummy*/],
-            _ => panic!(), // Shouldn't happen
-        };
+        let pte = self.load_word_raw(pte_address);
+        let ppn = (pte >> 10) & 0x3fffff;
+        let ppns = [(pte >> 10) & 0x3ff, (pte >> 20) & 0xfff, 0 /*dummy*/];
         let _rsw = (pte >> 8) & 0x3;
         let d = (pte >> 7) & 1;
         let a = (pte >> 6) & 1;
@@ -572,60 +498,33 @@ impl Mmu {
                     MemoryAccessType::Write => 1 << 7,
                     _ => 0,
                 });
-            match self.addressing_mode {
-                AddressingMode::SV32 => self.store_word_raw(pte_address, new_pte as u32),
-                _ => panic!(),
-            };
+            self.store_word_raw(pte_address, new_pte);
         }
 
         match access_type {
-            MemoryAccessType::Execute => {
-                if x == 0 {
-                    return Err(());
-                }
+            MemoryAccessType::Execute if x == 0 => {
+                return Err(());
             }
-            MemoryAccessType::Read => {
-                if r == 0 {
-                    return Err(());
-                }
+            MemoryAccessType::Read if r == 0 => {
+                return Err(());
             }
-            MemoryAccessType::Write => {
-                if w == 0 {
-                    return Err(());
-                }
+            MemoryAccessType::Write if w == 0 => {
+                return Err(());
             }
             _ => {}
         };
 
         let offset = v_address & 0xfff; // [11:0]
                                         // @TODO: Optimize
-        let p_address = match self.addressing_mode {
-            AddressingMode::SV32 => match level {
-                1 => {
-                    if ppns[0] != 0 {
-                        return Err(());
-                    }
-                    (ppns[1] << 22) | (vpns[0] << 12) | offset
+        let p_address = match level {
+            1 => {
+                if ppns[0] != 0 {
+                    return Err(());
                 }
-                0 => (ppn << 12) | offset,
-                _ => panic!(), // Shouldn't happen
-            },
-            _ => match level {
-                2 => {
-                    if ppns[1] != 0 || ppns[0] != 0 {
-                        return Err(());
-                    }
-                    (ppns[2] << 30) | (vpns[1] << 21) | (vpns[0] << 12) | offset
-                }
-                1 => {
-                    if ppns[0] != 0 {
-                        return Err(());
-                    }
-                    (ppns[2] << 30) | (ppns[1] << 21) | (vpns[0] << 12) | offset
-                }
-                0 => (ppn << 12) | offset,
-                _ => panic!(), // Shouldn't happen
-            },
+                (ppns[1] << 22) | (vpns[0] << 12) | offset
+            }
+            0 => (ppn << 12) | offset,
+            _ => panic!(), // Shouldn't happen
         };
 
         Ok(p_address)

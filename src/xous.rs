@@ -11,7 +11,7 @@ use std::{
     sync::{
         atomic::{AtomicI32, AtomicU32, Ordering},
         mpsc::{Receiver, Sender},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread::JoinHandle,
 };
@@ -166,14 +166,10 @@ impl Worker {
     }
 }
 
-// struct WorkerHandle {
-//     // joiner: std::thread::JoinHandle<u32>,
-// }
-
 #[derive(Clone)]
 struct Memory {
     base: u32,
-    data: Arc<Mutex<Vec<Vec<u8>>>>,
+    data: Arc<Vec<RwLock<Vec<u8>>>>,
     allocated_pages: Arc<Mutex<BTreeSet<usize>>>,
     free_pages: Arc<Mutex<BTreeSet<usize>>>,
     heap_start: Arc<AtomicU32>,
@@ -197,7 +193,7 @@ impl Memory {
 
         // Populate the backing table as well as the list of free pages
         for phys in (0..(size as u32)).step_by(4096) {
-            backing.push(vec![0; 4096]);
+            backing.push(RwLock::new(vec![0; 4096]));
             free_pages.insert((phys + base) as usize);
         }
         // Allocate the l0 page table
@@ -208,7 +204,7 @@ impl Memory {
         (
             Self {
                 base,
-                data: Arc::new(Mutex::new(backing)),
+                data: Arc::new(backing),
                 allocated_pages: Arc::new(Mutex::new(allocated_pages)),
                 free_pages: Arc::new(Mutex::new(free_pages)),
                 l1_pt: MEMORY_BASE + 4096,
@@ -525,10 +521,8 @@ impl riscv_cpu::cpu::Memory for Memory {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data
-            .lock()
-            .unwrap()
             .get(page >> 12)
-            .map(|page| page[offset])
+            .map(|page| page.read().unwrap()[offset])
             .unwrap_or(0)
     }
 
@@ -537,10 +531,11 @@ impl riscv_cpu::cpu::Memory for Memory {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data
-            .lock()
-            .unwrap()
             .get(page >> 12)
-            .map(|page| u16::from_le_bytes([page[offset], page[offset + 1]]))
+            .map(|page| {
+                let page = page.read().unwrap();
+                u16::from_le_bytes([page[offset], page[offset + 1]])
+            })
             .unwrap_or(0)
     }
 
@@ -549,10 +544,9 @@ impl riscv_cpu::cpu::Memory for Memory {
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data
-            .lock()
-            .unwrap()
             .get(page >> 12)
             .map(|page| {
+                let page = page.read().unwrap();
                 u32::from_le_bytes([
                     page[offset],
                     page[offset + 1],
@@ -567,8 +561,8 @@ impl riscv_cpu::cpu::Memory for Memory {
         let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.lock().unwrap().get_mut(page >> 12) {
-            page[offset] = value;
+        if let Some(page) = self.data.get(page >> 12) {
+            page.write().unwrap()[offset] = value;
         }
     }
 
@@ -576,8 +570,9 @@ impl riscv_cpu::cpu::Memory for Memory {
         let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.lock().unwrap().get_mut(page >> 12) {
+        if let Some(page) = self.data.get(page >> 12) {
             let bytes = value.to_le_bytes();
+            let mut page = page.write().unwrap();
             page[offset] = bytes[0];
             page[offset + 1] = bytes[1];
         }
@@ -587,8 +582,9 @@ impl riscv_cpu::cpu::Memory for Memory {
         let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.lock().unwrap().get_mut(page >> 12) {
+        if let Some(page) = self.data.get(page >> 12) {
             let bytes = value.to_le_bytes();
+            let mut page = page.write().unwrap();
             page[offset] = bytes[0];
             page[offset + 1] = bytes[1];
             page[offset + 2] = bytes[2];
@@ -601,7 +597,7 @@ impl riscv_cpu::cpu::Memory for Memory {
             return false;
         }
         let address = address as usize - self.base as usize;
-        address < self.data.lock().unwrap().len()
+        address < self.data.len()
     }
 
     fn syscall(&self, args: [i32; 8]) -> SyscallResult {

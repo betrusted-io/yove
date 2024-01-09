@@ -629,7 +629,7 @@ impl riscv_cpu::cpu::Memory for Memory {
     }
 
     fn reserve(&mut self, core: u32, p_address: u32) {
-        self.reservations.insert(core, p_address);
+        self.reservations.insert(p_address, core);
     }
 
     fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool {
@@ -893,6 +893,8 @@ impl Machine {
                     tx,
                 ) => {
                     let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone()).build();
+                    let tid = self.thread_id_counter.fetch_add(1, Ordering::SeqCst);
+                    cpu.write_csr(riscv_cpu::cpu::CSR_MHARTID_ADDRESS, tid as u32).unwrap();
 
                     cpu.write_csr(riscv_cpu::cpu::CSR_SATP_ADDRESS, self.satp)
                         .map_err(|_| LoadError::SatpWriteError)?;
@@ -916,9 +918,6 @@ impl Machine {
                     cpu.write_register(13, argument_4 as i32);
 
                     let cmd = self.memory_cmd_sender.clone();
-                    let tid = self.thread_id_counter.fetch_add(1, Ordering::SeqCst);
-                    cpu.write_csr(riscv_cpu::cpu::CSR_MHARTID_ADDRESS, tid as u32)
-                        .unwrap();
                     let memory = self.memory.clone();
                     join_tx
                         .send(std::thread::spawn(move || {

@@ -379,7 +379,6 @@ impl Cpu {
         //     (inst.disassemble)(self, word, self.pc, true)
         // );
         let result = (inst.operation)(self, word, instruction_address);
-        // println!();
         self.x[0] = 0; // hardwired zero
         result
     }

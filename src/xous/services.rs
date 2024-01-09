@@ -22,7 +22,7 @@ pub enum LendResult {
 }
 
 pub trait Service {
-    fn scalar(&mut self, _memory: &mut Memory, sender: u32, opcode: u32, args: [u32; 4]) {
+    fn scalar(&mut self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
         panic!(
             "Unknown scalar to service {}: {} ({:?})",
             sender, opcode, args
@@ -31,7 +31,7 @@ pub trait Service {
 
     fn blocking_scalar(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         args: [u32; 4],
@@ -44,7 +44,7 @@ pub trait Service {
 
     fn lend(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         buf: &[u8],
@@ -61,7 +61,7 @@ pub trait Service {
 
     fn lend_mut(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         buf: &mut [u8],
@@ -78,7 +78,7 @@ pub trait Service {
 
     fn send(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         buf: &[u8],

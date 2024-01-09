@@ -69,7 +69,7 @@ impl Default for Log {
 }
 
 impl Service for Log {
-    fn scalar(&mut self, _memory: &mut Memory, sender: u32, opcode: u32, args: [u32; 4]) {
+    fn scalar(&mut self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
         let message_bytes = if opcode >= LogSendOpcode::PanicMessage0 as u32
             && opcode <= LogSendOpcode::PanicMessage32 as u32
         {
@@ -107,7 +107,7 @@ impl Service for Log {
 
     fn blocking_scalar(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         args: [u32; 4],
@@ -121,7 +121,7 @@ impl Service for Log {
 
     fn lend(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         buf: &[u8],
@@ -145,7 +145,7 @@ impl Service for Log {
 
     fn lend_mut(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         _buf: &mut [u8],
@@ -157,7 +157,7 @@ impl Service for Log {
 
     fn send(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         _buf: &[u8],

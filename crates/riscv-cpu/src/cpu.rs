@@ -1,12 +1,11 @@
-use std::{
-    sync::{mpsc::Receiver, Arc, Mutex},
-    thread::JoinHandle,
-};
+use std::{sync::mpsc::Receiver, thread::JoinHandle};
 
 mod instructions;
 
 #[cfg(test)]
 mod tests;
+
+use crate::mmu::SystemBus;
 
 use self::instructions::Instruction;
 
@@ -85,7 +84,7 @@ pub struct Cpu {
     pc: u32,
     csr: [u32; CSR_CAPACITY],
     mmu: Mmu,
-    memory: Arc<Mutex<dyn Memory + Send + Sync>>,
+    memory: Box<dyn SystemBus>,
     _dump_flag: bool,
     unsigned_data_mask: u32,
     instructions: [instructions::Instruction; instructions::INSTRUCTION_NUM],
@@ -227,11 +226,11 @@ fn get_trap_cause(trap: &Trap) -> u32 {
 pub struct CpuBuilder {
     pc: u32,
     sp: u32,
-    memory: Arc<Mutex<dyn Memory + Send + Sync>>,
+    memory: Box<dyn SystemBus>,
 }
 
 impl CpuBuilder {
-    pub fn new(memory: Arc<Mutex<dyn Memory + Send + Sync>>) -> Self {
+    pub fn new(memory: Box<dyn SystemBus>) -> Self {
         CpuBuilder {
             memory,
             pc: 0,
@@ -261,7 +260,7 @@ impl Cpu {
     ///
     /// # Arguments
     /// * `Terminal`
-    pub fn new(memory: Arc<Mutex<dyn Memory + Send + Sync>>) -> Self {
+    pub fn new(memory: Box<dyn SystemBus>) -> Self {
         Cpu {
             clock: 0,
             privilege_mode: PrivilegeMode::Machine,

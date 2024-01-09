@@ -1,8 +1,4 @@
-use std::{
-    sync::mpsc::Receiver,
-    sync::{Arc, Mutex},
-    thread::JoinHandle,
-};
+use std::{sync::mpsc::Receiver, thread::JoinHandle};
 
 use crate::cpu::{decode_privilege_mode, PrivilegeMode, ResponseData, Trap, TrapType};
 
@@ -32,17 +28,18 @@ pub trait Memory {
     fn read_u8(&self, p_address: u32) -> u8;
     fn read_u16(&self, p_address: u32) -> u16;
     fn read_u32(&self, p_address: u32) -> u32;
-    // fn read_u64(&self, p_address: u32) -> u64;
-    fn write_u8(&mut self, p_address: u32, value: u8);
-    fn write_u16(&mut self, p_address: u32, value: u16);
-    fn write_u32(&mut self, p_address: u32, value: u32);
-    // fn write_u64(&mut self, p_address: u32, value: u64);
+    fn write_u8(&self, p_address: u32, value: u8);
+    fn write_u16(&self, p_address: u32, value: u16);
+    fn write_u32(&self, p_address: u32, value: u32);
     fn validate_address(&self, address: u32) -> bool;
-    fn syscall(&mut self, args: [i32; 8]) -> SyscallResult;
+    fn syscall(&self, args: [i32; 8]) -> SyscallResult;
     fn translate(&self, v_address: u32) -> Option<u32>;
-    fn reserve(&mut self, core: u32, p_address: u32);
-    fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool;
+    fn reserve(&self, core: u32, p_address: u32);
+    fn clear_reservation(&self, core: u32, p_address: u32) -> bool;
+    fn clone(&self) -> Box<dyn Memory + Send + Sync>;
 }
+
+pub trait SystemBus: Memory + Send + Sync {}
 
 /// Emulates Memory Management Unit. It holds the Main memory and peripheral
 /// devices, maps address to them, and accesses them depending on address.
@@ -54,7 +51,7 @@ pub struct Mmu {
     ppn: u32,
     addressing_mode: AddressingMode,
     privilege_mode: PrivilegeMode,
-    memory: Arc<Mutex<dyn Memory + Send + Sync>>,
+    memory: Box<dyn Memory + Send + Sync>,
 
     /// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
     /// then `Mmu` has copy of it.
@@ -88,7 +85,7 @@ impl Mmu {
     ///
     /// # Arguments
     /// * `xlen`
-    pub fn new(memory: Arc<Mutex<dyn Memory + Send + Sync>>) -> Self {
+    pub fn new(memory: Box<dyn Memory + Send + Sync>) -> Self {
         Mmu {
             // clock: 0,
             ppn: 0,
@@ -350,8 +347,8 @@ impl Mmu {
     /// * `p_address` Physical address
     pub(crate) fn load_raw(&self, p_address: u32) -> u8 {
         self.memory
-            .lock() // .read()
-            .unwrap()
+            // .lock() // .read()
+            // .unwrap()
             .read_u8(p_address)
     }
 
@@ -362,8 +359,8 @@ impl Mmu {
     /// * `p_address` Physical address
     fn load_halfword_raw(&self, p_address: u32) -> u16 {
         self.memory
-            .lock() // .read()
-            .unwrap()
+            // .lock() // .read()
+            // .unwrap()
             .read_u16(p_address)
     }
 
@@ -374,8 +371,8 @@ impl Mmu {
     /// * `p_address` Physical address
     pub fn load_word_raw(&self, p_address: u32) -> u32 {
         self.memory
-            .lock() // .read()
-            .unwrap()
+            // .lock() // .read()
+            // .unwrap()
             .read_u32(p_address)
     }
 
@@ -387,8 +384,8 @@ impl Mmu {
     /// * `value` data written
     pub(crate) fn store_raw(&self, p_address: u32, value: u8) {
         self.memory
-            .lock() // .write()
-            .unwrap()
+            // .lock() // .write()
+            // .unwrap()
             .write_u8(p_address, value)
     }
 
@@ -400,8 +397,8 @@ impl Mmu {
     /// * `value` data written
     pub(crate) fn store_halfword_raw(&self, p_address: u32, value: u16) {
         self.memory
-            .lock() // .write()
-            .unwrap()
+            // .lock() // .write()
+            // .unwrap()
             .write_u16(p_address, value)
     }
 
@@ -413,8 +410,8 @@ impl Mmu {
     /// * `value` data written
     pub(crate) fn store_word_raw(&self, p_address: u32, value: u32) {
         self.memory
-            .lock() // .write()
-            .unwrap()
+            // .lock() // .write()
+            // .unwrap()
             .write_u32(p_address, value)
     }
 
@@ -441,28 +438,28 @@ impl Mmu {
             .ok()
             .map(|p_address| {
                 self.memory
-                    .lock() // .read()
-                    .unwrap()
+                    // .lock() // .read()
+                    // .unwrap()
                     .validate_address(p_address)
             })
     }
 
     pub fn reserve(&mut self, core: u32, p_address: u32) {
         self.memory
-            .lock() // .write()
-            .unwrap()
+            // .lock() // .write()
+            // .unwrap()
             .reserve(core, p_address)
     }
 
     pub fn clear_reservation(&mut self, core: u32, p_address: u32) -> bool {
         self.memory
-            .lock() // .write()
-            .unwrap()
+            // .lock() // .write()
+            // .unwrap()
             .clear_reservation(core, p_address)
     }
 
     fn translate_address(&self, v_address: u32, access_type: &MemoryAccessType) -> Result<u32, ()> {
-        if let Some(address) = self.memory.lock().unwrap().translate(v_address) {
+        if let Some(address) = self.memory.translate(v_address) {
             return Ok(address);
         }
         if let AddressingMode::None = self.addressing_mode {

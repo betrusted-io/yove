@@ -2,12 +2,12 @@ mod memory;
 use super::*;
 const MEMORY_BASE: u32 = 0x8000_0000;
 
-fn create_cpu(memory_capacity: usize) -> (Cpu, Arc<Mutex<memory::Memory>>) {
-    let memory = Arc::new(Mutex::new(memory::Memory::new(
+fn create_cpu(memory_capacity: usize) -> (Cpu, Box<memory::Memory>) {
+    let memory = Box::new(memory::Memory::new(
         memory_capacity,
         MEMORY_BASE as usize,
         0x8000_1000,
-    )));
+    ));
     (Cpu::new(memory.clone()), memory)
 }
 
@@ -327,7 +327,7 @@ fn disassemble_next_instruction() {
     assert_eq!(memory_base, cpu.read_pc());
 }
 
-fn load_elf(cpu: &mut Cpu, memory: &Arc<Mutex<memory::Memory>>, program: &[u8]) {
+fn load_elf(cpu: &mut Cpu, memory: &mut Box<memory::Memory>, program: &[u8]) {
     let goblin::Object::Elf(elf) =
         goblin::Object::parse(program).expect("Failed to parse ELF file")
     else {
@@ -361,7 +361,7 @@ fn load_elf(cpu: &mut Cpu, memory: &Arc<Mutex<memory::Memory>>, program: &[u8]) 
     for sym in &elf.syms {
         if let Some("tohost") = elf.strtab.get_at(sym.st_name) {
             println!("tohost @ {:08x}", sym.st_value);
-            (*memory.lock().unwrap()).set_tohost(sym.st_value as u32);
+            memory.set_tohost(sym.st_value as u32);
             break;
         }
     }
@@ -370,10 +370,10 @@ fn load_elf(cpu: &mut Cpu, memory: &Arc<Mutex<memory::Memory>>, program: &[u8]) 
 }
 
 fn test_program(program: &[u8]) {
-    let (mut cpu, memory) = create_cpu(65536);
-    load_elf(&mut cpu, &memory, program);
+    let (mut cpu, mut memory) = create_cpu(65536);
+    load_elf(&mut cpu, &mut memory, program);
 
-    while memory.lock().unwrap().vm_result().is_none() {
+    while memory.vm_result().is_none() {
         let pc = cpu.read_pc();
         let result = cpu.tick();
         if let TickResult::CpuTrap(trap) = result {
@@ -389,7 +389,7 @@ fn test_program(program: &[u8]) {
         }
     }
 
-    let vm_result = memory.lock().unwrap().vm_result().unwrap();
+    let vm_result = memory.vm_result().unwrap();
     println!("VM result: {}", vm_result);
 
     assert_eq!(vm_result, 1);

@@ -607,7 +607,7 @@ pub const fn get_instructions() -> [Instruction; INSTRUCTION_NUM] {
                     *dest = *src;
                 }
                 use crate::mmu::SyscallResult;
-                match cpu.memory.lock().unwrap().syscall(args) {
+                match cpu.memory.syscall(args) {
                     SyscallResult::Ok(result) => {
                         for (src, dest) in result.iter().zip(cpu.x[10..].iter_mut()) {
                             *dest = *src;

@@ -102,6 +102,7 @@ pub enum Syscall {
     ),
     JoinThread(i32 /* thread ID */),
     UnmapMemory(i32, /* address */ i32 /* size */),
+    TerminateProcess(i32 /* Exit code */),
 }
 
 #[derive(Debug)]
@@ -174,6 +175,7 @@ impl From<[i32; 8]> for Syscall {
             ),
             SyscallNumber::Yield => Syscall::Yield,
             SyscallNumber::JoinThread => Syscall::JoinThread(value[1]),
+            SyscallNumber::TerminateProcess => Syscall::TerminateProcess(value[1]),
             _ => Syscall::Unknown(value),
         }
     }

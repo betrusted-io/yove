@@ -36,7 +36,7 @@ impl Default for Ticktimer {
 }
 
 impl super::Service for Ticktimer {
-    fn scalar(&mut self, _memory: &mut Memory, _sender: u32, opcode: u32, args: [u32; 4]) {
+    fn scalar(&mut self, _memory: &Memory, _sender: u32, opcode: u32, args: [u32; 4]) {
         if opcode == ScalarOpcode::FreeCondition as u32 {
             let condition_index = args[0] as usize;
             if let Some(condvar) = self.condvars.remove(&condition_index) {
@@ -49,7 +49,7 @@ impl super::Service for Ticktimer {
 
     fn blocking_scalar(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         args: [u32; 4],
@@ -135,7 +135,7 @@ impl super::Service for Ticktimer {
 
     fn lend(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         _buf: &[u8],
@@ -147,7 +147,7 @@ impl super::Service for Ticktimer {
 
     fn lend_mut(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         _buf: &mut [u8],
@@ -159,7 +159,7 @@ impl super::Service for Ticktimer {
 
     fn send(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         _buf: &[u8],

@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::channel;
 
 use super::super::xous::services::get_service;
@@ -7,13 +8,7 @@ use super::Memory;
 use super::SyscallResult;
 use riscv_cpu::cpu::Memory as OtherMemory;
 
-pub fn map_memory(
-    memory: &mut Memory,
-    phys: i32,
-    virt: i32,
-    size: i32,
-    _flags: i32,
-) -> SyscallResult {
+pub fn map_memory(memory: &Memory, phys: i32, virt: i32, size: i32, _flags: i32) -> SyscallResult {
     // print!(
     //     "MapMemory(phys: {:08x}, virt: {:08x}, bytes: {}, flags: {:02x})",
     //     phys, virt, size, _flags
@@ -56,14 +51,15 @@ pub fn map_memory(
     }
 }
 
-pub fn connect(memory: &mut Memory, id: [u32; 4]) -> SyscallResult {
+pub fn connect(memory: &Memory, id: [u32; 4]) -> SyscallResult {
     // println!(
     //     "Connect([0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}])",
     //     id[0], id[1], id[2], id[3]
     // );
     if let Some(service) = get_service(&id) {
-        let connection_id = memory.connections.len() as u32 + 1;
-        memory.connections.insert(connection_id, service);
+        let mut connections = memory.connections.lock().unwrap();
+        let connection_id = connections.len() as u32 + 1;
+        connections.insert(connection_id, service);
         [
             SyscallResultNumber::ConnectionId as i32,
             connection_id as i32,
@@ -90,12 +86,12 @@ pub fn connect(memory: &mut Memory, id: [u32; 4]) -> SyscallResult {
     }
 }
 
-pub fn try_connect(memory: &mut Memory, id: [u32; 4]) -> SyscallResult {
+pub fn try_connect(memory: &Memory, id: [u32; 4]) -> SyscallResult {
     connect(memory, id)
 }
 
 pub fn send_message(
-    memory: &mut Memory,
+    memory: &Memory,
     connection_id: u32,
     kind: u32,
     opcode: u32,
@@ -120,7 +116,7 @@ pub fn send_message(
     };
     // Pull the service out of the connections table so that we can send
     // a mutable copy of the memory object to the service.
-    let Some(mut service) = memory.connections.remove(&connection_id) else {
+    let Some(mut service) = memory.connections.lock().unwrap().remove(&connection_id) else {
         println!("Unhandled connection ID {}", connection_id);
         return [
             SyscallResultNumber::Error as i32,
@@ -234,12 +230,16 @@ pub fn send_message(
             // .into()
         }
     };
-    memory.connections.insert(connection_id, service);
+    memory
+        .connections
+        .lock()
+        .unwrap()
+        .insert(connection_id, service);
     response
 }
 
 pub fn try_send_message(
-    memory: &mut Memory,
+    memory: &Memory,
     connection_id: u32,
     kind: u32,
     opcode: u32,
@@ -248,18 +248,19 @@ pub fn try_send_message(
     send_message(memory, connection_id, kind, opcode, args)
 }
 
-pub fn increase_heap(memory: &mut Memory, delta: i32, _flags: i32) -> SyscallResult {
+pub fn increase_heap(memory: &Memory, delta: i32, _flags: i32) -> SyscallResult {
     assert!(delta & 0xfff == 0, "delta must be page-aligned");
     let increase_bytes = delta as u32;
-    let heap_address = memory.heap_start + memory.heap_size;
+    let heap_address =
+        memory.heap_start.load(Ordering::Relaxed) + memory.heap_size.load(Ordering::Relaxed);
     if delta == 0 {
         return [
             SyscallResultNumber::MemoryRange as i32,
-            memory.heap_start as i32,
-            if memory.heap_size == 0 {
+            memory.heap_start.load(Ordering::Relaxed) as i32,
+            if memory.heap_size.load(Ordering::Relaxed) == 0 {
                 4096
             } else {
-                memory.heap_size
+                memory.heap_size.load(Ordering::Relaxed)
             } as i32,
             0,
             0,
@@ -285,8 +286,11 @@ pub fn increase_heap(memory: &mut Memory, delta: i32, _flags: i32) -> SyscallRes
         for new_address in (heap_address..(heap_address + increase_bytes)).step_by(4096) {
             memory.ensure_page(new_address);
         }
-        let new_heap_region = memory.heap_start + memory.heap_size;
-        memory.heap_size += increase_bytes;
+        let new_heap_region =
+            memory.heap_start.load(Ordering::Relaxed) + memory.heap_size.load(Ordering::Relaxed);
+        memory
+            .heap_size
+            .fetch_add(increase_bytes, Ordering::Relaxed);
         [
             SyscallResultNumber::MemoryRange as i32,
             new_heap_region as i32,
@@ -302,7 +306,7 @@ pub fn increase_heap(memory: &mut Memory, delta: i32, _flags: i32) -> SyscallRes
 }
 
 pub fn create_thread(
-    memory: &mut Memory,
+    memory: &Memory,
     entry_point: i32,
     stack_pointer: i32,
     stack_length: i32,
@@ -323,7 +327,11 @@ pub fn create_thread(
         ))
         .unwrap();
     let (thread_id, join_handle) = rx.recv().unwrap();
-    memory.thread_handles.insert(thread_id, join_handle);
+    memory
+        .thread_handles
+        .lock()
+        .unwrap()
+        .insert(thread_id, join_handle);
     [
         SyscallResultNumber::ThreadId as i32,
         thread_id,
@@ -335,4 +343,8 @@ pub fn create_thread(
         0,
     ]
     .into()
+}
+
+pub fn terminate_process(_memory: &Memory, exit_code: i32) -> ! {
+    std::process::exit(exit_code)
 }

@@ -22,7 +22,7 @@ impl Default for PanicToScreen {
 impl Service for PanicToScreen {
     fn lend_mut(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         _sender: u32,
         opcode: u32,
         buf: &mut [u8],

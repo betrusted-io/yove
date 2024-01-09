@@ -94,13 +94,13 @@ impl Default for Name {
 }
 
 impl Service for Name {
-    fn scalar(&mut self, _memory: &mut Memory, sender: u32, opcode: u32, args: [u32; 4]) {
+    fn scalar(&mut self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
         panic!("Unhandled name scalar {}: {} {:x?}", sender, opcode, args);
     }
 
     fn blocking_scalar(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         args: [u32; 4],
@@ -114,7 +114,7 @@ impl Service for Name {
 
     fn lend(
         &mut self,
-        _memory: &mut Memory,
+        _memory: &Memory,
         sender: u32,
         opcode: u32,
         buf: &[u8],
@@ -129,7 +129,7 @@ impl Service for Name {
 
     fn lend_mut(
         &mut self,
-        memory: &mut Memory,
+        memory: &Memory,
         sender: u32,
         opcode: u32,
         buf: &mut [u8],
@@ -151,8 +151,9 @@ impl Service for Name {
                 panic!("Unrecognized service name {}", name);
             });
 
-            let connection_id = memory.connections.len() as u32 + 1;
-            memory.connections.insert(connection_id, service);
+            let mut connections = memory.connections.lock().unwrap();
+            let connection_id = connections.len() as u32 + 1;
+            connections.insert(connection_id, service);
 
             buf[0..4].copy_from_slice(&0u32.to_le_bytes());
             buf[4..8].copy_from_slice(&connection_id.to_le_bytes());
@@ -166,14 +167,7 @@ impl Service for Name {
         //
     }
 
-    fn send(
-        &mut self,
-        _memory: &mut Memory,
-        sender: u32,
-        opcode: u32,
-        _buf: &[u8],
-        extra: [u32; 2],
-    ) {
+    fn send(&mut self, _memory: &Memory, sender: u32, opcode: u32, _buf: &[u8], extra: [u32; 2]) {
         panic!("Unhandled name send {}: {} {:x?}", sender, opcode, extra);
     }
 }

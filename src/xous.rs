@@ -6,13 +6,16 @@ mod syscalls;
 use definitions::{Syscall, SyscallNumber, SyscallResultNumber};
 pub use riscv_cpu::mmu::SyscallResult;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     sync::{
         atomic::{AtomicI32, Ordering},
         mpsc::{Receiver, Sender},
         Arc, Mutex,
     },
+    thread::JoinHandle,
 };
+
+use self::definitions::SyscallErrorNumber;
 
 const MEMORY_BASE: u32 = 0x8000_0000;
 const ALLOCATION_START: u32 = 0x4000_0000;
@@ -62,27 +65,27 @@ const MMUFLAG_ACCESSED: u32 = 0x40;
 const MMUFLAG_DIRTY: u32 = 0x80;
 
 impl std::error::Error for LoadError {}
-pub type ResponseData = ([i32; 8], Option<(Vec<u8>, u32)>);
+// pub type ResponseData = ([i32; 8], Option<(Vec<u8>, u32)>);
 
 enum MemoryCommand {
-    Exit,
-    ExitThread(u32 /* tid */, u32 /* result */),
+    // Exit,
+    // ExitThread(u32 /* tid */, u32 /* result */),
     CreateThread(
-        u32,         /* entry point */
-        u32,         /* stack pointer */
-        u32,         /* stack length */
-        u32,         /* argument 1 */
-        u32,         /* argument 2 */
-        u32,         /* argument 3 */
-        u32,         /* argument 4 */
-        Sender<i32>, /* Thread ID */
+        u32,                                         /* entry point */
+        u32,                                         /* stack pointer */
+        u32,                                         /* stack length */
+        u32,                                         /* argument 1 */
+        u32,                                         /* argument 2 */
+        u32,                                         /* argument 3 */
+        u32,                                         /* argument 4 */
+        Sender<(i32, std::thread::JoinHandle<u32>)>, /* Thread ID + Result*/
     ),
-    JoinThread(u32, Sender<ResponseData>),
+    // JoinThread(u32, Sender<ResponseData>),
 }
 
 struct Worker {
     cpu: riscv_cpu::Cpu,
-    cmd: Sender<MemoryCommand>,
+    // cmd: Sender<MemoryCommand>,
     tid: i32,
     memory: Arc<Mutex<Memory>>,
 }
@@ -90,21 +93,25 @@ struct Worker {
 impl Worker {
     fn new(
         cpu: riscv_cpu::Cpu,
-        cmd: Sender<MemoryCommand>,
+        // cmd: Sender<MemoryCommand>,
         tid: i32,
         memory: Arc<Mutex<Memory>>,
     ) -> Self {
         Self {
             cpu,
-            cmd,
+            // cmd,
             tid,
             memory,
         }
     }
-    fn run(&mut self) {
+
+    fn run(&mut self) -> u32 {
         use riscv_cpu::cpu::TickResult;
         loop {
             match self.cpu.tick() {
+                // If we get a PauseEmulation result, it will have an accompanying Receiver.
+                // Block on this receiver until we get a result, then load that result into
+                // the CPU.
                 TickResult::PauseEmulation(e) => {
                     let (result, data) = e.recv().unwrap();
                     if let Some(data) = data {
@@ -120,11 +127,23 @@ impl Worker {
                     }
                 }
                 TickResult::ExitThread(val) => {
-                    self.cmd
-                        .send(MemoryCommand::ExitThread(self.tid as u32, val))
-                        .unwrap();
-                    // println!("Thread {} exited", self.tid);
-                    return;
+                    //     self.cmd
+                    //         .send(MemoryCommand::ExitThread(self.tid as u32, val))
+                    //         .unwrap();
+                    println!("Thread {} exited", self.tid);
+                    return val;
+                }
+                TickResult::JoinThread(handle) => {
+                    let result = handle.join().unwrap();
+                    self.cpu
+                        .write_register(10, SyscallResultNumber::Scalar1 as i32);
+                    self.cpu.write_register(11, result as i32);
+                    for reg in 12..18 {
+                        self.cpu.write_register(reg, 0);
+                    }
+                    // self.cmd
+                    //     .send(MemoryCommand::ExitThread(self.tid as u32, result))
+                    //     .unwrap();
                 }
                 TickResult::CpuTrap(trap) => {
                     self.memory.lock().unwrap().print_mmu();
@@ -135,10 +154,10 @@ impl Worker {
                         self.tid,
                         trap
                     );
-                    self.cmd
-                        .send(MemoryCommand::ExitThread(self.tid as u32, 1))
-                        .unwrap();
-                    return;
+                    // self.cmd
+                    //     .send(MemoryCommand::ExitThread(self.tid as u32, 1))
+                    //     .unwrap();
+                    return !0;
                 }
                 TickResult::Ok => {}
             }
@@ -146,9 +165,9 @@ impl Worker {
     }
 }
 
-struct WorkerHandle {
-    joiner: std::thread::JoinHandle<()>,
-}
+// struct WorkerHandle {
+//     // joiner: std::thread::JoinHandle<u32>,
+// }
 
 struct Memory {
     base: u32,
@@ -165,6 +184,7 @@ struct Memory {
     translation_cache: HashMap<u32, u32>,
     allocated_bytes: u32,
     reservations: HashMap<u32, u32>,
+    thread_handles: HashMap<i32, JoinHandle<u32>>,
 }
 
 impl Memory {
@@ -199,6 +219,7 @@ impl Memory {
                 translation_cache: HashMap::new(),
                 allocated_bytes: 4096,
                 reservations: HashMap::new(),
+                thread_handles: HashMap::new(),
             },
             memory_cmd_rx,
         )
@@ -603,12 +624,27 @@ impl riscv_cpu::cpu::Memory for Memory {
                 [SyscallResultNumber::Ok as i32, 0, 0, 0, 0, 0, 0, 0].into()
             }
             Syscall::JoinThread(thread_id) => {
-                // println!("JoinThread({})", thread_id);
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.memory_cmd
-                    .send(MemoryCommand::JoinThread(thread_id as _, tx))
-                    .unwrap();
-                rx.into()
+                println!("JoinThread({})", thread_id);
+                // let (tx, rx) = std::sync::mpsc::channel();
+                // self.memory_cmd
+                //     .send(MemoryCommand::JoinThread(thread_id as _, tx))
+                //     .unwrap();
+                // rx.into()
+                if let Some(val) = self.thread_handles.remove(&thread_id) {
+                    SyscallResult::JoinThread(val)
+                } else {
+                    [
+                        SyscallResultNumber::Error as i32,
+                        SyscallErrorNumber::ThreadNotAvailable as i32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
+                    .into()
+                }
             }
             Syscall::Unknown(args) => {
                 println!(
@@ -639,9 +675,9 @@ impl riscv_cpu::cpu::Memory for Memory {
 
 pub struct Machine {
     memory: Arc<Mutex<Memory>>,
-    workers: Vec<WorkerHandle>,
+    // workers: Vec<WorkerHandle>,
     satp: u32,
-    memory_cmd_sender: Sender<MemoryCommand>,
+    // memory_cmd_sender: Sender<MemoryCommand>,
     memory_cmd: Receiver<MemoryCommand>,
     thread_id_counter: AtomicI32,
 }
@@ -649,15 +685,15 @@ pub struct Machine {
 impl Machine {
     pub fn new(program: &[u8]) -> Result<Self, LoadError> {
         let (memory, memory_cmd) = Memory::new(MEMORY_BASE, 16 * 1024 * 1024);
-        let memory_cmd_sender = memory.memory_cmd.clone();
+        // let memory_cmd_sender = memory.memory_cmd.clone();
         let memory = Arc::new(Mutex::new(memory));
 
         let mut machine = Self {
             memory,
-            workers: vec![],
+            // workers: vec![],
             satp: 0,
             memory_cmd,
-            memory_cmd_sender,
+            // memory_cmd_sender,
             thread_id_counter: AtomicI32::new(1),
         };
 
@@ -820,68 +856,58 @@ impl Machine {
         // Update the stack pointer
         cpu.write_register(2, (STACK_END as i32 - 16 - param_block.len() as i32) & !0xf);
 
-        let cmd = self.memory_cmd_sender.clone();
+        // let cmd = self.memory_cmd_sender.clone();
         let memory = self.memory.clone();
-        let joiner = std::thread::spawn(move || Worker::new(cpu, cmd, 0, memory).run());
+        let joiner = std::thread::spawn(move || Worker::new(cpu, 0, memory).run());
 
-        self.workers.push(WorkerHandle { joiner });
+        // self.workers.push(WorkerHandle { joiner });
         self.satp = satp;
 
         Ok(())
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let (join_tx, rx) = std::sync::mpsc::channel();
-        let main_worker: WorkerHandle = self.workers.pop().unwrap();
-        join_tx.send(main_worker.joiner).unwrap();
-        let memory_cmd_sender = self.memory_cmd_sender.clone();
-        std::thread::spawn(move || {
-            while let Ok(msg) = rx.try_recv() {
-                if let Err(_e) = msg.join() {}
-            }
-            memory_cmd_sender.send(MemoryCommand::Exit).unwrap();
-        });
-        let mut joining_threads = HashMap::new();
-        let mut exited_threads = HashSet::new();
+        // let main_worker: WorkerHandle = self.workers.pop().unwrap();
+        // let mut joining_threads = HashMap::new();
         while let Ok(msg) = self.memory_cmd.recv() {
             match msg {
-                MemoryCommand::JoinThread(tid, sender) => {
-                    if exited_threads.contains(&tid) {
-                        sender
-                            .send((
-                                [SyscallResultNumber::Scalar1 as i32, 0, 0, 0, 0, 0, 0, 0],
-                                None,
-                            ))
-                            .unwrap();
-                    } else {
-                        joining_threads
-                            .entry(tid)
-                            .or_insert_with(Vec::new)
-                            .push(sender);
-                    }
-                }
-                MemoryCommand::ExitThread(tid, result) => {
-                    exited_threads.insert(tid);
-                    if let Some(joiners) = joining_threads.remove(&tid) {
-                        for joiner in joiners {
-                            joiner
-                                .send((
-                                    [
-                                        SyscallResultNumber::Scalar1 as i32,
-                                        result as _,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    ],
-                                    None,
-                                ))
-                                .unwrap();
-                        }
-                    }
-                }
+                // MemoryCommand::JoinThread(tid, sender) => {
+                //     if exited_threads.contains(&tid) {
+                //         sender
+                //             .send((
+                //                 [SyscallResultNumber::Scalar1 as i32, 0, 0, 0, 0, 0, 0, 0],
+                //                 None,
+                //             ))
+                //             .unwrap();
+                //     } else {
+                //         joining_threads
+                //             .entry(tid)
+                //             .or_insert_with(Vec::new)
+                //             .push(sender);
+                //     }
+                // }
+                // MemoryCommand::ExitThread(tid, result) => {
+                //     // exited_threads.insert(tid);
+                //     if let Some(joiners) = joining_threads.remove(&tid) {
+                //         for joiner in joiners {
+                //             joiner
+                //                 .send((
+                //                     [
+                //                         SyscallResultNumber::Scalar1 as i32,
+                //                         result as _,
+                //                         0,
+                //                         0,
+                //                         0,
+                //                         0,
+                //                         0,
+                //                         0,
+                //                     ],
+                //                     None,
+                //                 ))
+                //                 .unwrap();
+                //         }
+                //     }
+                // }
                 MemoryCommand::CreateThread(
                     entry_point,
                     stack_pointer,
@@ -894,7 +920,8 @@ impl Machine {
                 ) => {
                     let mut cpu = riscv_cpu::CpuBuilder::new(self.memory.clone()).build();
                     let tid = self.thread_id_counter.fetch_add(1, Ordering::SeqCst);
-                    cpu.write_csr(riscv_cpu::cpu::CSR_MHARTID_ADDRESS, tid as u32).unwrap();
+                    cpu.write_csr(riscv_cpu::cpu::CSR_MHARTID_ADDRESS, tid as u32)
+                        .unwrap();
 
                     cpu.write_csr(riscv_cpu::cpu::CSR_SATP_ADDRESS, self.satp)
                         .map_err(|_| LoadError::SatpWriteError)?;
@@ -917,18 +944,15 @@ impl Machine {
                     cpu.write_register(12, argument_3 as i32);
                     cpu.write_register(13, argument_4 as i32);
 
-                    let cmd = self.memory_cmd_sender.clone();
+                    // let cmd = self.memory_cmd_sender.clone();
                     let memory = self.memory.clone();
-                    join_tx
-                        .send(std::thread::spawn(move || {
-                            Worker::new(cpu, cmd, tid, memory).run()
-                        }))
-                        .unwrap();
-                    tx.send(tid).unwrap();
+                    let join_handle =
+                        std::thread::spawn(move || Worker::new(cpu, tid, memory).run());
+                    tx.send((tid, join_handle)).unwrap();
                 }
-                MemoryCommand::Exit => {
-                    break;
-                }
+                // MemoryCommand::Exit => {
+                //     break;
+                // }
             }
         }
         println!("Done! memory_cmd returned error");

@@ -1,4 +1,7 @@
-use std::sync::{mpsc::Receiver, Arc, Mutex};
+use std::{
+    sync::{mpsc::Receiver, Arc, Mutex},
+    thread::JoinHandle,
+};
 
 mod instructions;
 
@@ -67,6 +70,7 @@ pub enum TickResult {
     Ok,
     ExitThread(u32),
     PauseEmulation(Receiver<ResponseData>),
+    JoinThread(JoinHandle<u32>),
     CpuTrap(Trap),
 }
 
@@ -127,6 +131,7 @@ pub enum TrapType {
     SupervisorExternalInterrupt,
     MachineExternalInterrupt,
     PauseEmulation(Receiver<ResponseData>),
+    JoinThread(JoinHandle<u32>),
 }
 
 fn _get_privilege_mode_name(mode: &PrivilegeMode) -> &'static str {
@@ -184,6 +189,7 @@ fn _get_trap_type_name(trap_type: &TrapType) -> &'static str {
         TrapType::SupervisorExternalInterrupt => "SupervisorExternalInterrupt",
         TrapType::MachineExternalInterrupt => "MachineExternalInterrupt",
         TrapType::PauseEmulation(_) => "PauseEmulation",
+        TrapType::JoinThread(_) => "JoinThread",
     }
 }
 
@@ -205,6 +211,7 @@ fn get_trap_cause(trap: &Trap) -> u32 {
         TrapType::LoadPageFault => 13,
         TrapType::StorePageFault => 15,
         TrapType::PauseEmulation(_) => 16,
+        TrapType::JoinThread(_) => 17,
         TrapType::UserSoftwareInterrupt => interrupt_bit,
         TrapType::SupervisorSoftwareInterrupt => interrupt_bit + 1,
         TrapType::MachineSoftwareInterrupt => interrupt_bit + 3,
@@ -317,6 +324,12 @@ impl Cpu {
                 ..
             }) => {
                 return TickResult::PauseEmulation(rx);
+            }
+            Err(Trap {
+                trap_type: TrapType::JoinThread(handle),
+                ..
+            }) => {
+                return TickResult::JoinThread(handle);
             }
             Err(Trap {
                 trap_type: TrapType::InstructionPageFault,

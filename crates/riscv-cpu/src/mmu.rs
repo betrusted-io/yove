@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     sync::mpsc::Receiver,
     sync::{Arc, Mutex},
+    thread::JoinHandle,
 };
 
 use crate::cpu::{decode_privilege_mode, PrivilegeMode, ResponseData, Trap, TrapType};
@@ -10,6 +11,7 @@ pub enum SyscallResult {
     Ok([i32; 8]),
     Defer(Receiver<ResponseData>),
     Terminate(usize /* Result */),
+    JoinThread(JoinHandle<u32>),
 
     /// Pass the exception to the CPU
     Continue,

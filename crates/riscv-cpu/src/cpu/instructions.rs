@@ -618,6 +618,10 @@ pub const fn get_instructions() -> [Instruction; INSTRUCTION_NUM] {
                         trap_type: TrapType::PauseEmulation(receiver),
                         value: address,
                     }),
+                    SyscallResult::JoinThread(handle) => Err(Trap {
+                        trap_type: TrapType::JoinThread(handle),
+                        value: address,
+                    }),
                     SyscallResult::Terminate(_) => panic!("Unhandled termination"),
                     SyscallResult::Continue => {
                         println!("Got \"ECALL\" from address {:08x} -- issuing trap", address);

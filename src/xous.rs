@@ -130,7 +130,7 @@ impl Worker {
                     //     self.cmd
                     //         .send(MemoryCommand::ExitThread(self.tid as u32, val))
                     //         .unwrap();
-                    println!("Thread {} exited", self.tid);
+                    // println!("Thread {} exited", self.tid);
                     return val;
                 }
                 TickResult::JoinThread(handle) => {
@@ -624,7 +624,7 @@ impl riscv_cpu::cpu::Memory for Memory {
                 [SyscallResultNumber::Ok as i32, 0, 0, 0, 0, 0, 0, 0].into()
             }
             Syscall::JoinThread(thread_id) => {
-                println!("JoinThread({})", thread_id);
+                // println!("JoinThread({})", thread_id);
                 // let (tx, rx) = std::sync::mpsc::channel();
                 // self.memory_cmd
                 //     .send(MemoryCommand::JoinThread(thread_id as _, tx))
@@ -856,58 +856,19 @@ impl Machine {
         // Update the stack pointer
         cpu.write_register(2, (STACK_END as i32 - 16 - param_block.len() as i32) & !0xf);
 
-        // let cmd = self.memory_cmd_sender.clone();
         let memory = self.memory.clone();
-        let joiner = std::thread::spawn(move || Worker::new(cpu, 0, memory).run());
+        std::thread::spawn(move || {
+            std::process::exit(Worker::new(cpu, 0, memory).run() as i32);
+        });
 
-        // self.workers.push(WorkerHandle { joiner });
         self.satp = satp;
 
         Ok(())
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // let main_worker: WorkerHandle = self.workers.pop().unwrap();
-        // let mut joining_threads = HashMap::new();
         while let Ok(msg) = self.memory_cmd.recv() {
             match msg {
-                // MemoryCommand::JoinThread(tid, sender) => {
-                //     if exited_threads.contains(&tid) {
-                //         sender
-                //             .send((
-                //                 [SyscallResultNumber::Scalar1 as i32, 0, 0, 0, 0, 0, 0, 0],
-                //                 None,
-                //             ))
-                //             .unwrap();
-                //     } else {
-                //         joining_threads
-                //             .entry(tid)
-                //             .or_insert_with(Vec::new)
-                //             .push(sender);
-                //     }
-                // }
-                // MemoryCommand::ExitThread(tid, result) => {
-                //     // exited_threads.insert(tid);
-                //     if let Some(joiners) = joining_threads.remove(&tid) {
-                //         for joiner in joiners {
-                //             joiner
-                //                 .send((
-                //                     [
-                //                         SyscallResultNumber::Scalar1 as i32,
-                //                         result as _,
-                //                         0,
-                //                         0,
-                //                         0,
-                //                         0,
-                //                         0,
-                //                         0,
-                //                     ],
-                //                     None,
-                //                 ))
-                //                 .unwrap();
-                //         }
-                //     }
-                // }
                 MemoryCommand::CreateThread(
                     entry_point,
                     stack_pointer,
@@ -950,9 +911,6 @@ impl Machine {
                         std::thread::spawn(move || Worker::new(cpu, tid, memory).run());
                     tx.send((tid, join_handle)).unwrap();
                 }
-                // MemoryCommand::Exit => {
-                //     break;
-                // }
             }
         }
         println!("Done! memory_cmd returned error");

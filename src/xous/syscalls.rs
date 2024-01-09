@@ -324,7 +324,6 @@ pub fn create_thread(
         .unwrap();
     let (thread_id, join_handle) = rx.recv().unwrap();
     memory.thread_handles.insert(thread_id, join_handle);
-    println!("Created thread {}", thread_id);
     [
         SyscallResultNumber::ThreadId as i32,
         thread_id,

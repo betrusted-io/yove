@@ -33,7 +33,7 @@ enum ScalarOpcode {
 
 impl Ticktimer {
     pub fn new() -> Self {
-        eprintln!("Created new Ticktimer");
+        // eprintln!("Created new Ticktimer");
         Ticktimer {
             start: std::time::SystemTime::now(),
             condvars: Arc::new(Mutex::new(HashMap::new())),
@@ -43,7 +43,7 @@ impl Ticktimer {
     }
 
     fn lock_mutex(&self, mutex_index: u32) -> ScalarResult {
-        eprintln!("Locking mutex {:08x}", mutex_index);
+        // eprintln!("Locking mutex {:08x}", mutex_index);
         let mut mutexes = self.mutexes.lock().unwrap();
         let mutex_locked = mutexes.entry(mutex_index).or_default();
         if *mutex_locked {
@@ -71,7 +71,7 @@ impl Ticktimer {
     }
 
     fn unlock_mutex(&self, mutex_index: u32) -> ScalarResult {
-        eprintln!("Unlocking mutex {:08x}", mutex_index);
+        // eprintln!("Unlocking mutex {:08x}", mutex_index);
         let mut mutexes = self.mutexes.lock().unwrap();
         let mutex_locked = mutexes.get_mut(&mutex_index).expect("mutex didn't exist");
         assert!(*mutex_locked);
@@ -91,7 +91,7 @@ impl Ticktimer {
     }
 
     fn free_mutex(&self, mutex_index: u32) -> ScalarResult {
-        eprintln!("Freeing mutex {:08x}", mutex_index);
+        // eprintln!("Freeing mutex {:08x}", mutex_index);
         self.mutexes
             .lock()
             .unwrap()

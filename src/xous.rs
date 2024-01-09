@@ -705,9 +705,13 @@ impl riscv_cpu::cpu::Memory for Memory {
                 // println!("TerminateProcess({})", result);
                 syscalls::terminate_process(self, exit_code)
             }
+            Syscall::GetProcessId => {
+                [SyscallResultNumber::ProcessId as i32, 2, 0, 0, 0, 0, 0, 0].into()
+            }
             Syscall::Unknown(args) => {
-                println!(
-                    "Unhandled {:?}: {:?}",
+                eprintln!(
+                    "Unhandled syscall #{} {:?}: {:?}",
+                    args[0],
                     SyscallNumber::from(args[0]),
                     &args[1..]
                 );

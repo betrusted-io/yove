@@ -7,6 +7,7 @@ use definitions::{Syscall, SyscallNumber, SyscallResultNumber};
 pub use riscv_cpu::mmu::SyscallResult;
 use std::{
     collections::{BTreeSet, HashMap},
+    num::NonZeroU32,
     sync::{
         atomic::{AtomicI32, Ordering},
         mpsc::{Receiver, Sender},
@@ -171,7 +172,7 @@ impl Worker {
 
 struct Memory {
     base: u32,
-    data: HashMap<usize, [u8; 4096]>,
+    data: Vec<Vec<u8>>, //HashMap<usize, [u8; 4096]>,
     allocated_pages: BTreeSet<usize>,
     free_pages: BTreeSet<usize>,
     heap_start: u32,
@@ -181,7 +182,7 @@ struct Memory {
     satp: u32,
     connections: HashMap<u32, Box<dyn services::Service + Send + Sync>>,
     memory_cmd: Sender<MemoryCommand>,
-    translation_cache: HashMap<u32, u32>,
+    translation_cache: Vec<Option<NonZeroU32>>,
     allocated_bytes: u32,
     reservations: HashMap<u32, u32>,
     thread_handles: HashMap<i32, JoinHandle<u32>>,
@@ -189,14 +190,14 @@ struct Memory {
 
 impl Memory {
     pub fn new(base: u32, size: usize) -> (Self, Receiver<MemoryCommand>) {
-        let mut backing = HashMap::new();
+        let mut backing = vec![];
         let mut free_pages = BTreeSet::new();
         let mut allocated_pages = BTreeSet::new();
 
         // Populate the backing table as well as the list of free pages
-        for phys in (base..(base + size as u32)).step_by(4096) {
-            backing.insert(phys as usize, [0; 4096]);
-            free_pages.insert(phys as usize);
+        for phys in (0..(size as u32)).step_by(4096) {
+            backing.push(vec![0; 4096]);
+            free_pages.insert((phys + base) as usize);
         }
         // Allocate the l0 page table
         assert!(free_pages.remove(&(MEMORY_BASE as usize + 4096)));
@@ -216,7 +217,8 @@ impl Memory {
                 allocation_previous: ALLOCATION_START,
                 connections: HashMap::new(),
                 memory_cmd,
-                translation_cache: HashMap::new(),
+                // translation_cache: HashMap::new(),
+                translation_cache: vec![None; 0x000f_ffff],
                 allocated_bytes: 4096,
                 reservations: HashMap::new(),
                 thread_handles: HashMap::new(),
@@ -299,7 +301,7 @@ impl Memory {
 
         assert!(self.allocated_pages.remove(&(phys as usize)));
         assert!(self.free_pages.insert(phys as usize));
-        assert!(self.translation_cache.remove(&virt).is_some());
+        self.translation_cache[phys as usize >> 12] = None;
 
         let l0_pt_phys = ((l1_pt_entry >> 10) << 12) + vpn0 as u32;
         assert!(self.read_u32(l0_pt_phys) & MMUFLAG_VALID != 0);
@@ -386,7 +388,8 @@ impl Memory {
                 | MMUFLAG_ACCESSED;
             // Map the level 0 pagetable into the level 1 pagetable
             self.write_u32(l0_pt_phys, l0_pt_entry);
-            assert!(self.translation_cache.insert(virt, phys).is_none());
+            self.translation_cache[(virt >> 12) as usize] = NonZeroU32::new(phys);
+
             allocated = true;
         }
         assert!(self
@@ -508,25 +511,31 @@ impl Memory {
 
 impl riscv_cpu::cpu::Memory for Memory {
     fn read_u8(&self, address: u32) -> u8 {
-        let page = address as usize & !0xfff;
-        let offset = address as usize & 0xfff;
-        self.data.get(&page).map(|page| page[offset]).unwrap_or(0)
-    }
-
-    fn read_u16(&self, address: u32) -> u16 {
+        let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data
-            .get(&page)
+            .get(page >> 12)
+            .map(|page| page[offset])
+            .unwrap_or(0)
+    }
+
+    fn read_u16(&self, address: u32) -> u16 {
+        let address = address - self.base;
+        let page = address as usize & !0xfff;
+        let offset = address as usize & 0xfff;
+        self.data
+            .get(page >> 12)
             .map(|page| u16::from_le_bytes([page[offset], page[offset + 1]]))
             .unwrap_or(0)
     }
 
     fn read_u32(&self, address: u32) -> u32 {
+        let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
         self.data
-            .get(&page)
+            .get(page >> 12)
             .map(|page| {
                 u32::from_le_bytes([
                     page[offset],
@@ -539,17 +548,19 @@ impl riscv_cpu::cpu::Memory for Memory {
     }
 
     fn write_u8(&mut self, address: u32, value: u8) {
+        let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.get_mut(&page) {
+        if let Some(page) = self.data.get_mut(page >> 12) {
             page[offset] = value;
         }
     }
 
     fn write_u16(&mut self, address: u32, value: u16) {
+        let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.get_mut(&page) {
+        if let Some(page) = self.data.get_mut(page >> 12) {
             let bytes = value.to_le_bytes();
             page[offset] = bytes[0];
             page[offset + 1] = bytes[1];
@@ -557,9 +568,10 @@ impl riscv_cpu::cpu::Memory for Memory {
     }
 
     fn write_u32(&mut self, address: u32, value: u32) {
+        let address = address - self.base;
         let page = address as usize & !0xfff;
         let offset = address as usize & 0xfff;
-        if let Some(page) = self.data.get_mut(&page) {
+        if let Some(page) = self.data.get_mut(page >> 12) {
             let bytes = value.to_le_bytes();
             page[offset] = bytes[0];
             page[offset + 1] = bytes[1];
@@ -659,9 +671,7 @@ impl riscv_cpu::cpu::Memory for Memory {
     }
 
     fn translate(&self, v_address: u32) -> Option<u32> {
-        let ppn = v_address & !0xfff;
-        let offset = v_address & 0xfff;
-        self.translation_cache.get(&ppn).map(|x| (*x + offset))
+        self.translation_cache[v_address as usize >> 12].map(|x| x.get() | v_address & 0xfff)
     }
 
     fn reserve(&mut self, core: u32, p_address: u32) {

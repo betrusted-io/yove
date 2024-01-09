@@ -339,7 +339,7 @@ impl Cpu {
             }
             Err(e) => return TickResult::CpuTrap(e),
         }
-        self.mmu.tick(&mut self.csr[CSR_MIP_ADDRESS as usize]);
+        // self.mmu.tick(&mut self.csr[CSR_MIP_ADDRESS as usize]);
         self.handle_interrupt(self.pc);
         self.clock = self.clock.wrapping_add(1);
 

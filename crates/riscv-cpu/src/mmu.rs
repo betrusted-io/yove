@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::mpsc::Receiver,
     sync::{Arc, Mutex},
     thread::JoinHandle,
@@ -60,17 +59,12 @@ pub struct Mmu {
     /// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
     /// then `Mmu` has copy of it.
     mstatus: u32,
-
-    /// A cache of instructions. We assume that instruction memory does not change.
-    instruction_cache: Arc<Mutex<HashMap<u32, u32>>>,
 }
 
 #[derive(Debug)]
 pub enum AddressingMode {
     None,
     SV32,
-    // SV39,
-    // SV48, // @TODO: Implement
 }
 
 enum MemoryAccessType {
@@ -102,7 +96,6 @@ impl Mmu {
             privilege_mode: PrivilegeMode::Machine,
             memory,
             mstatus: 0,
-            instruction_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -162,9 +155,6 @@ impl Mmu {
     /// # Arguments
     /// * `v_address` Virtual address
     pub fn fetch_word(&self, v_address: u32) -> Result<u32, Trap> {
-        // if let Some(data) = self.instruction_cache.lock().unwrap().get(&v_address) {
-        //     return Ok(*data);
-        // }
         let width = 4;
         if (v_address & 0xfff) <= (0x1000 - width) {
             // Fast path. All bytes fetched are in the same page so
@@ -173,10 +163,10 @@ impl Mmu {
             self.translate_address(effective_address, &MemoryAccessType::Execute)
                 .map(|p_address| {
                     let data = self.load_word_raw(p_address);
-                    self.instruction_cache
-                        .lock()
-                        .unwrap()
-                        .insert(v_address, data);
+                    // self.instruction_cache
+                    //     .lock()
+                    //     .unwrap()
+                    //     .insert(v_address, data);
                     data
                 })
                 .map_err(|()| Trap {
@@ -191,10 +181,10 @@ impl Mmu {
                     Err(e) => return Err(e),
                 };
             }
-            self.instruction_cache
-                .lock()
-                .unwrap()
-                .insert(v_address, data);
+            // self.instruction_cache
+            //     .lock()
+            //     .unwrap()
+            //     .insert(v_address, data);
             Ok(data)
         }
     }
@@ -472,10 +462,12 @@ impl Mmu {
     }
 
     fn translate_address(&self, v_address: u32, access_type: &MemoryAccessType) -> Result<u32, ()> {
+        if let Some(address) = self.memory.lock().unwrap().translate(v_address) {
+            return Ok(address);
+        }
         if let AddressingMode::None = self.addressing_mode {
             Ok(v_address)
         } else {
-            // self.memory.lock() // .read().unwrap().translate(v_address).ok_or(())
             let phys = self.translate_address_with_privilege_mode(
                 v_address,
                 access_type,

@@ -63,7 +63,7 @@ pub const MIP_SEIP: u32 = 0x200;
 const MIP_STIP: u32 = 0x020;
 const MIP_SSIP: u32 = 0x002;
 
-pub type ResponseData = ([i32; 8], Option<(Vec<u8>, u32)>);
+pub type ResponseData = ([i32; 8], Option<Vec<u8>>);
 
 pub enum TickResult {
     Ok,

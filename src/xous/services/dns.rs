@@ -81,7 +81,7 @@ impl Default for DnsResolver {
 
 impl Service for DnsResolver {
     fn lend_mut(
-        &mut self,
+        &self,
         _memory: &Memory,
         _sender: u32,
         opcode: u32,

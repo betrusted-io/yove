@@ -116,11 +116,16 @@ impl Worker {
                 TickResult::PauseEmulation(e) => {
                     let (result, data) = e.recv().unwrap();
                     if let Some(data) = data {
-                        let start = data.1;
-                        let data = data.0;
+                        let syscall_type = self.cpu.read_register(10);
+                        let message_kind = self.cpu.read_register(12);
+                        let memory_offset = self.cpu.read_register(14) as u32;
+                        // let memory_size = self.cpu.read_register(15);
+
+                        assert!(syscall_type == SyscallNumber::SendMessage as i32);
+                        assert!(message_kind == 1 || message_kind == 2);
                         let mmu = self.cpu.get_mut_mmu();
                         for (offset, byte) in data.into_iter().enumerate() {
-                            mmu.store(offset as u32 + start, byte).unwrap();
+                            mmu.store(offset as u32 + memory_offset, byte).unwrap();
                         }
                     }
                     for (index, value) in result.iter().enumerate() {
@@ -131,7 +136,7 @@ impl Worker {
                     //     self.cmd
                     //         .send(MemoryCommand::ExitThread(self.tid as u32, val))
                     //         .unwrap();
-                    // println!("Thread {} exited", self.tid);
+                    // eprintln!("Thread {} exited", self.tid);
                     return val;
                 }
                 TickResult::JoinThread(handle) => {
@@ -179,6 +184,7 @@ struct Memory {
     satp: u32,
     connections: Arc<Mutex<HashMap<u32, Box<dyn services::Service + Send + Sync>>>>,
     connection_index: Arc<AtomicU32>,
+    named_connections_index: Arc<Mutex<HashMap<[u32; 4], u32>>>,
     memory_cmd: Sender<MemoryCommand>,
     translation_cache: Arc<RwLock<Vec<Option<NonZeroU32>>>>,
     allocated_bytes: Arc<AtomicU32>,
@@ -220,6 +226,7 @@ impl Memory {
                 allocated_bytes: Arc::new(AtomicU32::new(4096)),
                 reservations: Arc::new(Mutex::new(HashMap::new())),
                 thread_handles: Arc::new(Mutex::new(HashMap::new())),
+                named_connections_index: Arc::new(Mutex::new(HashMap::new())),
             },
             memory_cmd_rx,
         )

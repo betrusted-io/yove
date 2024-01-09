@@ -56,10 +56,35 @@ pub fn connect(memory: &Memory, id: [u32; 4]) -> SyscallResult {
     //     "Connect([0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}])",
     //     id[0], id[1], id[2], id[3]
     // );
-    if let Some(service) = get_service(&id) {
+
+    // If a connection already exists, use that.
+    let existing_connection = memory
+        .named_connections_index
+        .lock()
+        .unwrap()
+        .get(&id)
+        .copied();
+    if let Some(connection_id) = existing_connection {
+        [
+            SyscallResultNumber::ConnectionId as i32,
+            connection_id as i32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+        .into()
+    } else if let Some(service) = get_service(&id) {
         let connection_id = memory.connection_index.fetch_add(1, Ordering::Relaxed);
         let mut connections = memory.connections.lock().unwrap();
         connections.insert(connection_id, service);
+        memory
+            .named_connections_index
+            .lock()
+            .unwrap()
+            .insert(id, connection_id);
         [
             SyscallResultNumber::ConnectionId as i32,
             connection_id as i32,
@@ -116,7 +141,8 @@ pub fn send_message(
     };
     // Pull the service out of the connections table so that we can send
     // a mutable copy of the memory object to the service.
-    let Some(mut service) = memory.connections.lock().unwrap().remove(&connection_id) else {
+    let connections = memory.connections.lock().unwrap();
+    let Some(service) = connections.get(&connection_id) else {
         println!("Unhandled connection ID {}", connection_id);
         return [
             SyscallResultNumber::Error as i32,
@@ -130,7 +156,8 @@ pub fn send_message(
         ]
         .into();
     };
-    let response = match kind {
+
+    match kind {
         1..=3 => {
             let mut memory_region = memory_region.unwrap();
             let extra = [args[2], args[3]];
@@ -232,13 +259,7 @@ pub fn send_message(
             // ]
             // .into()
         }
-    };
-    memory
-        .connections
-        .lock()
-        .unwrap()
-        .insert(connection_id, service);
-    response
+    }
 }
 
 pub fn try_send_message(

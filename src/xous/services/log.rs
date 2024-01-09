@@ -1,4 +1,4 @@
-use super::{LendResult, ScalarResult, Service};
+use super::{LendResult, Service};
 use crate::xous::Memory;
 use std::io::Write;
 
@@ -69,7 +69,7 @@ impl Default for Log {
 }
 
 impl Service for Log {
-    fn scalar(&mut self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
+    fn scalar(&self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
         let message_bytes = if opcode >= LogSendOpcode::PanicMessage0 as u32
             && opcode <= LogSendOpcode::PanicMessage32 as u32
         {
@@ -105,22 +105,8 @@ impl Service for Log {
         }
     }
 
-    fn blocking_scalar(
-        &mut self,
-        _memory: &Memory,
-        sender: u32,
-        opcode: u32,
-        args: [u32; 4],
-    ) -> ScalarResult {
-        println!(
-            "Unhandled log blocking_scalar {}: {} {:x?}",
-            sender, opcode, args
-        );
-        ScalarResult::Scalar1(0)
-    }
-
     fn lend(
-        &mut self,
+        &self,
         _memory: &Memory,
         sender: u32,
         opcode: u32,
@@ -141,28 +127,5 @@ impl Service for Log {
             panic!("Unhandled log lend {}: {} {:x?}", sender, opcode, buf);
         }
         LendResult::MemoryReturned([0, 0])
-    }
-
-    fn lend_mut(
-        &mut self,
-        _memory: &Memory,
-        sender: u32,
-        opcode: u32,
-        _buf: &mut [u8],
-        extra: [u32; 2],
-    ) -> LendResult {
-        println!("Unhandled log lend_mut {}: {} {:x?}", sender, opcode, extra);
-        LendResult::MemoryReturned([0, 0])
-    }
-
-    fn send(
-        &mut self,
-        _memory: &Memory,
-        sender: u32,
-        opcode: u32,
-        _buf: &[u8],
-        extra: [u32; 2],
-    ) {
-        println!("Unhandled log send {}: {} {:x?}", sender, opcode, extra);
     }
 }

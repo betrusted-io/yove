@@ -6,7 +6,7 @@ pub mod panic_to_screen;
 pub mod ticktimer;
 use super::Memory;
 
-pub type ResponseData = ([i32; 8], Option<(Vec<u8>, u32)>);
+pub type ResponseData = ([i32; 8], Option<Vec<u8>>);
 
 #[allow(dead_code)]
 pub enum ScalarResult {
@@ -23,7 +23,7 @@ pub enum LendResult {
 }
 
 pub trait Service {
-    fn scalar(&mut self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
+    fn scalar(&self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
         panic!(
             "Unknown scalar to service {}: {} ({:?})",
             sender, opcode, args
@@ -31,7 +31,7 @@ pub trait Service {
     }
 
     fn blocking_scalar(
-        &mut self,
+        &self,
         _memory: &Memory,
         sender: u32,
         opcode: u32,
@@ -44,7 +44,7 @@ pub trait Service {
     }
 
     fn lend(
-        &mut self,
+        &self,
         _memory: &Memory,
         sender: u32,
         opcode: u32,
@@ -61,7 +61,7 @@ pub trait Service {
     }
 
     fn lend_mut(
-        &mut self,
+        &self,
         _memory: &Memory,
         sender: u32,
         opcode: u32,
@@ -77,7 +77,7 @@ pub trait Service {
         );
     }
 
-    fn send(&mut self, _memory: &Memory, sender: u32, opcode: u32, buf: &[u8], extra: [u32; 2]) {
+    fn send(&self, _memory: &Memory, sender: u32, opcode: u32, buf: &[u8], extra: [u32; 2]) {
         panic!(
             "Unknown send {} bytes to service {}: {} ({:?})",
             buf.len(),

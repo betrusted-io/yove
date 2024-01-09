@@ -1,8 +1,12 @@
-use std::{collections::HashMap, sync::atomic::Ordering};
+use std::{
+    collections::HashMap,
+    sync::{atomic::Ordering, mpsc::channel, Arc, Mutex},
+    thread,
+};
 
-use crate::xous::Memory;
+use crate::xous::{definitions::SyscallResultNumber, Memory};
 
-use super::{LendResult, ScalarResult, Service};
+use super::{LendResult, Service};
 
 #[allow(dead_code)]
 enum NameLendOpcode {
@@ -82,20 +86,14 @@ enum NameLendOpcode {
 }
 
 pub struct Name {
-    connection_index: HashMap<String, u32>,
+    connection_index: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl Name {
     pub fn new() -> Self {
         Name {
-            connection_index: HashMap::default(),
+            connection_index: Arc::new(Mutex::new(HashMap::default())),
         }
-    }
-
-    fn return_connection(&self, buf: &mut [u8], connection_id: u32) -> LendResult {
-        buf[0..4].copy_from_slice(&0u32.to_le_bytes());
-        buf[4..8].copy_from_slice(&connection_id.to_le_bytes());
-        LendResult::MemoryReturned([0, 0])
     }
 }
 
@@ -106,39 +104,8 @@ impl Default for Name {
 }
 
 impl Service for Name {
-    fn scalar(&mut self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
-        panic!("Unhandled name scalar {}: {} {:x?}", sender, opcode, args);
-    }
-
-    fn blocking_scalar(
-        &mut self,
-        _memory: &Memory,
-        sender: u32,
-        opcode: u32,
-        args: [u32; 4],
-    ) -> ScalarResult {
-        panic!(
-            "Unhandled name blocking_scalar {}: {} {:x?}",
-            sender, opcode, args
-        );
-    }
-
-    fn lend(
-        &mut self,
-        _memory: &Memory,
-        sender: u32,
-        opcode: u32,
-        buf: &[u8],
-        extra: [u32; 2],
-    ) -> LendResult {
-        panic!(
-            "Unhandled name lend {}: {} {:x?} {:x?}",
-            sender, opcode, buf, extra
-        );
-    }
-
     fn lend_mut(
-        &mut self,
+        &self,
         memory: &Memory,
         sender: u32,
         opcode: u32,
@@ -152,13 +119,16 @@ impl Service for Name {
         {
             let buf_len = buf.len().min(extra[1] as usize);
             let name = std::str::from_utf8(&buf[0..buf_len]).unwrap_or("<invalid>");
+            // println!("Connecting to {}", name);
 
-            if let Some(connection_id) = self.connection_index.get(name) {
+            if let Some(connection_id) = self.connection_index.lock().unwrap().get(name) {
                 println!(
                     "Existing server found at connection index {}",
                     connection_id
                 );
-                return self.return_connection(buf, *connection_id);
+                buf[0..4].copy_from_slice(&0u32.to_le_bytes());
+                buf[4..8].copy_from_slice(&connection_id.to_le_bytes());
+                return LendResult::MemoryReturned([0, 0]);
             }
 
             let service: Box<dyn Service + Send + Sync> = if name == "panic-to-screen!" {
@@ -171,14 +141,44 @@ impl Service for Name {
             };
 
             // Insert the connection into the system bus' connection table
+            let (tx, rx) = channel();
             let connection_id = memory.connection_index.fetch_add(1, Ordering::Relaxed);
-            let mut connections = memory.connections.lock().unwrap();
-            connections.insert(connection_id, service);
+            let connections: Arc<Mutex<HashMap<u32, Box<dyn Service + Send + Sync>>>> =
+                memory.connections.clone();
+            let name_connection_mapping = self.connection_index.clone();
+            let buffer_length = buf.len();
+            let name = name.to_owned();
+            thread::spawn(move || {
+                let mut connections = connections.lock().unwrap();
+                connections.insert(connection_id, service);
 
-            // Insert it into the connection map so subsequent lookups get the same service
-            self.connection_index.insert(name.to_owned(), connection_id);
+                // Insert it into the connection map so subsequent lookups get the same service
+                name_connection_mapping
+                    .lock()
+                    .unwrap()
+                    .insert(name, connection_id);
 
-            self.return_connection(buf, connection_id)
+                // println!("Inserted new connection {}", connection_id);
+
+                let mut buf = vec![0u8; buffer_length];
+                buf[0..4].copy_from_slice(&0u32.to_le_bytes());
+                buf[4..8].copy_from_slice(&connection_id.to_le_bytes());
+                tx.send((
+                    [
+                        SyscallResultNumber::MemoryReturned as i32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    Some(buf),
+                ))
+                .unwrap();
+            });
+            LendResult::WaitForResponse(rx)
         } else {
             panic!(
                 "Unhandled name lend_mut {}: {} {:x?}",
@@ -186,9 +186,5 @@ impl Service for Name {
             );
         }
         //
-    }
-
-    fn send(&mut self, _memory: &Memory, sender: u32, opcode: u32, _buf: &[u8], extra: [u32; 2]) {
-        panic!("Unhandled name send {}: {} {:x?}", sender, opcode, extra);
     }
 }

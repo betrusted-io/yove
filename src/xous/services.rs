@@ -1,4 +1,5 @@
 use std::sync::mpsc::Receiver;
+pub mod dns;
 pub mod log;
 pub mod name;
 pub mod panic_to_screen;
@@ -76,14 +77,7 @@ pub trait Service {
         );
     }
 
-    fn send(
-        &mut self,
-        _memory: &Memory,
-        sender: u32,
-        opcode: u32,
-        buf: &[u8],
-        extra: [u32; 2],
-    ) {
+    fn send(&mut self, _memory: &Memory, sender: u32, opcode: u32, buf: &[u8], extra: [u32; 2]) {
         panic!(
             "Unknown send {} bytes to service {}: {} ({:?})",
             buf.len(),
@@ -102,10 +96,10 @@ pub fn get_service(name: &[u32; 4]) -> Option<Box<dyn Service + Sync + Send>> {
     for (src, dest) in name.iter().zip(output_bfr.chunks_mut(4)) {
         dest.copy_from_slice(src.to_le_bytes().as_ref());
     }
-    println!(
-        "Connecting to service: {}",
-        std::str::from_utf8(&output_bfr).unwrap_or("<invalid name>")
-    );
+    // println!(
+    //     "Connecting to service: {}",
+    //     std::str::from_utf8(&output_bfr).unwrap_or("<invalid name>")
+    // );
 
     match name {
         [0x6b636974, 0x656d6974, 0x65732d72, 0x72657672] => {

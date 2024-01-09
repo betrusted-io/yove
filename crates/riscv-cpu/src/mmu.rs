@@ -198,33 +198,31 @@ impl Mmu {
             "Width must be 1, 2, or 4. {:X}",
             width
         );
-        match (v_address & 0xfff) <= (0x1000 - width) {
-            true => match self.translate_address(v_address, &MemoryAccessType::Read) {
-                Ok(p_address) => {
-                    // Fast path. All bytes fetched are in the same page so
-                    // translating an address only once.
-                    match width {
-                        1 => Ok(self.load_raw(p_address) as u32),
-                        2 => Ok(self.load_halfword_raw(p_address) as u32),
-                        4 => Ok(self.load_word_raw(p_address)),
-                        _ => panic!("Width must be 1, 2, or 4. {:X}", width),
-                    }
-                }
-                Err(()) => Err(Trap {
+        if (v_address & 0xfff) <= (0x1000 - width) {
+            let p_address = self
+                .translate_address(v_address, &MemoryAccessType::Read)
+                .map_err(|()| Trap {
                     trap_type: TrapType::LoadPageFault,
                     value: v_address,
-                }),
-            },
-            false => {
-                let mut data = 0;
-                for i in 0..width {
-                    match self.load(v_address.wrapping_add(i)) {
-                        Ok(byte) => data |= (byte as u32) << (i * 8),
-                        Err(e) => return Err(e),
-                    };
-                }
-                Ok(data)
+                })?;
+
+            // Fast path. All bytes fetched are in the same page so
+            // translating an address only once.
+            match width {
+                1 => Ok(self.load_raw(p_address) as u32),
+                2 => Ok(self.load_halfword_raw(p_address) as u32),
+                4 => Ok(self.load_word_raw(p_address)),
+                _ => panic!("Width must be 1, 2, or 4. {:X}", width),
             }
+        } else {
+            let mut data = 0;
+            for i in 0..width {
+                match self.load(v_address.wrapping_add(i)) {
+                    Ok(byte) => data |= (byte as u32) << (i * 8),
+                    Err(e) => return Err(e),
+                };
+            }
+            Ok(data)
         }
     }
 

@@ -178,8 +178,9 @@ struct Memory {
     l1_pt: u32,
     satp: u32,
     connections: Arc<Mutex<HashMap<u32, Box<dyn services::Service + Send + Sync>>>>,
+    connection_index: Arc<AtomicU32>,
     memory_cmd: Sender<MemoryCommand>,
-    translation_cache: Arc<Mutex<Vec<Option<NonZeroU32>>>>,
+    translation_cache: Arc<RwLock<Vec<Option<NonZeroU32>>>>,
     allocated_bytes: Arc<AtomicU32>,
     reservations: Arc<Mutex<HashMap<u32, u32>>>,
     thread_handles: Arc<Mutex<HashMap<i32, JoinHandle<u32>>>>,
@@ -213,8 +214,9 @@ impl Memory {
                 heap_size: Arc::new(AtomicU32::new(0)),
                 allocation_previous: Arc::new(AtomicU32::new(ALLOCATION_START)),
                 connections: Arc::new(Mutex::new(HashMap::new())),
+                connection_index: Arc::new(AtomicU32::new(1)),
                 memory_cmd,
-                translation_cache: Arc::new(Mutex::new(vec![None; 0x000f_ffff])),
+                translation_cache: Arc::new(RwLock::new(vec![None; 0x000f_ffff])),
                 allocated_bytes: Arc::new(AtomicU32::new(4096)),
                 reservations: Arc::new(Mutex::new(HashMap::new())),
                 thread_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -301,7 +303,7 @@ impl Memory {
             .unwrap()
             .remove(&(phys as usize)));
         assert!(self.free_pages.lock().unwrap().insert(phys as usize));
-        self.translation_cache.lock().unwrap()[phys as usize >> 12] = None;
+        self.translation_cache.write().unwrap()[phys as usize >> 12] = None;
 
         let l0_pt_phys = ((l1_pt_entry >> 10) << 12) + vpn0 as u32;
         assert!(self.read_u32(l0_pt_phys) & MMUFLAG_VALID != 0);
@@ -390,7 +392,7 @@ impl Memory {
                 | MMUFLAG_ACCESSED;
             // Map the level 0 pagetable into the level 1 pagetable
             self.write_u32(l0_pt_phys, l0_pt_entry);
-            self.translation_cache.lock().unwrap()[(virt >> 12) as usize] = NonZeroU32::new(phys);
+            self.translation_cache.write().unwrap()[(virt >> 12) as usize] = NonZeroU32::new(phys);
 
             allocated = true;
         }
@@ -709,7 +711,7 @@ impl riscv_cpu::cpu::Memory for Memory {
     }
 
     fn translate(&self, v_address: u32) -> Option<u32> {
-        self.translation_cache.lock().unwrap()[v_address as usize >> 12]
+        self.translation_cache.read().unwrap()[v_address as usize >> 12]
             .map(|x| x.get() | v_address & 0xfff)
     }
 

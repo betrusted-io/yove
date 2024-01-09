@@ -7,7 +7,7 @@ mod tests;
 
 use crate::mmu::SystemBus;
 
-use self::instructions::Instruction;
+use self::instructions::{Instruction, InstructionOperation};
 
 pub use super::mmu::Memory;
 use super::mmu::{AddressingMode, Mmu};
@@ -87,7 +87,13 @@ pub struct Cpu {
     memory: Box<dyn SystemBus>,
     _dump_flag: bool,
     unsigned_data_mask: u32,
+
+    /// An array of known instructions. Consulting this requires a full search.
     instructions: [instructions::Instruction; instructions::INSTRUCTION_NUM],
+
+    /// Dumb cache to speed up C-instruction decompression. We can fit every possible
+    /// C instruction here since there are only 64k of them, taking up 256k of memory.
+    c_cache: Vec<Option<u32>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -273,6 +279,7 @@ impl Cpu {
             unsigned_data_mask: !0,
             memory,
             instructions: instructions::get_instructions(),
+            c_cache: vec![None; 65536],
         }
     }
 
@@ -375,12 +382,7 @@ impl Cpu {
         //     word
         // );
 
-        let Ok(inst) = self.decode_raw(word) else {
-            panic!(
-                "Unknown instruction PC:0x{:x} WORD:0x{:x}",
-                instruction_address, original_word
-            );
-        };
+        let operation = self.decode(word)?;
 
         // println!(
         //     "pc @ 0x{:08x}: 0x{:08x} (0x{:08x}) {} {}",
@@ -390,8 +392,10 @@ impl Cpu {
         //     inst.name,
         //     (inst.disassemble)(self, word, self.pc, true)
         // );
-        let result = (inst.operation)(self, word, instruction_address);
+        // let result = (inst.operation)(self, word, instruction_address);
+        let result = operation(self, word, instruction_address);
         self.x[0] = 0; // hardwired zero
+
         result
     }
 
@@ -399,20 +403,20 @@ impl Cpu {
         (self.decode_raw(op)?.operation)(self, op, self.pc)
     }
 
-    // /// Decodes a word instruction data and returns a reference to
-    // /// [`Instruction`](struct.Instruction.html). Using [`DecodeCache`](struct.DecodeCache.html)
-    // /// so if cache hits this method returns the result very quickly.
-    // /// The result will be stored to cache.
-    // fn decode_raw(&mut self, word: u32) -> Result<&Instruction, ()> {
-    //     if let Some(index) = self.decode_cache.get(word) {
-    //         return Ok(&INSTRUCTIONS[index]);
-    //     }
-    //     let Ok(index) = self.decode_and_get_instruction_index(word) else {
-    //         return Err(());
-    //     };
-    //     self.decode_cache.insert(word, index);
-    //     Ok(&INSTRUCTIONS[index])
-    // }
+    /// Decodes a word instruction data and returns a reference to
+    /// [`Instruction`](struct.Instruction.html). Using [`DecodeCache`](struct.DecodeCache.html)
+    /// so if cache hits this method returns the result very quickly.
+    /// The result will be stored to cache. Eventually.
+    fn decode(&mut self, word: u32) -> Result<InstructionOperation, Trap> {
+        let index = self
+            .decode_and_get_instruction_index(word)
+            .map_err(|_| Trap {
+                value: self.pc.wrapping_sub(4),
+                trap_type: TrapType::IllegalInstruction,
+            })?;
+        // TODO: Come up with a fancy cache here
+        Ok(self.instructions[index].operation)
+    }
 
     /// Decodes a word instruction data and returns a reference to
     /// [`Instruction`](struct.Instruction.html). Not Using [`DecodeCache`](struct.DecodeCache.html)
@@ -894,7 +898,17 @@ impl Cpu {
     }
 
     // @TODO: Optimize
-    fn uncompress(&self, halfword: u32) -> u32 {
+    fn uncompress(&mut self, halfword: u32) -> u32 {
+        let inst = (halfword as usize) & 0xffff;
+        if let Some(hit) = self.c_cache[inst] {
+            return hit;
+        }
+        let result = self.uncompress_inner(halfword);
+        self.c_cache[inst] = Some(result);
+        result
+    }
+
+    fn uncompress_inner(&self, halfword: u32) -> u32 {
         let op = halfword & 0x3; // [1:0]
         let funct3 = (halfword >> 13) & 0x7; // [15:13]
 

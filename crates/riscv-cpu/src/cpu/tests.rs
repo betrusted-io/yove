@@ -164,7 +164,7 @@ fn decode_raw() {
 
 #[test]
 fn uncompress() {
-    let cpu = create_cpu(0).0;
+    let mut cpu = create_cpu(0).0;
     // .uncompress() doesn't directly return an instruction but
     // it returns uncompressed word. Then you need to call .decode_raw().
     match cpu.decode_raw(cpu.uncompress(0x20)) {

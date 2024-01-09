@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::atomic::Ordering};
+
 use crate::xous::Memory;
 
 use super::{LendResult, ScalarResult, Service};
@@ -79,11 +81,21 @@ enum NameLendOpcode {
     TryConnect = 7,
 }
 
-pub struct Name {}
+pub struct Name {
+    connection_index: HashMap<String, u32>,
+}
 
 impl Name {
     pub fn new() -> Self {
-        Name {}
+        Name {
+            connection_index: HashMap::default(),
+        }
+    }
+
+    fn return_connection(&self, buf: &mut [u8], connection_id: u32) -> LendResult {
+        buf[0..4].copy_from_slice(&0u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&connection_id.to_le_bytes());
+        LendResult::MemoryReturned([0, 0])
     }
 }
 
@@ -109,7 +121,6 @@ impl Service for Name {
             "Unhandled name blocking_scalar {}: {} {:x?}",
             sender, opcode, args
         );
-        // ScalarResult::Scalar1(0)
     }
 
     fn lend(
@@ -124,7 +135,6 @@ impl Service for Name {
             "Unhandled name lend {}: {} {:x?} {:x?}",
             sender, opcode, buf, extra
         );
-        // LendResult::MemoryReturned([0, 0])
     }
 
     fn lend_mut(
@@ -142,22 +152,33 @@ impl Service for Name {
         {
             let buf_len = buf.len().min(extra[1] as usize);
             let name = std::str::from_utf8(&buf[0..buf_len]).unwrap_or("<invalid>");
-            println!("Registering name {}", name);
 
-            let service = Box::new(if name == "panic-to-screen!" {
-                println!("Panic-to-screen registered");
-                super::panic_to_screen::PanicToScreen::new()
+            if let Some(connection_id) = self.connection_index.get(name) {
+                println!(
+                    "Existing server found at connection index {}",
+                    connection_id
+                );
+                return self.return_connection(buf, *connection_id);
+            }
+
+            let service: Box<dyn Service + Send + Sync> = if name == "panic-to-screen!" {
+                Box::new(super::panic_to_screen::PanicToScreen::new())
+            } else if name == "_DNS Resolver Middleware_" {
+                Box::new(super::dns::DnsResolver::new())
             } else {
-                panic!("Unrecognized service name {}", name);
-            });
+                eprintln!("Unrecognized service name {}", name);
+                std::process::exit(1);
+            };
 
+            // Insert the connection into the system bus' connection table
+            let connection_id = memory.connection_index.fetch_add(1, Ordering::Relaxed);
             let mut connections = memory.connections.lock().unwrap();
-            let connection_id = connections.len() as u32 + 1;
             connections.insert(connection_id, service);
 
-            buf[0..4].copy_from_slice(&0u32.to_le_bytes());
-            buf[4..8].copy_from_slice(&connection_id.to_le_bytes());
-            LendResult::MemoryReturned([0, 0])
+            // Insert it into the connection map so subsequent lookups get the same service
+            self.connection_index.insert(name.to_owned(), connection_id);
+
+            self.return_connection(buf, connection_id)
         } else {
             panic!(
                 "Unhandled name lend_mut {}: {} {:x?}",

@@ -57,8 +57,8 @@ pub fn connect(memory: &Memory, id: [u32; 4]) -> SyscallResult {
     //     id[0], id[1], id[2], id[3]
     // );
     if let Some(service) = get_service(&id) {
+        let connection_id = memory.connection_index.fetch_add(1, Ordering::Relaxed);
         let mut connections = memory.connections.lock().unwrap();
-        let connection_id = connections.len() as u32 + 1;
         connections.insert(connection_id, service);
         [
             SyscallResultNumber::ConnectionId as i32,
@@ -139,7 +139,10 @@ pub fn send_message(
                     services::LendResult::WaitForResponse(msg) => msg.into(),
                     services::LendResult::MemoryReturned(result) => {
                         for (offset, value) in memory_region.into_iter().enumerate() {
-                            memory.write_u8(args[0] + offset as u32, value);
+                            memory.write_u8(
+                                memory.virt_to_phys(args[0] + offset as u32).unwrap(),
+                                value,
+                            );
                         }
                         [
                             SyscallResultNumber::MemoryReturned as i32,

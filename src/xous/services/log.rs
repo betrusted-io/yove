@@ -2,7 +2,10 @@ use super::{LendResult, Service};
 use crate::xous::Memory;
 use std::io::Write;
 
-enum LogLendOpcode {
+enum LendOpcode {
+    /// A `LogRecord` message, delivering structured log output
+    LogRecord = 0,
+
     /// A `&[u8]` destined for stdout
     StandardOutput = 1,
 
@@ -11,7 +14,7 @@ enum LogLendOpcode {
 }
 
 #[allow(dead_code)]
-enum LogSendOpcode {
+enum ScalarOpcode {
     /// A panic occurred, and a panic log is forthcoming
     PanicStarted = 1000,
 
@@ -60,6 +63,37 @@ impl Log {
     pub fn new() -> Self {
         Log {}
     }
+
+    fn str_from_log_record<'a>(&self, buf: &'a [u8], offset: usize) -> &'a str {
+        let length =
+            u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
+        core::str::from_utf8(
+            buf[offset + 4..offset + 4 + length]
+                .try_into()
+                .unwrap_or(&[]),
+        )
+        .unwrap_or("<invalid utf-8>")
+    }
+
+    fn log_record(&self, buf: &[u8]) -> LendResult {
+        let filename = self.str_from_log_record(buf, 0);
+        let line_num = u32::from_le_bytes(buf[132..136].try_into().unwrap_or([0; 4]));
+        let module = self.str_from_log_record(buf, 136);
+        let args = self.str_from_log_record(buf, 272);
+
+        let level = match u32::from_le_bytes(buf[136..140].try_into().unwrap_or([0; 4])) {
+            1 => "ERR ",
+            2 => "WARN",
+            3 => "INFO",
+            4 => "DBG ",
+            5 => "TRCE",
+            _ => "UNKNOWN",
+        };
+
+        println!("{}:{} {} ({}:{})", level, module, args, filename, line_num);
+
+        LendResult::MemoryReturned([0, 0])
+    }
 }
 
 impl Default for Log {
@@ -70,17 +104,17 @@ impl Default for Log {
 
 impl Service for Log {
     fn scalar(&self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
-        let message_bytes = if opcode >= LogSendOpcode::PanicMessage0 as u32
-            && opcode <= LogSendOpcode::PanicMessage32 as u32
+        let message_bytes = if opcode >= ScalarOpcode::PanicMessage0 as u32
+            && opcode <= ScalarOpcode::PanicMessage32 as u32
         {
-            Some(opcode - LogSendOpcode::PanicMessage0 as u32)
+            Some(opcode - ScalarOpcode::PanicMessage0 as u32)
         } else {
             None
         };
 
-        if LogSendOpcode::PanicStarted as u32 == opcode {
+        if ScalarOpcode::PanicStarted as u32 == opcode {
             println!("Panic started");
-        } else if LogSendOpcode::PanicFinished as u32 == opcode {
+        } else if ScalarOpcode::PanicFinished as u32 == opcode {
             println!();
             println!("Panic finished");
         } else if let Some(message_bytes) = message_bytes {
@@ -113,19 +147,22 @@ impl Service for Log {
         buf: &[u8],
         extra: [u32; 2],
     ) -> LendResult {
-        if opcode == LogLendOpcode::StandardOutput as u32 {
+        if opcode == LendOpcode::LogRecord as u32 {
+            self.log_record(buf)
+        } else if opcode == LendOpcode::StandardOutput as u32 {
             let print_buffer = &buf[0..extra[1] as usize];
             // println!("Log stdout:");
             std::io::stdout().write_all(print_buffer).unwrap();
             std::io::stdout().flush().unwrap();
-        } else if opcode == LogLendOpcode::StandardError as u32 {
+            LendResult::MemoryReturned([0, 0])
+        } else if opcode == LendOpcode::StandardError as u32 {
             let print_buffer = &buf[0..extra[1] as usize];
             // println!("Log stderr:");
             std::io::stderr().write_all(print_buffer).unwrap();
             std::io::stderr().flush().unwrap();
+            LendResult::MemoryReturned([0, 0])
         } else {
             panic!("Unhandled log lend {}: {} {:x?}", sender, opcode, buf);
         }
-        LendResult::MemoryReturned([0, 0])
     }
 }

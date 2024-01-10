@@ -81,7 +81,7 @@ impl Log {
         let module = self.str_from_log_record(buf, 136);
         let args = self.str_from_log_record(buf, 272);
 
-        let level = match u32::from_le_bytes(buf[136..140].try_into().unwrap_or([0; 4])) {
+        let level = match u32::from_le_bytes(buf[268..272].try_into().unwrap_or([0; 4])) {
             1 => "ERR ",
             2 => "WARN",
             3 => "INFO",

@@ -104,21 +104,16 @@ impl Default for Log {
 
 impl Service for Log {
     fn scalar(&self, _memory: &Memory, sender: u32, opcode: u32, args: [u32; 4]) {
-        let message_bytes = if opcode >= ScalarOpcode::PanicMessage0 as u32
-            && opcode <= ScalarOpcode::PanicMessage32 as u32
-        {
-            Some(opcode - ScalarOpcode::PanicMessage0 as u32)
-        } else {
-            None
-        };
-
         if ScalarOpcode::PanicStarted as u32 == opcode {
             println!("Panic started");
         } else if ScalarOpcode::PanicFinished as u32 == opcode {
             println!();
             println!("Panic finished");
-        } else if let Some(message_bytes) = message_bytes {
-            let mut output_bfr = [0u8; core::mem::size_of::<u32>() * 4 /*args.len()*/];
+        } else if opcode >= ScalarOpcode::PanicMessage0 as u32
+            && opcode <= ScalarOpcode::PanicMessage32 as u32
+        {
+            let message_bytes = opcode - ScalarOpcode::PanicMessage0 as u32;
+            let mut output_bfr = [0u8; core::mem::size_of::<u32>() * 4];
             // let mut output_iter = output_bfr.iter_mut();
 
             // Combine the four arguments to form a single
@@ -130,7 +125,7 @@ impl Service for Log {
                 //     *(output_iter.next().unwrap()) = *src;
                 // }
             }
-            print!(
+            eprint!(
                 "{}",
                 std::str::from_utf8(&output_bfr[0..message_bytes as usize]).unwrap_or("<invalid>")
             );

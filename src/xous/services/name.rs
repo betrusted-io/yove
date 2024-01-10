@@ -87,13 +87,81 @@ enum NameLendOpcode {
 
 pub struct Name {
     connection_index: Arc<Mutex<HashMap<String, u32>>>,
+    name_map: Arc<Mutex<HashMap<String, u128>>>,
 }
 
 impl Name {
     pub fn new() -> Self {
         Name {
             connection_index: Arc::new(Mutex::new(HashMap::default())),
+            name_map: Arc::new(Mutex::new(HashMap::default())),
         }
+    }
+
+    fn djb2_hash(path: &str) -> u128 {
+        let mut hash = 5381u128;
+        for c in path.bytes() {
+            // This algorithm appears to be wrong, but it's what the original
+            // algorithm in mkfrogfs.py does.
+            hash = (hash << 5).wrapping_add(hash) ^ (c as u128);
+        }
+        hash
+    }
+
+    fn register_name(&self, buf: &mut [u8], rkyv_header: u32) -> LendResult {
+        let rkyv_header = rkyv_header as usize;
+
+        let conn_limit_is_some =
+            u32::from_le_bytes(buf[rkyv_header..rkyv_header + 4].try_into().unwrap()) != 0;
+        let conn_limit = if conn_limit_is_some {
+            Some(u32::from_le_bytes(
+                buf[rkyv_header + 4..rkyv_header + 8].try_into().unwrap(),
+            ))
+        } else {
+            None
+        };
+
+        let name_header = rkyv_header + 8;
+        let name_offset = i32::from_le_bytes(buf[name_header..name_header + 4].try_into().unwrap());
+        let name_length =
+            u32::from_le_bytes(buf[name_header + 4..name_header + 8].try_into().unwrap());
+        let name_slice = &buf[name_header + name_offset as usize
+            ..name_header + name_offset as usize + name_length as usize];
+
+        let server_name = std::str::from_utf8(name_slice)
+            .unwrap_or("<invalid>")
+            .to_owned();
+        let hash = Self::djb2_hash(&server_name);
+        println!(
+            "Program is registering service \"{}\" with {}",
+            server_name,
+            if let Some(max) = conn_limit {
+                format!(
+                    "a maximum of {} {}",
+                    max,
+                    if max == 1 {
+                        "connection"
+                    } else {
+                        "connections"
+                    }
+                )
+            } else {
+                "an unlimited number of connections".to_owned()
+            }
+        );
+
+        // Construct the rkyv object by hand.
+        let rkyv_offset = 0;
+        buf[rkyv_offset..rkyv_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+        buf[rkyv_offset + 4..rkyv_offset + 20].copy_from_slice(&hash.to_le_bytes());
+
+        assert!(self
+            .name_map
+            .lock()
+            .unwrap()
+            .insert(server_name, hash)
+            .is_none());
+        LendResult::MemoryReturned([rkyv_offset as u32, 0])
     }
 }
 
@@ -113,7 +181,7 @@ impl Service for Name {
         extra: [u32; 2],
     ) -> LendResult {
         if opcode == NameLendOpcode::Register as u32 {
-            panic!("Register opcode unimplemented");
+            self.register_name(buf, extra[0])
         } else if opcode == NameLendOpcode::TryConnect as u32
             || opcode == NameLendOpcode::BlockingConnect as u32
         {

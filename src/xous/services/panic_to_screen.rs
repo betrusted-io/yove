@@ -14,7 +14,7 @@ impl PanicToScreen {
 
     fn append_panic_text(&self, buf: &[u8], valid: u32) -> LendResult {
         let _panic_str: &str = std::str::from_utf8(&buf[0..valid as usize]).unwrap_or("<invalid>");
-        // println!("Panic to screen: {}", panic_str);
+        // println!("Panic to screen: {}", _panic_str);
         LendResult::MemoryReturned([0, 0])
     }
 }
